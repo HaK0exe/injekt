@@ -1,0 +1,48 @@
+#![deny(unsafe_code)]
+
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum DbmsError {
+    #[error("not detected")]
+    NotDetected,
+    #[error("query failed: {0}")]
+    QueryFailed(String),
+    #[error("unsupported dbms: {0}")]
+    Unsupported(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DbmsKind {
+    MySql,
+    Postgres,
+    MsSql,
+    Oracle,
+    Unknown,
+}
+
+impl core::fmt::Display for DbmsKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MySql => write!(f, "mysql"),
+            Self::Postgres => write!(f, "postgres"),
+            Self::MsSql => write!(f, "mssql"),
+            Self::Oracle => write!(f, "oracle"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Common DBMS detector trait using native async fn (1.75+).
+pub trait DbmsDetector: Send + Sync {
+    fn kind(&self) -> DbmsKind;
+    fn fingerprint_queries(&self) -> Vec<String>;
+    fn extract_version_query(&self) -> String;
+    fn extract_user_query(&self) -> String;
+    fn extract_databases_query(&self) -> String;
+    fn extract_tables_query(&self, db: &str) -> String;
+    fn extract_columns_query(&self, db: &str, table: &str) -> String;
+    fn file_read_query(&self, path: &str) -> Option<String>;
+}

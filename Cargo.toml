@@ -1,0 +1,67 @@
+[package]
+name = "injekt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Modern SQL injection detection & exploitation — zero persistence, anonymisation by design"
+license = "MIT"
+readme = "README.md"
+keywords = ["security", "sql-injection", "pentest", "opsec"]
+categories = ["command-line-utilities"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+
+[dependencies]
+# Async
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "brotli", "socks", "cookies", "rustls-tls"] }
+url = "2"
+http = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+owo-colors = "4"
+indicatif = "0.17"
+tabled = "0.15"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# OPSEC / crypto
+zeroize = { version = "1", features = ["derive"] }
+secrecy = "0.10"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+rand = "0.9"
+rand_distr = "0.5"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+
+# Utils
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+insta = "1"
+proptest = "1"
+tokio = { version = "1", features = ["full"] }
