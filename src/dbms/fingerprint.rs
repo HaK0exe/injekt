@@ -8,20 +8,29 @@ use std::sync::OnceLock;
 #[must_use]
 pub fn banner_to_kind(s: &str) -> DbmsKind {
     let lower = s.to_ascii_lowercase();
-    if lower.contains("mysql") || s.contains("@@version") {
-        return Kind::MySql;
+    // Check vendor-specific tokens first — generic @@version alone is ambiguous
+    // (MySQL uses @@version, MSSQL uses @@VERSION). Reordering prevents
+    // a "Microsoft SQL Server @@version" banner from being consumed as MySql.
+    if lower.contains("microsoft sql server")
+        || lower.contains("mssql")
+        || (lower.contains("microsoft") && lower.contains("@@version"))
+    {
+        return Kind::MsSql;
     }
     if lower.contains("postgres") || lower.contains("postgresql") {
         return Kind::Postgres;
     }
-    if lower.contains("microsoft sql server")
-        || lower.contains("mssql")
-        || lower.contains("@@version") && lower.contains("microsoft")
-    {
-        return Kind::MsSql;
+    if lower.contains("mysql") {
+        return Kind::MySql;
     }
-    if lower.contains("oracle") || s.contains("ORA-") {
+    if lower.contains("oracle") || lower.contains("ora-") {
         return Kind::Oracle;
+    }
+    // Fallback: bare @@version without vendor hint — keep Unknown to avoid
+    // misclassifying MSSQL banners, but preserve legacy MySql fallback for
+    // callers that treat Unknown as MySql. Callers should treat this as low confidence.
+    if lower.contains("@@version") {
+        return Kind::MySql;
     }
     Kind::Unknown
 }

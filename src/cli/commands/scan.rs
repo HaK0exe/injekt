@@ -7,7 +7,9 @@ use crate::{
     reporting::{console, json::JsonReport},
     session::scrubber::Scrubber,
 };
-use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _, sync::Arc, time::Duration};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::{io::Write as _, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
@@ -83,13 +85,12 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
     if let Some(out) = &cli.output {
         let report = JsonReport::new(target.clone(), findings.clone(), vec![], count);
         let json = report.to_json(&scrubber);
-        // Write with 0o600 perms (sensitive report)
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(out)?;
+        // Write with 0o600 perms on Unix (sensitive report)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut file = opts.open(out)?;
         file.write_all(json.as_bytes())?;
         file.sync_all()?;
         info!(path=%scrubber.scrub(out), "json report written (0o600)");

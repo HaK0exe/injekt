@@ -94,13 +94,23 @@ impl RawRequest {
     }
 
     /// Reconstruct target URL if Host header present.
+    /// Supports absolute-form request-target (e.g., `GET http://host/path HTTP/1.1`)
+    /// and preserves Host:port if present.
     #[must_use]
     pub fn to_url(&self, scheme: &str) -> Option<String> {
+        if self.path.starts_with("http://") || self.path.starts_with("https://") {
+            return Some(self.path.clone());
+        }
         let host = self
             .headers
             .get("Host")
             .or_else(|| self.headers.get("host"))?;
-        Some(format!("{scheme}://{host}{}", self.path))
+        let path = if self.path.starts_with('/') {
+            self.path.clone()
+        } else {
+            format!("/{}", self.path)
+        };
+        Some(format!("{scheme}://{host}{path}"))
     }
 }
 

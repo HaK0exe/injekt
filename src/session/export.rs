@@ -12,7 +12,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -85,12 +86,12 @@ impl EncryptedExport {
         };
         let out = serde_json::to_vec_pretty(&blob)
             .map_err(|e| ExportError::Serialization(e.to_string()))?;
-        // 0o600 strict perms, fail if exists to avoid overwrite of sensitive file
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
+        // 0o600 strict perms on Unix, fail if exists to avoid overwrite of sensitive file
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut file = opts
             .open(path)
             .map_err(|e| ExportError::Io(e.to_string()))?;
         file.write_all(&out)

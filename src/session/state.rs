@@ -129,10 +129,10 @@ impl SessionState {
 
     /// Fill `None` dbms with guessed kind (e.g., from fingerprint).
     pub fn fill_missing_dbms(&mut self, kind: crate::dbms::DbmsKind) {
-        let s = kind.to_string();
-        if s == "unknown" {
+        if kind == crate::dbms::DbmsKind::Unknown {
             return;
         }
+        let s = kind.to_string();
         for f in &mut self.findings {
             if f.dbms.is_none() {
                 f.dbms = Some(s.clone());

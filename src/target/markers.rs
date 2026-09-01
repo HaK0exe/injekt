@@ -35,9 +35,10 @@ pub struct MarkerSet {
 impl MarkerSet {
     #[must_use]
     pub fn detect(input: &str) -> Self {
+        let lower = input.to_ascii_lowercase();
         Self {
-            asterisk: input.contains('*'),
-            section: input.contains('§'),
+            asterisk: input.contains('*') || lower.contains("%2a"),
+            section: input.contains('§') || lower.contains("%c2%a7"),
             double_brace: input.contains("{{") && input.contains("}}"),
         }
     }

