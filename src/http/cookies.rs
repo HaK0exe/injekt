@@ -1,13 +1,24 @@
 #![deny(unsafe_code)]
 
+use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+#[derive(Debug, Clone)]
+struct CookieMeta {
+    value: SecretString,
+    path: String,
+    domain: Option<String>,
+    expires: Option<DateTime<Utc>>,
+    secure: bool,
+}
+
 /// In-memory cookie jar, zeroized on drop. No disk persistence.
+/// Stores per-cookie attributes per RFC6265 minimal subset.
 #[derive(Debug, Default)]
 pub struct CookieJar {
-    cookies: HashMap<String, SecretString>,
+    cookies: HashMap<String, CookieMeta>,
 }
 
 impl CookieJar {
@@ -17,42 +28,149 @@ impl CookieJar {
     }
 
     pub fn set(&mut self, name: impl Into<String>, value: SecretString) {
-        self.cookies.insert(name.into(), value);
+        self.cookies.insert(
+            name.into(),
+            CookieMeta {
+                value,
+                path: "/".to_owned(),
+                domain: None,
+                expires: None,
+                secure: false,
+            },
+        );
     }
 
     pub fn set_raw(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.cookies
-            .insert(name.into(), SecretString::from(value.into()));
+        self.set(name, SecretString::from(value.into()));
     }
 
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&SecretString> {
-        self.cookies.get(name)
+        self.cookies.get(name).map(|m| &m.value)
     }
 
     #[must_use]
     pub fn header_value(&self) -> Option<String> {
+        self.header_value_for_url(None)
+    }
+
+    /// Scope-aware header value (filters by domain/path/expires/secure if url provided).
+    #[must_use]
+    pub fn header_value_for_url(&self, url: Option<&str>) -> Option<String> {
         if self.cookies.is_empty() {
             return None;
         }
-        let parts: Vec<String> = self
-            .cookies
-            .iter()
-            .map(|(k, v)| format!("{k}={}", v.expose_secret()))
-            .collect();
-        Some(parts.join("; "))
+        let now = Utc::now();
+        let mut parts: Vec<String> = Vec::new();
+        for (k, meta) in &self.cookies {
+            if let Some(exp) = meta.expires
+                && exp < now
+            {
+                continue;
+            }
+            if let Some(raw_url) = url
+                && let Ok(parsed) = url::Url::parse(raw_url)
+            {
+                let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+                if let Some(d) = &meta.domain
+                    && !host.ends_with(d)
+                    && host != d.as_str()
+                {
+                    continue;
+                }
+                let path = parsed.path();
+                if !path.starts_with(&meta.path) {
+                    continue;
+                }
+                if meta.secure && parsed.scheme() != "https" {
+                    continue;
+                }
+            }
+            parts.push(format!("{k}={}", meta.value.expose_secret()));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("; "))
+        }
     }
 
     pub fn parse_set_cookie(&mut self, header: &str) {
-        if let Some((pair, _)) = header.split_once(';')
-            && let Some((k, v)) = pair.split_once('=')
-        {
-            self.set_raw(k.trim(), v.trim());
+        self.parse_set_cookie_with_url(header, None);
+    }
+
+    pub fn parse_set_cookie_with_url(&mut self, header: &str, url: Option<&url::Url>) {
+        let mut parts = header.split(';').map(str::trim);
+        let Some(pair) = parts.next() else { return };
+        let Some((k, v)) = pair.split_once('=') else {
+            return;
+        };
+        let name = k.trim();
+        if name.is_empty() {
+            return;
         }
+        let mut meta = CookieMeta {
+            value: SecretString::from(v.trim().to_owned()),
+            path: url.map_or_else(|| "/".to_owned(), default_path),
+            domain: None,
+            expires: None,
+            secure: false,
+        };
+        for attr in parts {
+            if let Some((ak, av)) = attr.split_once('=') {
+                match ak.trim().to_ascii_lowercase().as_str() {
+                    "path" => meta.path = av.trim().to_owned(),
+                    "domain" => {
+                        meta.domain = Some(av.trim().trim_start_matches('.').to_ascii_lowercase());
+                    }
+                    "expires" => {
+                        if let Ok(dt) =
+                            chrono::DateTime::parse_from_rfc2822(av.trim()).or_else(|_| {
+                                chrono::DateTime::parse_from_str(
+                                    av.trim(),
+                                    "%a, %d %b %Y %H:%M:%S %Z",
+                                )
+                            })
+                        {
+                            meta.expires = Some(dt.with_timezone(&Utc));
+                        }
+                    }
+                    "max-age" => {
+                        if let Ok(secs) = av.trim().parse::<i64>() {
+                            meta.expires = Some(Utc::now() + chrono::Duration::seconds(secs));
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                match attr.to_ascii_lowercase().as_str() {
+                    "secure" => meta.secure = true,
+                    "httponly" => {}
+                    _ => {}
+                }
+            }
+        }
+        // Domain validation if url present
+        if let (Some(d), Some(u)) = (&meta.domain, url) {
+            let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+            if !host.ends_with(d) && host != d.as_str() {
+                return;
+            }
+        }
+        self.cookies.insert(name.to_owned(), meta);
     }
 
     pub fn clear(&mut self) {
         self.cookies.clear();
+    }
+}
+
+fn default_path(url: &url::Url) -> String {
+    let p = url.path();
+    if let Some(idx) = p.rfind('/') {
+        p[..idx + 1].to_owned()
+    } else {
+        "/".to_owned()
     }
 }
 

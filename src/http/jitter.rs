@@ -1,5 +1,4 @@
 #![deny(unsafe_code)]
-#![allow(clippy::expect_used)]
 
 use rand_distr::{Distribution, Normal};
 
@@ -31,8 +30,19 @@ impl Jitter {
     #[must_use]
     pub fn next_delay(&self) -> std::time::Duration {
         let mut rng = rand::rng();
-        let normal = Normal::new(self.mean_ms, self.stddev_ms.max(1.0))
-            .unwrap_or_else(|_| Normal::new(self.mean_ms, 50.0).expect("normal"));
+        let normal = match Normal::new(self.mean_ms, self.stddev_ms.max(1.0)) {
+            Ok(n) => n,
+            Err(_) => match Normal::new(self.mean_ms, 50.0) {
+                Ok(n) => n,
+                Err(_) => {
+                    // Both attempts failed (stddev invalid) — fallback to uniform jitter around mean
+                    let fallback: f64 = rand::random_range(500.0..1000.0);
+                    return std::time::Duration::from_millis(
+                        fallback.max(self.min_ms as f64).round() as u64,
+                    );
+                }
+            },
+        };
         let sample = normal
             .sample(&mut rng)
             .max(f64::from(u32::try_from(self.min_ms).unwrap_or(0)));

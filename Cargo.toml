@@ -16,6 +16,11 @@ unsafe_code = "deny"
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
+large_stack_arrays = "deny"
+needless_return = "warn"
+manual_div_ceil = "warn"
 
 [dependencies]
 # Async
@@ -53,6 +58,8 @@ rand_distr = "0.5"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
+subtle = "2.6"
+rpassword = "7.3"
 
 # Utils
 regex = "1"

@@ -1,19 +1,25 @@
 #![deny(unsafe_code)]
 
 use crate::{
-    detection::baseline,
-    http::client::HttpClient,
+    detection::{baseline, confirmation},
+    http::client::{HttpClient, RequestSpec},
     session::{
         scrubber::Scrubber,
         state::{Finding, SessionState, TechniqueKind},
     },
-    target::{parameters::TargetParameter, url::TargetUrl},
+    target::{
+        markers::MarkerSet,
+        parameters::{ParameterLocation, TargetParameter},
+        url::TargetUrl,
+    },
     techniques::{
         boolean::{detector::BooleanDetector, payloads::boolean_payloads_for},
         error::detector::ErrorDetector,
         time::{detector::TimeDetector, payloads::time_payload_for},
     },
 };
+use futures::StreamExt as _;
+use http::Method;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::{sync::Arc, time::Instant};
 use tokio::sync::RwLock;
@@ -111,12 +117,29 @@ impl Engine {
                 break;
             }
             let start = Instant::now();
-            let resp = self.client.get_with_retry(target.as_str().to_owned()).await;
+            let resp = self
+                .client
+                .send_with_retry(
+                    RequestSpec {
+                        method: Method::GET,
+                        url: target.as_str().to_owned(),
+                        headers: http::HeaderMap::new(),
+                        body: None,
+                    },
+                    &self.cancel,
+                )
+                .await;
             let elapsed = start.elapsed();
             match resp {
                 Ok(r) => {
                     let status = r.status().as_u16();
-                    let body = r.bytes().await.unwrap_or_default().to_vec();
+                    let body = match r.bytes().await {
+                        Ok(b) => b.to_vec(),
+                        Err(e) => {
+                            warn!(error=%e, "baseline body read failed");
+                            Vec::new()
+                        }
+                    };
                     samples.push(baseline::Sample {
                         status,
                         body,
@@ -135,60 +158,125 @@ impl Engine {
         current = EngineState::Detection;
         info!(state=?current, "phase detection");
 
-        // Detection per parameter, bounded concurrency
-        let params = crate::target::parameters::collect_from_url_query(&target);
+        // Detection per parameter — bounded concurrency via buffer_unordered
+        let marker_set = MarkerSet::detect(target_str);
+        let params = if marker_set.has_any() {
+            // Marker mode: create synthetic params for each marker type
+            let mut v = Vec::new();
+            if marker_set.asterisk {
+                v.push(TargetParameter::new(
+                    "marker_asterisk",
+                    ParameterLocation::Query,
+                    "*",
+                ));
+            }
+            if marker_set.section {
+                v.push(TargetParameter::new(
+                    "marker_section",
+                    ParameterLocation::Query,
+                    "§",
+                ));
+            }
+            if marker_set.double_brace {
+                v.push(TargetParameter::new(
+                    "marker_brace",
+                    ParameterLocation::Query,
+                    "{{}}",
+                ));
+            }
+            if v.is_empty() {
+                crate::target::parameters::collect_from_url_query(&target)
+            } else {
+                v
+            }
+        } else {
+            crate::target::parameters::collect_from_url_query(&target)
+        };
         let to_test: Vec<TargetParameter> = if params.is_empty() {
-            // fallback: test single synthetic param "id"
-            vec![crate::target::parameters::TargetParameter::new(
-                "id",
-                crate::target::parameters::ParameterLocation::Query,
-                "1",
-            )]
+            vec![TargetParameter::new("id", ParameterLocation::Query, "1")]
         } else {
             params
         };
 
-        let pb2 = ProgressBar::new(to_test.len() as u64);
+        let pb2 = Arc::new(ProgressBar::new(to_test.len() as u64));
         pb2.set_style(
             ProgressStyle::default_bar()
                 .template("{bar:40} {pos}/{len} {msg}")
                 .unwrap_or_else(|_| ProgressStyle::default_bar()),
         );
 
-        for param in &to_test {
-            if self.cancel.is_cancelled() {
-                break;
-            }
-            pb2.set_message(format!("testing {}", param.name));
-            // boolean
-            if self
-                .config
-                .techniques
-                .iter()
-                .any(|t| t == "boolean" || t == "all")
-            {
-                self.test_boolean(&target, param, &baseline).await;
-            }
-            // error
-            if self
-                .config
-                .techniques
-                .iter()
-                .any(|t| t == "error" || t == "all")
-            {
-                self.test_error(&target, param).await;
-            }
-            // time
-            if self
-                .config
-                .techniques
-                .iter()
-                .any(|t| t == "time" || t == "all")
-            {
-                self.test_time(&target, param, &baseline).await;
-            }
-            pb2.inc(1);
-        }
+        // Bounded concurrent testing per parameter (respects --threads)
+        let concurrency = self.config.threads.clamp(1, 32);
+        let target_str_owned = target_str.to_owned();
+        let baseline_clone = baseline.clone();
+        let target_clone = target.clone();
+        let marker_set_clone = marker_set;
+
+        let stream = futures::stream::iter(to_test)
+            .map(|param| {
+                let target = target_clone.clone();
+                let target_str = target_str_owned.clone();
+                let baseline = baseline_clone.clone();
+                let marker_set = marker_set_clone.clone();
+                let client = self.client.clone();
+                let state = Arc::clone(&self.state);
+                let cancel = self.cancel.clone();
+                let config = self.config.clone();
+                let pb2 = Arc::clone(&pb2);
+                async move {
+                    if cancel.is_cancelled() {
+                        pb2.inc(1);
+                        return;
+                    }
+                    // Boolean with confirmation (3 trials)
+                    if config
+                        .techniques
+                        .iter()
+                        .any(|t| t == "boolean" || t == "all")
+                    {
+                        test_boolean_bounded(
+                            &client,
+                            &state,
+                            &cancel,
+                            &target,
+                            &target_str,
+                            &param,
+                            &baseline,
+                            &marker_set,
+                        )
+                        .await;
+                    }
+                    if config.techniques.iter().any(|t| t == "error" || t == "all") {
+                        test_error_bounded(
+                            &client,
+                            &state,
+                            &cancel,
+                            &target,
+                            &target_str,
+                            &param,
+                            &marker_set,
+                        )
+                        .await;
+                    }
+                    if config.techniques.iter().any(|t| t == "time" || t == "all") {
+                        test_time_bounded(
+                            &client,
+                            &state,
+                            &cancel,
+                            &target,
+                            &target_str,
+                            &param,
+                            &baseline,
+                            &marker_set,
+                        )
+                        .await;
+                    }
+                    pb2.inc(1);
+                }
+            })
+            .buffer_unordered(concurrency);
+
+        stream.collect::<Vec<()>>().await;
         pb2.finish_with_message("detection done");
         current = EngineState::Fingerprint;
         info!(state=?current, "phase fingerprint");
@@ -212,6 +300,7 @@ impl Engine {
         Ok(current)
     }
 
+    #[allow(dead_code)]
     async fn test_boolean(
         &self,
         target: &TargetUrl,
@@ -233,9 +322,9 @@ impl Engine {
             let (false_body, false_ms) =
                 fetch_body_and_time(&self.client, &false_url, &self.state).await;
 
-            let baseline_body = ""; // we use empty as we already sampled; real would use baseline body hash
+            let baseline_body = baseline.representative_body_str();
             let res = detector.evaluate(
-                baseline_body,
+                &baseline_body,
                 &true_body,
                 &false_body,
                 baseline.mean_ms,
@@ -261,6 +350,7 @@ impl Engine {
         }
     }
 
+    #[allow(dead_code)]
     async fn test_error(&self, target: &TargetUrl, param: &TargetParameter) {
         let detector = ErrorDetector::new();
         let payloads = crate::techniques::error::payloads::error_payloads_for(None);
@@ -286,6 +376,7 @@ impl Engine {
         }
     }
 
+    #[allow(dead_code)]
     async fn test_time(
         &self,
         target: &TargetUrl,
@@ -338,6 +429,55 @@ fn inject_param(target: &TargetUrl, param: &TargetParameter, payload: &str) -> S
     url.to_string()
 }
 
+#[allow(clippy::collapsible_if)]
+fn inject_with_marker(target_str: &str, payload: &str, marker_set: &MarkerSet) -> String {
+    let mut s = target_str.to_owned();
+    if marker_set.asterisk && s.contains('*') {
+        s = s.replace('*', payload);
+        return s;
+    }
+    if marker_set.section {
+        // §payload§ -> replace inner
+        if let Some(start) = s.find('§')
+            && let Some(end) = s[start + '§'.len_utf8()..].find('§')
+        {
+            let sec_end = start + '§'.len_utf8() + end + '§'.len_utf8();
+            s.replace_range(start..sec_end, payload);
+            return s;
+        }
+    }
+    if marker_set.double_brace && s.contains("{{") && s.contains("}}") {
+        if let Some(start) = s.find("{{")
+            && let Some(end) = s[start..].find("}}")
+        {
+            let brace_end = start + end + "}}".len();
+            s.replace_range(start..brace_end, payload);
+            return s;
+        }
+    }
+    // fallback: append as query
+    if s.contains('?') {
+        format!("{s}&injekt={payload}")
+    } else {
+        format!("{s}?injekt={payload}")
+    }
+}
+
+fn inject_param_or_marker(
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    payload: &str,
+    marker_set: &MarkerSet,
+) -> String {
+    if marker_set.has_any() && param.name.starts_with("marker_") {
+        inject_with_marker(target_str, payload, marker_set)
+    } else {
+        inject_param(target, param, payload)
+    }
+}
+
+#[allow(dead_code)]
 async fn fetch_body_and_time(
     client: &HttpClient,
     url: &str,
@@ -353,5 +493,164 @@ async fn fetch_body_and_time(
             (body, elapsed_ms)
         }
         Err(_) => (String::new(), elapsed_ms),
+    }
+}
+
+async fn fetch_body_and_time_spec(
+    client: &HttpClient,
+    url: String,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+) -> (String, f64) {
+    let start = Instant::now();
+    let spec = RequestSpec {
+        method: Method::GET,
+        url,
+        headers: http::HeaderMap::new(),
+        body: None,
+    };
+    let resp = client.send_with_retry(spec, cancel).await;
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    state.write().await.increment_requests();
+    match resp {
+        Ok(r) => {
+            #[allow(clippy::unwrap_used)]
+            let body = r.text().await.unwrap_or_default();
+            (body, elapsed_ms)
+        }
+        Err(_) => (String::new(), elapsed_ms),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn test_boolean_bounded(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    baseline: &baseline::Baseline,
+    marker_set: &MarkerSet,
+) {
+    let payloads = boolean_payloads_for(None);
+    let detector = BooleanDetector::new();
+    let baseline_body = baseline.representative_body_str();
+    for p in payloads.iter().take(2) {
+        if cancel.is_cancelled() {
+            break;
+        }
+        // 3 trials confirmation
+        let mut trials: Vec<(bool, f64)> = Vec::with_capacity(3);
+        let mut last_res: Option<crate::techniques::boolean::detector::BooleanResult> = None;
+        for _ in 0..3 {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let true_url =
+                inject_param_or_marker(target, target_str, param, &p.true_payload, marker_set);
+            let false_url =
+                inject_param_or_marker(target, target_str, param, &p.false_payload, marker_set);
+            let (true_body, true_ms) =
+                fetch_body_and_time_spec(client, true_url, state, cancel).await;
+            let (false_body, false_ms) =
+                fetch_body_and_time_spec(client, false_url, state, cancel).await;
+            let res = detector.evaluate(
+                &baseline_body,
+                &true_body,
+                &false_body,
+                baseline.mean_ms,
+                true_ms,
+                false_ms,
+            );
+            trials.push((res.is_vulnerable, res.confidence));
+            last_res = Some(res);
+        }
+        let conf = confirmation::confirm(&trials);
+        if conf.confirmed {
+            let res = last_res.unwrap_or_else(|| {
+                detector.evaluate(&baseline_body, "", "", baseline.mean_ms, 0.0, 0.0)
+            });
+            let evidence = format!(
+                "boolean true_sim={:.2} false_sim={:.2} trials={}/3 fp={:.2}",
+                res.true_similarity, res.false_similarity, conf.trials, conf.false_positive_prob
+            );
+            let mut finding = Finding::new(
+                target.as_str(),
+                param.key(),
+                TechniqueKind::Boolean,
+                conf.score,
+                evidence,
+            );
+            finding.dbms = None;
+            state.write().await.push_finding(finding);
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn test_error_bounded(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    marker_set: &MarkerSet,
+) {
+    let detector = ErrorDetector::new();
+    let payloads = crate::techniques::error::payloads::error_payloads_for(None);
+    for p in payloads.iter().take(2) {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let url = inject_param_or_marker(target, target_str, param, &p.payload, marker_set);
+        let (body, _ms) = fetch_body_and_time_spec(client, url, state, cancel).await;
+        let r = detector.evaluate(&body);
+        if r.is_vulnerable {
+            let mut finding = Finding::new(
+                target.as_str(),
+                param.key(),
+                TechniqueKind::Error,
+                r.confidence,
+                format!("error pattern {:?}", r.matched_pattern),
+            );
+            finding.dbms = Some(p.dbms.clone());
+            state.write().await.push_finding(finding);
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn test_time_bounded(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    baseline: &baseline::Baseline,
+    marker_set: &MarkerSet,
+) {
+    let detector = TimeDetector::new(baseline.mean_ms, baseline.stddev_ms);
+    let payload = time_payload_for(None, 3.0);
+    let url = inject_param_or_marker(target, target_str, param, &payload.payload, marker_set);
+    let (_body, ms) = fetch_body_and_time_spec(client, url, state, cancel).await;
+    let r = detector.evaluate(ms, payload.sleep_secs);
+    if r.is_vulnerable {
+        let finding = Finding::new(
+            target.as_str(),
+            param.key(),
+            TechniqueKind::Time,
+            r.confidence,
+            format!(
+                "time delay {:.0}ms > threshold {:.0}ms",
+                r.measured_ms,
+                detector.threshold()
+            ),
+        );
+        state.write().await.push_finding(finding);
     }
 }

@@ -12,6 +12,7 @@ pub struct Baseline {
     pub durations: Vec<Duration>,
     pub mean_ms: f64,
     pub stddev_ms: f64,
+    pub representative_body: Vec<u8>,
 }
 
 impl Baseline {
@@ -33,9 +34,18 @@ impl Baseline {
         let var = if ms.len() < 2 {
             0.0
         } else {
-            ms.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / ms.len() as f64
+            // Bessel's correction for sample variance (n-1) more accurate for n=3..5
+            ms.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (ms.len() - 1) as f64
         };
         let stddev = var.sqrt();
+        let representative_body = if samples.is_empty() {
+            Vec::new()
+        } else {
+            // Median by length (robust against outliers), fallback to most common hash
+            let mut sorted = samples.clone();
+            sorted.sort_by_key(|s| s.body.len());
+            sorted[sorted.len() / 2].body.clone()
+        };
         Self {
             status_codes,
             body_hashes,
@@ -43,6 +53,7 @@ impl Baseline {
             durations,
             mean_ms: mean,
             stddev_ms: stddev,
+            representative_body,
         }
     }
 
@@ -54,7 +65,13 @@ impl Baseline {
 
     #[must_use]
     pub fn threshold_ms(&self, sigma: f64) -> f64 {
-        self.mean_ms + sigma * self.stddev_ms.max(50.0)
+        // Unified floor 100ms per 2026 audit (time detector uses 100)
+        self.mean_ms + sigma * self.stddev_ms.max(100.0)
+    }
+
+    #[must_use]
+    pub fn representative_body_str(&self) -> String {
+        String::from_utf8_lossy(&self.representative_body).into_owned()
     }
 
     #[must_use]

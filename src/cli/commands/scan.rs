@@ -7,9 +7,10 @@ use crate::{
     reporting::{console, json::JsonReport},
     session::scrubber::Scrubber,
 };
-use std::{sync::Arc, time::Duration};
+use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
     let target = cli
@@ -60,8 +61,14 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
 
     let engine = Engine::new(cfg.clone(), client, cancel.clone());
     let state = engine.run(&target).await?;
-
-    info!(?state, "scan finished");
+    {
+        let scrubber = Scrubber::new(cfg.no_redact);
+        info!(
+            target=%scrubber.scrub(&target),
+            state=?state,
+            "scan finished"
+        );
+    }
 
     // Reporting
     let handle = engine.state_handle();
@@ -74,16 +81,46 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
     console::print_findings(&findings);
 
     if let Some(out) = &cli.output {
-        let report = JsonReport::new(target, findings, vec![], count);
+        let report = JsonReport::new(target.clone(), findings.clone(), vec![], count);
         let json = report.to_json(&scrubber);
-        std::fs::write(out, json)?;
-        info!(path=%out, "json report written");
+        // Write with 0o600 perms (sensitive report)
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(out)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        info!(path=%scrubber.scrub(out), "json report written (0o600)");
     }
 
     if let Some(path) = &cli.export_encrypted {
-        warn!("--export-encrypted creates sensitive artefact at {path}");
-        // In real usage, prompt for passphrase securely; here we use dummy
-        let pass = secrecy::SecretString::from("changeme".to_owned());
+        let scrubbed_path = Scrubber::new(cfg.no_redact).scrub(path);
+        warn!(path=%scrubbed_path, "export chiffré demandé — artefact sensible");
+        // Secure passphrase prompt (rpassword) with fallback to env for CI
+        let pass = if let Ok(env_pass) = std::env::var("INJEKT_PASSPHRASE") {
+            if env_pass.len() < 12 {
+                anyhow::bail!("INJEKT_PASSPHRASE trop courte (min 12)");
+            }
+            secrecy::SecretString::from(env_pass)
+        } else {
+            let p1 = Zeroizing::new(
+                rpassword::prompt_password("Passphrase export (min 12 chars): ")
+                    .map_err(|e| anyhow::anyhow!("tty read: {e}"))?,
+            );
+            if p1.len() < 12 {
+                anyhow::bail!("passphrase trop courte (min 12)");
+            }
+            let p2 = Zeroizing::new(
+                rpassword::prompt_password("Confirmer passphrase: ")
+                    .map_err(|e| anyhow::anyhow!("tty read: {e}"))?,
+            );
+            if p1.as_str() != p2.as_str() {
+                anyhow::bail!("passphrases mismatch");
+            }
+            secrecy::SecretString::from(p1.as_str().to_owned())
+        };
         if let Err(e) = crate::session::export::EncryptedExport::encrypt_to_file(
             &*handle.read().await,
             &pass,
@@ -91,7 +128,7 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
         ) {
             warn!(error=%e, "export failed");
         } else {
-            info!("export encrypted written");
+            info!(path=%scrubbed_path, "export chiffré écrit (0o600, v2 argon2id)");
         }
     }
 

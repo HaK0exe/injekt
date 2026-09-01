@@ -2,12 +2,14 @@
 
 use crate::http::{
     cookies::CookieJar, identity::Identity, jitter::Jitter, proxy::ProxyConfig,
-    rate_limit::RateLimiter, retry::RetryPolicy,
+    rate_limit::RateLimiter, redirects::RedirectPolicy, retry::RetryPolicy,
 };
+use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use reqwest::{Client, RequestBuilder};
 use std::{sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -18,6 +20,12 @@ pub enum ClientError {
     Reqwest(String),
     #[error("proxy error: {0}")]
     Proxy(String),
+    #[error("cancelled")]
+    Cancelled,
+    #[error("timeout after {0:?}")]
+    Timeout(Duration),
+    #[error("invalid header: {0}")]
+    InvalidHeader(String),
 }
 
 ///Marker types for typestate.
@@ -36,6 +44,8 @@ pub struct ClientBuilder<State> {
     jitter: Option<Jitter>,
     rate_limit: Option<Arc<RateLimiter>>,
     retry: RetryPolicy,
+    redirect_policy: RedirectPolicy,
+    extra_headers: HeaderMap,
     _state: core::marker::PhantomData<State>,
 }
 
@@ -50,6 +60,8 @@ impl ClientBuilder<NeedTimeout> {
             jitter: None,
             rate_limit: None,
             retry: RetryPolicy::default(),
+            redirect_policy: RedirectPolicy::default(),
+            extra_headers: HeaderMap::new(),
             _state: core::marker::PhantomData,
         }
     }
@@ -64,6 +76,8 @@ impl ClientBuilder<NeedTimeout> {
             jitter: self.jitter,
             rate_limit: self.rate_limit,
             retry: self.retry,
+            redirect_policy: self.redirect_policy,
+            extra_headers: self.extra_headers,
             _state: core::marker::PhantomData,
         }
     }
@@ -105,11 +119,27 @@ impl<State> ClientBuilder<State> {
         self.retry = r;
         self
     }
+
+    #[must_use]
+    pub fn redirect_policy(mut self, p: RedirectPolicy) -> Self {
+        self.redirect_policy = p;
+        self
+    }
+
+    #[must_use]
+    pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.extra_headers.insert(name, value);
+        self
+    }
 }
 
 impl ClientBuilder<HasTimeout> {
     pub fn build(self) -> Result<HttpClient, ClientError> {
         let timeout = self.timeout.ok_or(ClientError::MissingTimeout)?;
+        let reqwest_policy = match self.redirect_policy {
+            RedirectPolicy::None => reqwest::redirect::Policy::none(),
+            RedirectPolicy::Limited(n) => reqwest::redirect::Policy::limited(n),
+        };
         let mut builder = Client::builder()
             .timeout(timeout)
             .connect_timeout(self.connect_timeout.unwrap_or(Duration::from_secs(10)))
@@ -117,7 +147,7 @@ impl ClientBuilder<HasTimeout> {
             .brotli(true)
             .cookie_store(false) // we manage cookies manually for OPSEC
             .use_rustls_tls()
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(reqwest_policy);
 
         if let Some(proxy) = self.proxy {
             let p = reqwest::Proxy::all(proxy.as_str())
@@ -128,13 +158,15 @@ impl ClientBuilder<HasTimeout> {
         let mut default_headers = reqwest::header::HeaderMap::new();
         if let Some(id) = &self.identity {
             for (k, v) in id.headers() {
-                if let (Ok(hn), Ok(hv)) = (
-                    reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                    reqwest::header::HeaderValue::from_str(&v),
-                ) {
-                    default_headers.insert(hn, hv);
-                }
+                let hn = HeaderName::from_bytes(k.as_bytes())
+                    .map_err(|e| ClientError::InvalidHeader(format!("{k}: {e}")))?;
+                let hv = HeaderValue::from_str(&v)
+                    .map_err(|e| ClientError::InvalidHeader(format!("{v}: {e}")))?;
+                default_headers.insert(hn, hv);
             }
+        }
+        for (k, v) in &self.extra_headers {
+            default_headers.insert(k.clone(), v.clone());
         }
         builder = builder.default_headers(default_headers);
 
@@ -150,6 +182,8 @@ impl ClientBuilder<HasTimeout> {
                 .unwrap_or_else(|| Arc::new(RateLimiter::new(5.0))),
             cookies: Arc::new(RwLock::new(CookieJar::new())),
             retry: self.retry,
+            timeout,
+            redirect_policy: self.redirect_policy,
         })
     }
 }
@@ -169,6 +203,47 @@ pub struct HttpClient {
     rate_limiter: Arc<RateLimiter>,
     cookies: Arc<RwLock<CookieJar>>,
     retry: RetryPolicy,
+    timeout: Duration,
+    redirect_policy: RedirectPolicy,
+}
+
+/// Request specification for generic HTTP calls (2026 best practice).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RequestSpec {
+    pub method: Method,
+    pub url: String,
+    pub headers: HeaderMap,
+    pub body: Option<Vec<u8>>,
+}
+
+impl RequestSpec {
+    #[must_use]
+    pub fn new(method: Method, url: String) -> Self {
+        Self {
+            method,
+            url,
+            headers: HeaderMap::new(),
+            body: None,
+        }
+    }
+
+    #[must_use]
+    pub fn get(url: String) -> Self {
+        Self::new(Method::GET, url)
+    }
+
+    #[must_use]
+    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    #[must_use]
+    pub fn with_body(mut self, body: Vec<u8>) -> Self {
+        self.body = Some(body);
+        self
+    }
 }
 
 impl HttpClient {
@@ -182,29 +257,62 @@ impl HttpClient {
         Arc::clone(&self.inner)
     }
 
-    /// Execute with jitter, rate-limit, retry, timeout cancellation.
-    pub async fn get_with_retry(&self, url: String) -> Result<reqwest::Response, ClientError> {
-        self.rate_limiter.acquire().await;
-        self.jitter.sleep().await;
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    #[must_use]
+    pub fn redirect_policy(&self) -> RedirectPolicy {
+        self.redirect_policy
+    }
+
+    /// Generic send with jitter, rate-limit, retry, timeout and cancellation.
+    pub async fn send_with_retry(
+        &self,
+        spec: RequestSpec,
+        cancel: &CancellationToken,
+    ) -> Result<reqwest::Response, ClientError> {
+        // cancellable jitter + rate-limit per 2026 tokio best practice
+        tokio::select! {
+            () = cancel.cancelled() => return Err(ClientError::Cancelled),
+            () = self.rate_limiter.acquire() => {},
+        }
+        tokio::select! {
+            () = cancel.cancelled() => return Err(ClientError::Cancelled),
+            () = self.jitter.sleep() => {},
+        }
 
         let mut attempt = 0usize;
         loop {
-            // inject cookie header if present
-            let mut req: RequestBuilder = self.inner.get(&url);
-            {
-                let jar = self.cookies.read().await;
-                if let Some(cv) = jar.header_value() {
-                    req = req.header(reqwest::header::COOKIE, cv);
-                }
+            if cancel.is_cancelled() {
+                return Err(ClientError::Cancelled);
             }
+            let req = self.build_request(&spec).await;
 
-            let fut = async { tokio::time::timeout(Duration::from_secs(15), req.send()).await };
-            match fut.await {
-                Ok(Ok(resp)) => {
-                    // store Set-Cookie
-                    for val in &resp.headers().get_all(reqwest::header::SET_COOKIE) {
+            // per-request timeout covers send() only; jitter/rate-limit already done
+            let send_fut = req.send();
+            let resp_res: Result<reqwest::Response, ClientError> = tokio::select! {
+                () = cancel.cancelled() => return Err(ClientError::Cancelled),
+                r = tokio::time::timeout(self.timeout, send_fut) => match r {
+                    Ok(Ok(resp)) => Ok(resp),
+                    Ok(Err(e)) => Err(ClientError::Reqwest(e.to_string())),
+                    Err(_) => Err(ClientError::Timeout(self.timeout)),
+                }
+            };
+
+            match resp_res {
+                Ok(resp) => {
+                    // Store cookies with URL scope per RFC6265
+                    let url_for_cookies = spec.url.clone();
+                    for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
                         if let Ok(s) = val.to_str() {
-                            self.cookies.write().await.parse_set_cookie(s);
+                            let mut jar = self.cookies.write().await;
+                            if let Ok(parsed) = url::Url::parse(&url_for_cookies) {
+                                jar.parse_set_cookie_with_url(s, Some(&parsed));
+                            } else {
+                                jar.parse_set_cookie(s);
+                            }
                         }
                     }
                     if self
@@ -212,29 +320,62 @@ impl HttpClient {
                         .should_retry(attempt, Some(resp.status().as_u16()))
                     {
                         attempt += 1;
-                        tokio::time::sleep(self.retry.delay_for(attempt)).await;
+                        let delay = self.retry.delay_for(attempt);
+                        tokio::select! {
+                            () = cancel.cancelled() => return Err(ClientError::Cancelled),
+                            () = tokio::time::sleep(delay) => {},
+                        }
                         continue;
                     }
                     return Ok(resp);
                 }
-                Ok(Err(e)) => {
-                    if self.retry.should_retry(attempt, None) {
+                Err(e) => {
+                    let retryable = matches!(e, ClientError::Timeout(_) | ClientError::Reqwest(_))
+                        && self.retry.should_retry(attempt, None);
+                    if retryable {
                         attempt += 1;
-                        tokio::time::sleep(self.retry.delay_for(attempt)).await;
+                        let delay = self.retry.delay_for(attempt);
+                        tokio::select! {
+                            () = cancel.cancelled() => return Err(ClientError::Cancelled),
+                            () = tokio::time::sleep(delay) => {},
+                        }
                         continue;
                     }
-                    return Err(ClientError::Reqwest(e.to_string()));
-                }
-                Err(_) => {
-                    if self.retry.should_retry(attempt, None) {
-                        attempt += 1;
-                        tokio::time::sleep(self.retry.delay_for(attempt)).await;
-                        continue;
-                    }
-                    return Err(ClientError::Reqwest("timeout".to_owned()));
+                    return Err(e);
                 }
             }
         }
+    }
+
+    async fn build_request(&self, spec: &RequestSpec) -> RequestBuilder {
+        let mut req = match spec.method {
+            Method::GET => self.inner.get(&spec.url),
+            Method::POST => self.inner.post(&spec.url),
+            _ => self.inner.request(spec.method.clone(), &spec.url),
+        };
+        for (k, v) in &spec.headers {
+            req = req.header(k, v);
+        }
+        if let Some(b) = &spec.body {
+            req = req.body(b.clone());
+        }
+        {
+            let jar = self.cookies.read().await;
+            if let Some(cv) = jar.header_value_for_url(Some(&spec.url)) {
+                req = req.header(reqwest::header::COOKIE, cv);
+            } else if let Some(cv) = jar.header_value() {
+                req = req.header(reqwest::header::COOKIE, cv);
+            }
+        }
+        req
+    }
+
+    /// Legacy GET with jitter/rate-limit/retry — delegates to `send_with_retry` with no cancellation.
+    pub async fn get_with_retry(&self, url: String) -> Result<reqwest::Response, ClientError> {
+        let spec = RequestSpec::get(url);
+        // Use a detached token that never cancels for backwards compat
+        let cancel = CancellationToken::new();
+        self.send_with_retry(spec, &cancel).await
     }
 
     #[must_use]

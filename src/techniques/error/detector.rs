@@ -1,5 +1,4 @@
 #![deny(unsafe_code)]
-#![allow(clippy::expect_used)]
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -49,7 +48,11 @@ impl ErrorDetector {
         ];
         let compiled = patterns
             .into_iter()
-            .map(|(p, name)| (Regex::new(p).expect("regex"), name.to_owned()))
+            .map(|(p, name)| {
+                #[allow(clippy::expect_used)]
+                let re = Regex::new(p).expect("static error pattern regex");
+                (re, name.to_owned())
+            })
             .collect();
         Self { patterns: compiled }
     }
@@ -79,8 +82,11 @@ impl ErrorDetector {
 fn extract_version(body: &str) -> Option<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"(?:MySQL|PostgreSQL|Microsoft SQL Server|Oracle).*?(\d+\.\d+[^<\s]*)")
-            .expect("regex")
+        #[allow(clippy::expect_used)]
+        {
+            Regex::new(r"(?:MySQL|PostgreSQL|Microsoft SQL Server|Oracle).*?(\d+\.\d+[^<\s]*)")
+                .expect("static version regex")
+        }
     });
     re.captures(body)
         .and_then(|c| c.get(1))

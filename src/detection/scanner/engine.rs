@@ -1,5 +1,4 @@
 #![deny(unsafe_code)]
-#![allow(clippy::expect_used)]
 
 use futures::StreamExt;
 use std::sync::Arc;
@@ -78,7 +77,13 @@ impl ScanEngine {
                                 confidence: 0.0,
                             };
                         }
-                        let _permit = sem.acquire().await.expect("semaphore");
+                        let Ok(_permit) = sem.acquire().await else {
+                            return ScanResult {
+                                task: t,
+                                success: false,
+                                confidence: 0.0,
+                            };
+                        };
                         // enforce per-task timeout
                         let fut = f(t.clone());
                         match tokio::time::timeout(std::time::Duration::from_secs(cfg_timeout), fut)
