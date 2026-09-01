@@ -59,6 +59,16 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
         allow_private: cli.allow_private,
         no_redact: cli.no_redact,
         extract: cli.extract,
+        dbs: cli.dbs,
+        tables: cli.tables,
+        columns: cli.columns,
+        dump: cli.dump,
+        db: cli.db,
+        table: cli.table,
+        column: cli.column,
+        start: cli.start,
+        stop: cli.stop,
+        count: cli.count,
     };
 
     let engine = Engine::new(cfg.clone(), client, cancel.clone());

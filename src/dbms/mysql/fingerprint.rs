@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 use crate::dbms::common::{DbmsDetector, DbmsKind};
+use crate::dbms::mysql::enumeration;
 
 #[derive(Debug, Default)]
 pub struct MySqlDetector;
@@ -22,16 +23,27 @@ impl DbmsDetector for MySqlDetector {
     fn extract_user_query(&self) -> String {
         "SELECT USER()".to_owned()
     }
-    fn extract_databases_query(&self) -> String {
-        "SELECT schema_name FROM information_schema.schemata".to_owned()
+    fn list_databases_query(&self) -> String {
+        enumeration::list_databases().to_owned()
     }
-    fn extract_tables_query(&self, db: &str) -> String {
-        format!("SELECT table_name FROM information_schema.tables WHERE table_schema='{db}'")
+    fn list_tables_query(&self, db: &str) -> String {
+        enumeration::list_tables(db)
     }
-    fn extract_columns_query(&self, db: &str, table: &str) -> String {
-        format!(
-            "SELECT column_name FROM information_schema.columns WHERE table_schema='{db}' AND table_name='{table}'"
-        )
+    fn list_columns_query(&self, db: &str, table: &str) -> String {
+        enumeration::list_columns(db, table)
+    }
+    fn dump_table_query(
+        &self,
+        db: &str,
+        table: &str,
+        columns: &[String],
+        start: usize,
+        stop: usize,
+    ) -> String {
+        enumeration::dump_table(db, table, columns, start, stop)
+    }
+    fn count_rows_query(&self, db: &str, table: &str) -> String {
+        enumeration::count_rows(db, table)
     }
     fn file_read_query(&self, path: &str) -> Option<String> {
         Some(format!("SELECT LOAD_FILE('{path}')"))

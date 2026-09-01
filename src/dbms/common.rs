@@ -41,8 +41,18 @@ pub trait DbmsDetector: Send + Sync {
     fn fingerprint_queries(&self) -> Vec<String>;
     fn extract_version_query(&self) -> String;
     fn extract_user_query(&self) -> String;
-    fn extract_databases_query(&self) -> String;
-    fn extract_tables_query(&self, db: &str) -> String;
-    fn extract_columns_query(&self, db: &str, table: &str) -> String;
+    // Enumeration methods
+    fn list_databases_query(&self) -> String;
+    fn list_tables_query(&self, db: &str) -> String;
+    fn list_columns_query(&self, db: &str, table: &str) -> String;
+    fn dump_table_query(
+        &self,
+        db: &str,
+        table: &str,
+        columns: &[String],
+        start: usize,
+        stop: usize,
+    ) -> String;
+    fn count_rows_query(&self, db: &str, table: &str) -> String;
     fn file_read_query(&self, path: &str) -> Option<String>;
 }

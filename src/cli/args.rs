@@ -48,6 +48,28 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub extract: bool,
 
+    /// Enumeration flags
+    #[arg(long, global = true)]
+    pub dbs: bool,
+    #[arg(long, global = true)]
+    pub tables: bool,
+    #[arg(long, global = true)]
+    pub columns: bool,
+    #[arg(long, global = true)]
+    pub dump: bool,
+    #[arg(long, global = true)]
+    pub db: Option<String>,
+    #[arg(long, global = true)]
+    pub table: Option<String>,
+    #[arg(long, global = true)]
+    pub column: Option<String>,
+    #[arg(long, global = true)]
+    pub start: Option<usize>,
+    #[arg(long, global = true)]
+    pub stop: Option<usize>,
+    #[arg(long, global = true)]
+    pub count: bool,
+
     #[arg(long, global = true)]
     pub output: Option<String>,
 
