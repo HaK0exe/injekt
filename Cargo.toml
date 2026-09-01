@@ -30,8 +30,9 @@ futures = "0.3"
 
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "brotli", "socks", "cookies", "rustls-tls"] }
-url = "2"
+url = { version = "2", features = ["serde"] }
 http = "1"
+scraper = "0.24"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

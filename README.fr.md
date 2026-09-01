@@ -33,6 +33,7 @@
 - **Techniques** (`src/techniques/`) : `boolean` (`OR 1=1` / `AND 1=1`, commentaires par SGBD), `time` (`SLEEP/pg_sleep/WAITFOR/BENCHMARK`, seuil `baseline+2σ`), `error` (`EXTRACTVALUE/CONVERT/CAST`), générateur avec encodages (URL, double-URL, hex, unicode) + commentaires inline + case mixing.
 - **SGBD** (`src/dbms/`) : trait `DbmsDetector` en `async fn` natifs, fingerprint MySQL 8.x (`@@version`), Postgres 15+ (`version()`), MSSQL 2022 (`@@version`), Oracle 21c (`v$version`).
 - **Extraction** (`src/extraction/`) : recherche binaire ASCII 32-126, `buffer_unordered` borné, vérification longueur + checksum, `SecretString` wipé après rapport.
+- **Recon** (`src/recon/`) : crawler statique pour liens, formulaires et endpoints JS basiques ; périmètre same-origin, support robots.txt, déduplication des candidats et passage rate-limité vers scan/énumération.
 - **Session** (`src/session/`) : `SessionState` RAM, `Scrubber` (`Authorization/Cookie/JWT/AKIA*/PEM` → `[REDACTED]`), export chiffré `XChaCha20-Poly1305` + `Argon2id` **OPT-IN**.
 - **Reporting** (`src/reporting/`) : JSON + console (`owo-colors`, `tabled`, `indicatif`), preuves scrubbed.
 - **Moteur** (`src/engine/orchestrator.rs`) : machine d'états `parse → baseline → detection → fingerprint → extraction(opt-in)`, concurrence bornée, barres de progression, `tracing` structuré.
@@ -72,6 +73,15 @@ injekt --target "https://example.com/search?q=1" --threads 5
 # Sous-commande scan (équivalent)
 injekt scan --target "https://example.com/?id=1"
 
+# Découvrir URLs paramétrées et formulaires sans tester
+injekt recon crawl --target "example.com" --depth 2 --max-pages 100
+
+# Crawler, tester chaque paramètre découvert, puis énumérer les vulnérabilités confirmées
+injekt recon scan --target "example.com" --auto-enumerate --dbs
+
+# Importer des candidats déjà découverts
+injekt recon import --file discovered.json --test
+
 # Techniques et SGBD ciblés
 injekt --target "https://example.com/?id=1" --techniques boolean,error --dbms mysql
 
@@ -103,6 +113,7 @@ injekt [OPTIONS] [COMMAND]
 
 Commandes:
   scan    Lance la détection (défaut quand --target est fourni)
+  recon   Crawle les cibles, découvre les paramètres, scanne les candidats, importe du JSON
   replay  Rejoue une session chiffrée
   info    Affiche version / techniques / SGBD
 
@@ -129,6 +140,14 @@ Options:
   -V, --version
 ```
 
+Sous-commandes recon:
+
+```bash
+injekt recon crawl --target <HOTE|URL> [--depth N] [--max-pages N] [--include-subdomains] [--ignore-robots]
+injekt recon scan --target <HOTE|URL> [--depth N] [--max-pages N] [--auto-enumerate]
+injekt recon import --file discovered.json [--test] [--enumerate]
+```
+
 ---
 
 ## OPSEC
@@ -150,13 +169,14 @@ Voir [`docs/OPSEC.md`](docs/OPSEC.md) — résumé :
 ```
 src/
 ├── main.rs / lib.rs
-├── cli/{args,commands/{scan,replay,info},output/{console,json,format}}
+├── cli/{args,commands/{scan,recon,replay,info},output/{console,json,format}}
 ├── target/{url,raw_request,parameters,markers}
 ├── http/{client,identity,proxy,cookies,redirects,retry,jitter,rate_limit}
 ├── detection/{baseline,response_diff,confirmation,scanner/{engine,scheduler}}
 ├── techniques/{boolean,time,error}/{detector,payloads}
 ├── dbms/{common,mysql,postgres,mssql,oracle}/{fingerprint,payloads,queries}
 ├── extraction/{engine,inference,verification}
+├── recon/{crawler,discovery,filters,parameter}
 ├── session/{state,scrubber,export}
 ├── reporting/{console,json,evidence}
 └── engine/orchestrator

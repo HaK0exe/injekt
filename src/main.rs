@@ -35,6 +35,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Scan(_)) => {
             commands::scan::run(cli, cancel).await?;
         }
+        Some(Commands::Recon(_)) => {
+            commands::recon::run(cli, cancel).await?;
+        }
         Some(Commands::Replay(_)) => {
             commands::replay::run(cli).await?;
         }

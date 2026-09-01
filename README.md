@@ -33,6 +33,7 @@
 - **Techniques** (`src/techniques/`): `boolean` (`OR 1=1` / `AND 1=1`, comment per DBMS), `time` (`SLEEP/pg_sleep/WAITFOR/BENCHMARK`, threshold `baseline+2σ`), `error` (`EXTRACTVALUE/CONVERT/CAST`), payload generator with encodings (URL, double-URL, hex, unicode) + inline comments + case mixing.
 - **DBMS** (`src/dbms/`): trait `DbmsDetector` with native `async fn`, fingerprint for MySQL 8.x (`@@version`), Postgres 15+ (`version()`), MSSQL 2022 (`@@version`), Oracle 21c (`v$version`).
 - **Extraction** (`src/extraction/`): binary search ASCII 32-126, `buffer_unordered` bounded, verification (length + checksum), `SecretString` zeroized after report.
+- **Recon** (`src/recon/`): static crawler for links, forms, and basic JS endpoints; same-origin scope control, robots.txt support, candidate deduplication, and rate-limited scan/enumeration handoff.
 - **Session** (`src/session/`): `SessionState` RAM, `Scrubber` (`Authorization/Cookie/JWT/AKIA*/PEM` → `[REDACTED]`), encrypted export `XChaCha20-Poly1305` + `Argon2id` **OPT-IN**.
 - **Reporting** (`src/reporting/`): JSON + console (`owo-colors`, `tabled`, `indicatif`), evidence scrubbed.
 - **Engine** (`src/engine/orchestrator.rs`): state machine `parse → baseline → detection → fingerprint → extraction(opt-in)`, bounded concurrency, progress bars, structured `tracing`.
@@ -72,6 +73,15 @@ injekt --target "https://example.com/search?q=1" --threads 5
 # Scan subcommand (equivalent)
 injekt scan --target "https://example.com/?id=1"
 
+# Discover parameterized URLs and forms without testing
+injekt recon crawl --target "example.com" --depth 2 --max-pages 100
+
+# Crawl, test each discovered parameter, then enumerate confirmed findings
+injekt recon scan --target "example.com" --auto-enumerate --dbs
+
+# Import previously discovered candidates
+injekt recon import --file discovered.json --test
+
 # Specific techniques + DBMS
 injekt --target "https://example.com/?id=1" --techniques boolean,error --dbms mysql
 
@@ -109,6 +119,7 @@ injekt [OPTIONS] [COMMAND]
 
 Commands:
   scan    Run detection (default when --target is given)
+  recon   Crawl targets, discover parameters, scan candidates, import candidate JSON
   replay  Replay encrypted session
   info    Show version / techniques / DBMS
 
@@ -135,6 +146,14 @@ Options:
   -V, --version
 ```
 
+Recon subcommands:
+
+```bash
+injekt recon crawl --target <HOST|URL> [--depth N] [--max-pages N] [--include-subdomains] [--ignore-robots]
+injekt recon scan --target <HOST|URL> [--depth N] [--max-pages N] [--auto-enumerate]
+injekt recon import --file discovered.json [--test] [--enumerate]
+```
+
 ---
 
 ## OPSEC
@@ -156,13 +175,14 @@ See [`docs/OPSEC.md`](docs/OPSEC.md) — summary:
 ```
 src/
 ├── main.rs / lib.rs
-├── cli/{args,commands/{scan,replay,info},output/{console,json,format}}
+├── cli/{args,commands/{scan,recon,replay,info},output/{console,json,format}}
 ├── target/{url,raw_request,parameters,markers}
 ├── http/{client,identity,proxy,cookies,redirects,retry,jitter,rate_limit}
 ├── detection/{baseline,response_diff,confirmation,scanner/{engine,scheduler}}
 ├── techniques/{boolean,time,error}/{detector,payloads}
 ├── dbms/{common,mysql,postgres,mssql,oracle}/{fingerprint,payloads,queries}
 ├── extraction/{engine,inference,verification}
+├── recon/{crawler,discovery,filters,parameter}
 ├── session/{state,scrubber,export}
 ├── reporting/{console,json,evidence}
 └── engine/orchestrator

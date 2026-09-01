@@ -106,8 +106,59 @@ pub struct Cli {
 #[non_exhaustive]
 pub enum Commands {
     Scan(ScanArgs),
+    Recon(ReconArgs),
     Replay(ReplayArgs),
     Info(InfoArgs),
+}
+
+#[derive(Parser, Debug)]
+#[non_exhaustive]
+pub struct ReconArgs {
+    #[command(subcommand)]
+    pub command: ReconCommands,
+}
+
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum ReconCommands {
+    /// Crawl a target and print discovered parameters without testing them.
+    Crawl(ReconCrawlArgs),
+    /// Crawl a target, then test each discovered parameter.
+    Scan(ReconScanArgs),
+    /// Import candidates previously exported as JSON.
+    Import(ReconImportArgs),
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct ReconCrawlArgs {
+    #[arg(long)]
+    pub target: String,
+    #[arg(long, default_value_t = 2)]
+    pub depth: usize,
+    #[arg(long, default_value_t = 100)]
+    pub max_pages: usize,
+    #[arg(long)]
+    pub include_subdomains: bool,
+    #[arg(long)]
+    pub ignore_robots: bool,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct ReconScanArgs {
+    #[command(flatten)]
+    pub crawl: ReconCrawlArgs,
+    #[arg(long)]
+    pub auto_enumerate: bool,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct ReconImportArgs {
+    #[arg(long)]
+    pub file: String,
+    #[arg(long)]
+    pub test: bool,
+    #[arg(long)]
+    pub enumerate: bool,
 }
 
 #[derive(Parser, Debug)]

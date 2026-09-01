@@ -1,7 +1,7 @@
 # ADR 0004: Auto-Discovery Crawler for SQLi Target Discovery
 
 ## Status
-Proposed
+Implemented
 
 ## Context
 Currently, `injekt` requires the user to provide a specific URL with an injectable parameter (e.g., `https://example.com/page?id=1`). Users often only have a domain name (e.g., `monplanq.com`) and want the tool to automatically discover vulnerable endpoints.
@@ -12,7 +12,7 @@ We need a reconnaissance phase that:
 3. Runs enumeration on confirmed vulnerable parameters
 
 ## Decision
-Introduce a new `recon` module with a `crawler` subcommand that performs automated discovery.
+Introduce a new `recon` module with crawler, scanner, and import subcommands that perform automated discovery.
 
 ### Architecture
 
@@ -28,9 +28,10 @@ src/recon/
 ### Crawler Design
 - **Static HTML parsing** (no headless browser initially) using `html5ever`/`scraper`
 - Extract: `<a href>`, `<form action>`, `<input name>`, JS endpoints (basic regex)
-- Respect `robots.txt` (optional, configurable)
+- Respect `robots.txt` by default (`--ignore-robots` opt-out)
 - Configurable depth, max pages, same-domain-only vs subdomains
 - Deduplication by normalized URL + parameter set
+- Mandatory shared rate limiter and jitter inherited from the HTTP client
 
 ### Parameter Candidate
 ```rust
@@ -49,14 +50,14 @@ struct ParameterCandidate {
 2. **Filter** → deduplicate, scope, allowlist/denylist
 3. **Test** → run baseline + detection per candidate (parallel, rate-limited)
 4. **Report** → list vulnerable parameters with technique + confidence
-5. **Enumerate** (optional `--auto-enumerate`) → run enumeration on confirmed vulns
+5. **Enumerate** (optional `--auto-enumerate`) → run enumeration only on confirmed vulns
 
 ### CLI Interface
 ```bash
 # Discovery only
 injekt recon crawl --target monplanq.com --depth 2 --max-pages 100
 
-# Discovery + auto-test + enumerate
+# Discovery + auto-test + optional enumeration
 injekt recon scan --target monplanq.com --auto-enumerate --dbs
 
 # Import discovered params from file
@@ -67,6 +68,14 @@ injekt recon import --file discovered.json --test --enumerate
 - Reuse `Engine`, `EngineConfig`, `HttpClient` from `src/engine/`
 - Share `baseline`, `detection`, `fingerprint`, `enumeration` phases
 - Output compatible with `--output` / `--export-encrypted`
+- Use `Engine::run_candidate` so form-backed body parameters keep method, body fields, and headers during baseline, detection, extraction, and enumeration.
+
+## Implementation Notes
+- Public modules: `src/recon/{crawler,parameter,discovery,filters}.rs`
+- CLI: `injekt recon crawl`, `injekt recon scan`, `injekt recon import`
+- Authentication context: global `--headers` and `--cookies` are applied to recon HTTP requests.
+- JS support is limited to static endpoint strings with query parameters; full browser execution remains out of scope.
+- Legal warning is emitted when a recon crawl or scan starts.
 
 ## Consequences
 ### Positive
@@ -91,11 +100,11 @@ injekt recon import --file discovered.json --test --enumerate
 3. **Passive recon only (waybackurls, alienvault OTX)** — Misses hidden params, no auth context
 
 ## Implementation Phases
-1. **Phase 1**: Basic static crawler + parameter extraction (HTML forms/links)
-2. **Phase 2**: Deduplication, scope filtering, CLI `recon crawl`
-3. **Phase 3**: Integration with detection engine (`recon scan --test`)
-4. **Phase 4**: Auto-enumeration (`--auto-enumerate --dbs`)
-5. **Phase 5**: Authenticated crawling (cookie/header import), JS endpoint discovery
+1. **Phase 1**: Basic static crawler + parameter extraction (HTML forms/links) - done
+2. **Phase 2**: Deduplication, scope filtering, CLI `recon crawl` - done
+3. **Phase 3**: Integration with detection engine (`recon scan`) - done
+4. **Phase 4**: Auto-enumeration (`--auto-enumerate --dbs`) - done
+5. **Phase 5**: Authenticated crawling (cookie/header import), static JS endpoint discovery - done
 
 ## References
 - OWASP Testing Guide: Crawling and Spidering

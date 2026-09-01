@@ -9,6 +9,7 @@ pub mod detection;
 pub mod engine;
 pub mod extraction;
 pub mod http;
+pub mod recon;
 pub mod reporting;
 pub mod session;
 pub mod target;
