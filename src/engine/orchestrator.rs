@@ -15,6 +15,7 @@ use crate::{
     techniques::{
         boolean::{detector::BooleanDetector, payloads::boolean_payloads_for},
         error::detector::ErrorDetector,
+        stacked::{detector::StackedDetector, payloads::stacked_payloads_for},
         time::{detector::TimeDetector, payloads::time_payload_for},
         union::{detector::UnionDetector, payloads::union_payloads_for},
     },
@@ -272,6 +273,23 @@ impl Engine {
                     }
                     if config.techniques.iter().any(|t| t == "union" || t == "all") {
                         test_union_bounded(
+                            &client,
+                            &state,
+                            &cancel,
+                            &target,
+                            &target_str,
+                            &param,
+                            &baseline,
+                            &marker_set,
+                        )
+                        .await;
+                    }
+                    if config
+                        .techniques
+                        .iter()
+                        .any(|t| t == "stacked" || t == "all")
+                    {
+                        test_stacked_bounded(
                             &client,
                             &state,
                             &cancel,
@@ -1268,6 +1286,48 @@ async fn test_union_bounded(
                 state.write().await.push_finding(finding);
                 return;
             }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn test_stacked_bounded(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    baseline: &baseline::Baseline,
+    marker_set: &MarkerSet,
+) {
+    let detector = StackedDetector::new();
+    let baseline_body = baseline.representative_body_str();
+    let payloads = stacked_payloads_for(None);
+    for p in payloads.iter().take(2) {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let (body, ms) = fetch_for_payload(
+            client, state, cancel, target, target_str, param, &p.payload, marker_set,
+        )
+        .await;
+        let r = detector.evaluate(&baseline_body, &body, baseline.mean_ms, ms, p);
+        if r.is_vulnerable {
+            let mut finding = Finding::new(
+                target.as_str(),
+                param.key(),
+                TechniqueKind::Stacked,
+                r.confidence,
+                format!(
+                    "stacked dbms={} marker={}",
+                    r.dbms.as_deref().unwrap_or("?"),
+                    p.marker
+                ),
+            );
+            finding.dbms = r.dbms.clone();
+            state.write().await.push_finding(finding);
+            return;
         }
     }
 }
