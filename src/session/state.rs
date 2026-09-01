@@ -123,6 +123,24 @@ impl SessionState {
     }
 
     #[must_use]
+    pub fn findings_mut(&mut self) -> &mut Vec<Finding> {
+        &mut self.findings
+    }
+
+    /// Fill `None` dbms with guessed kind (e.g., from fingerprint).
+    pub fn fill_missing_dbms(&mut self, kind: crate::dbms::DbmsKind) {
+        let s = kind.to_string();
+        if s == "unknown" {
+            return;
+        }
+        for f in &mut self.findings {
+            if f.dbms.is_none() {
+                f.dbms = Some(s.clone());
+            }
+        }
+    }
+
+    #[must_use]
     pub fn extracted_count(&self) -> usize {
         self.extracted.len()
     }

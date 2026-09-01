@@ -9,6 +9,7 @@ pub enum TechniqueOpt {
     Boolean,
     Time,
     Error,
+    Union,
     All,
 }
 
@@ -71,6 +72,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub allow_private: bool,
 
+    /// Raw HTTP request file (Burp/ZAP) — alternative to --target
+    #[arg(long, global = true)]
+    pub raw_file: Option<String>,
+
     #[arg(long, short = 'v', global = true)]
     pub verbose: bool,
 }
@@ -109,9 +114,27 @@ impl Cli {
 
     #[must_use]
     pub fn effective_target(&self) -> Option<String> {
+        if let Some(raw) = &self.raw_file
+            && let Ok(content) = std::fs::read_to_string(raw)
+            && let Ok(req) = crate::target::raw_request::RawRequest::parse(&content)
+        {
+            if let Some(url) = req.to_url("https") {
+                return Some(url);
+            }
+            if let Some(url) = req.to_url("http") {
+                return Some(url);
+            }
+        }
         self.target.clone().or_else(|| match &self.command {
             Some(Commands::Scan(a)) => a.target.clone(),
             _ => None,
         })
+    }
+
+    #[must_use]
+    pub fn raw_request(&self) -> Option<crate::target::raw_request::RawRequest> {
+        let path = self.raw_file.as_ref()?;
+        let content = std::fs::read_to_string(path).ok()?;
+        crate::target::raw_request::RawRequest::parse(&content).ok()
     }
 }

@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 pub mod common;
+pub mod fingerprint;
 pub mod mssql;
 pub mod mysql;
 pub mod oracle;

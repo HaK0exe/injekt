@@ -61,3 +61,25 @@ pub fn collect_from_url_query(url: &crate::target::url::TargetUrl) -> Vec<Target
         .map(|(k, v)| TargetParameter::new(k, ParameterLocation::Query, v))
         .collect()
 }
+
+#[must_use]
+pub fn collect_from_body(body: &str) -> Vec<TargetParameter> {
+    if body.is_empty() {
+        return Vec::new();
+    }
+    url::form_urlencoded::parse(body.as_bytes())
+        .map(|(k, v)| TargetParameter::new(k.into_owned(), ParameterLocation::Body, v.into_owned()))
+        .collect()
+}
+
+#[must_use]
+pub fn collect_from_raw_request(
+    req: &crate::target::raw_request::RawRequest,
+) -> Vec<TargetParameter> {
+    let mut out = Vec::new();
+    if let Some(body) = &req.body {
+        out.extend(collect_from_body(body));
+    }
+    // Headers as injectable (X-Forwarded-For etc) — only if needed; for now just body
+    out
+}
