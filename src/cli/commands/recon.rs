@@ -102,6 +102,11 @@ fn parse_candidates(content: &str) -> anyhow::Result<Vec<ParameterCandidate>> {
 }
 
 fn engine_config(cli: &Cli, enumerate: bool) -> EngineConfig {
+    let tampers = if cli.tamper.is_empty() {
+        Vec::new()
+    } else {
+        crate::techniques::tamper::parse_tamper_list(Some(&cli.tamper.join(",")))
+    };
     EngineConfig {
         threads: cli.threads,
         techniques: if cli.techniques.is_empty() {
@@ -109,6 +114,12 @@ fn engine_config(cli: &Cli, enumerate: bool) -> EngineConfig {
         } else {
             cli.techniques.clone()
         },
+        tampers,
+        oob_domain: cli.oob_domain.clone(),
+        oob_poll_url: cli.oob_poll_url.clone(),
+        oob_wait_secs: cli.oob_wait_secs,
+        hpp: cli.hpp,
+        chunked: cli.chunked,
         allow_private: cli.allow_private,
         no_redact: cli.no_redact,
         extract: cli.extract,

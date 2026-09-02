@@ -49,6 +49,11 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
         .build()
         .map_err(|e| anyhow::anyhow!("client build: {e}"))?;
 
+    let tampers = if cli.tamper.is_empty() {
+        Vec::new()
+    } else {
+        crate::techniques::tamper::parse_tamper_list(Some(&cli.tamper.join(",")))
+    };
     let cfg = EngineConfig {
         threads: cli.threads,
         techniques: if cli.techniques.is_empty() {
@@ -56,6 +61,12 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
         } else {
             cli.techniques.clone()
         },
+        tampers,
+        oob_domain: cli.oob_domain.clone(),
+        oob_poll_url: cli.oob_poll_url.clone(),
+        oob_wait_secs: cli.oob_wait_secs,
+        hpp: cli.hpp,
+        chunked: cli.chunked,
         allow_private: cli.allow_private,
         no_redact: cli.no_redact,
         extract: cli.extract,

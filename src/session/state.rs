@@ -14,6 +14,7 @@ pub enum TechniqueKind {
     Error,
     Union,
     Stacked,
+    Oob,
 }
 
 impl core::fmt::Display for TechniqueKind {
@@ -24,6 +25,7 @@ impl core::fmt::Display for TechniqueKind {
             Self::Error => write!(f, "error"),
             Self::Union => write!(f, "union"),
             Self::Stacked => write!(f, "stacked"),
+            Self::Oob => write!(f, "oob"),
         }
     }
 }

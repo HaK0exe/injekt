@@ -357,7 +357,28 @@ impl HttpClient {
             req = req.header(k, v);
         }
         if let Some(b) = &spec.body {
-            req = req.body(b.clone());
+            // Chunked transfer: when Transfer-Encoding: chunked is set, stream the
+            // body in small pieces so reqwest/hyper emits real chunk framing instead
+            // of Content-Length. This bypasses WAFs inspecting content-length bodies.
+            let is_chunked = spec
+                .headers
+                .get(http::header::TRANSFER_ENCODING)
+                .is_some_and(|v| {
+                    v.to_str()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                        .contains("chunked")
+                });
+            if is_chunked {
+                let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = b
+                    .chunks(5)
+                    .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+                    .collect();
+                let stream = futures::stream::iter(chunks);
+                req = req.body(reqwest::Body::wrap_stream(stream));
+            } else {
+                req = req.body(b.clone());
+            }
         }
         {
             let jar = self.cookies.read().await;

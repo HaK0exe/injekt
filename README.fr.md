@@ -30,7 +30,7 @@
 - **Cibles** : parsing URL strict (`url` crate), rejet IPs privées/loopback anti-SSRF, parser raw-request Burp/ZAP, `ParameterLocation{Query,Body,Header,Cookie}`, marqueurs `*` / `§` / `{{}}`.
 - **HTTP** (`src/http/`) : builder type-state (`timeout()` obligatoire avant `build()`), `Arc<reqwest::Client>` rustls, jitter, `RateLimiter` token-bucket, `CookieJar` mémoire (`zeroize`), rotation `Identity`, `ProxyConfig` Tor `socks5h://`, retry exponentiel + jitter, gzip/br.
 - **Détection** (`src/detection/`) : baseline 3-5 requêtes → SHA-256 + moyenne/écart-type + détection WAF 403/406, diff Levenshtein + Jaccard (`DiffResult{similarity,time_delta,confidence}`), confirmation TRUE/FALSE inversés (3 essais min).
-- **Techniques** (`src/techniques/`) : `boolean` (`OR 1=1` / `AND 1=1`, commentaires par SGBD), `time` (`SLEEP/pg_sleep/WAITFOR/BENCHMARK`, seuil `baseline+2σ`), `error` (`EXTRACTVALUE/CONVERT/CAST`), générateur avec encodages (URL, double-URL, hex, unicode) + commentaires inline + case mixing.
+- **Techniques** (`src/techniques/`) : `boolean` (`OR 1=1` / `AND 1=1`, commentaires par SGBD), `time` (`SLEEP/pg_sleep/WAITFOR/BENCHMARK`, seuil `baseline+2σ`), `error` (`EXTRACTVALUE/CONVERT/CAST`), `union` (énumération ORDER BY), `stacked` (marqueur `; SELECT`), `oob` (OPT-IN DNS/HTTP via `--oob-domain`, polling collaborateur), `tamper` évasion WAF (`--tamper space2comment,randomcase,versionedcomment,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,...` + auto `space2comment` sur WAF 403/406), tampers requête (`--hpp` pollution `?id=1&id=PAYLOAD`, `--chunked` `Transfer-Encoding: chunked` streamé).
 - **SGBD** (`src/dbms/`) : trait `DbmsDetector` en `async fn` natifs, fingerprint MySQL 8.x (`@@version`), Postgres 15+ (`version()`), MSSQL 2022 (`@@version`), Oracle 21c (`v$version`).
 - **Extraction** (`src/extraction/`) : recherche binaire ASCII 32-126, `buffer_unordered` borné, vérification longueur + checksum, `SecretString` wipé après rapport.
 - **Recon** (`src/recon/`) : crawler statique pour liens, formulaires et endpoints JS basiques ; périmètre same-origin, support robots.txt, déduplication des candidats et passage rate-limité vers scan/énumération.
@@ -85,6 +85,13 @@ injekt recon import --file discovered.json --test
 # Techniques et SGBD ciblés
 injekt --target "https://example.com/?id=1" --techniques boolean,error --dbms mysql
 
+# Contournement WAF : variantes tampers (original + chaque simple + chaîne complète)
+injekt --target "https://example.com/?id=1" --tamper space2comment,randomcase --techniques boolean,union
+
+# Tampers requête : HPP (duplique ?id=1&id=PAYLOAD) et chunked (body streamé)
+injekt --target "https://example.com/?id=1" --hpp --techniques boolean
+injekt recon scan --target "example.com" --hpp --chunked --auto-enumerate --dbs
+
 # OPSEC : Tor + jitter + rate limit
 injekt --target "https://example.com/?id=1" \
   --proxy socks5h://127.0.0.1:9050 \
@@ -124,7 +131,13 @@ Options:
       --cookies <STR>             Cookies (SecretString, masqué dans les logs)
       --proxy <URL>               http(s):// ou socks5h:// (socks5:// refusé - fuite DNS)
       --threads <N>               Concurrence [défaut: 5]
-      --techniques <LISTE>        boolean,time,error,all [défaut: all]
+      --techniques <LISTE>        boolean,time,error,union,stacked,oob,all [défaut: all]
+      --tamper <LISTE>            Tampers WAF : space2comment,space2plus,space2tab,space2newline,space2randomblank,randomcase,versionedcomment,betweencomment,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8 [défaut: aucun, auto space2comment sur WAF 403/406]
+      --hpp                       Pollution paramètres : duplique ?id=1&id=PAYLOAD (Query/Body)
+      --chunked                   Transfert chunked : body streamé Transfer-Encoding: chunked (Body uniquement)
+      --oob-domain <DOMAINE>      Domaine collaborateur (active sondes OOB, OPT-IN)
+      --oob-poll-url <URL>        URL de polling avec placeholder {token} (auto-confirmation)
+      --oob-wait-secs <N>         Attente avant polling [défaut: 5]
       --dbms <TYPE>               mysql|postgres|mssql|oracle
       --extract                   Active l'extraction (opt-in, SecretString)
       --output <CHEMIN>           Chemin rapport JSON
@@ -173,7 +186,7 @@ src/
 ├── target/{url,raw_request,parameters,markers}
 ├── http/{client,identity,proxy,cookies,redirects,retry,jitter,rate_limit}
 ├── detection/{baseline,response_diff,confirmation,scanner/{engine,scheduler}}
-├── techniques/{boolean,time,error}/{detector,payloads}
+├── techniques/{boolean,time,error,union,stacked,oob}/{detector,payloads} (+oob/verifier) + tamper (évasion WAF) + request_tamper (HPP/chunked)
 ├── dbms/{common,mysql,postgres,mssql,oracle}/{fingerprint,payloads,queries}
 ├── extraction/{engine,inference,verification}
 ├── recon/{crawler,discovery,filters,parameter}

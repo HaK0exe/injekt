@@ -30,7 +30,7 @@
 - **Targets**: strict URL parsing (`url` crate), private/loopback anti-SSRF rejection, Burp/ZAP raw-request parser, `ParameterLocation{Query,Body,Header,Cookie}`, markers `*` / `§` / `{{}}`.
 - **HTTP** (`src/http/`): type-state builder (`timeout()` mandatory before `build()`), `Arc<reqwest::Client>` rustls, jitter, `RateLimiter` token-bucket, in-memory `CookieJar` (`zeroize`), `Identity` rotation, `ProxyConfig` Tor `socks5h://`, retry exponential + jitter, redirect policy, gzip/br.
 - **Detection** (`src/detection/`): 3-5 baselines → SHA-256 + mean/σ + WAF 403/406 detection, Levenshtein + Jaccard diff (`DiffResult{similarity,time_delta,confidence}`), confirmation TRUE/FALSE inverted (3 trials min).
-- **Techniques** (`src/techniques/`): `boolean` (`OR 1=1` / `AND 1=1`, comment per DBMS), `time` (`SLEEP/pg_sleep/WAITFOR/BENCHMARK`, threshold `baseline+2σ`), `error` (`EXTRACTVALUE/CONVERT/CAST`), payload generator with encodings (URL, double-URL, hex, unicode) + inline comments + case mixing.
+- **Techniques** (`src/techniques/`): `boolean` (`OR 1=1` / `AND 1=1`, comment per DBMS), `time` (`SLEEP/pg_sleep/WAITFOR/BENCHMARK`, threshold `baseline+2σ`), `error` (`EXTRACTVALUE/CONVERT/CAST`), `union` (ORDER BY enumeration), `stacked` (`; SELECT` marker), `oob` (OPT-IN DNS/HTTP via `--oob-domain`, collaborator polling), `tamper` WAF evasion (`--tamper space2comment,randomcase,versionedcomment,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2plus/tab/newline/randomblank,betweencomment` + auto `space2comment` on WAF 403/406).
 - **DBMS** (`src/dbms/`): trait `DbmsDetector` with native `async fn`, fingerprint for MySQL 8.x (`@@version`), Postgres 15+ (`version()`), MSSQL 2022 (`@@version`), Oracle 21c (`v$version`).
 - **Extraction** (`src/extraction/`): binary search ASCII 32-126, `buffer_unordered` bounded, verification (length + checksum), `SecretString` zeroized after report.
 - **Recon** (`src/recon/`): static crawler for links, forms, and basic JS endpoints; same-origin scope control, robots.txt support, candidate deduplication, and rate-limited scan/enumeration handoff.
@@ -85,6 +85,14 @@ injekt recon import --file discovered.json --test
 # Specific techniques + DBMS
 injekt --target "https://example.com/?id=1" --techniques boolean,error --dbms mysql
 
+# WAF bypass: try tampered variants (original + each single + full chain)
+injekt --target "https://example.com/?id=1" --tamper space2comment,randomcase --techniques boolean,union
+injekt --target "https://example.com/?id=1" --tamper versionedcomment,charencode  # MySQL versioned + URL encode
+
+# Request-level tampers: HPP (?id=1&id=PAYLOAD) and chunked (streamed body)
+injekt --target "https://example.com/?id=1" --hpp --techniques boolean
+injekt recon scan --target "example.com" --hpp --chunked --auto-enumerate --dbs
+
 # OPSEC: Tor + jitter + rate limit + no private IP bypass
 injekt --target "https://example.com/?id=1" \
   --proxy socks5h://127.0.0.1:9050 \
@@ -130,7 +138,13 @@ Options:
       --cookies <STR>             Cookies (SecretString, redacted in logs)
       --proxy <URL>               http(s):// or socks5h:// (socks5:// rejected - DNS leak)
       --threads <N>               Concurrency [default: 5]
-      --techniques <LIST>         boolean,time,error,all [default: all]
+      --techniques <LIST>         boolean,time,error,union,stacked,oob,all [default: all]
+      --tamper <LIST>             WAF tampers: space2comment,space2plus,space2tab,space2newline,space2randomblank,randomcase,versionedcomment,betweencomment,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8 [default: none, auto space2comment on WAF 403/406]
+      --hpp                       HTTP Parameter Pollution: duplicate ?id=1&id=PAYLOAD (Query/Body)
+      --chunked                   Chunked transfer: streamed Transfer-Encoding: chunked body (Body only)
+      --oob-domain <DOMAIN>       Collaborator base domain (enables OOB probes, OPT-IN)
+      --oob-poll-url <URL>        Poll URL with {token} placeholder (auto-confirm callbacks)
+      --oob-wait-secs <N>         Wait before polling collaborator [default: 5]
       --dbms <KIND>               mysql|postgres|mssql|oracle
       --extract                   Enable data extraction (opt-in, SecretString)
       --output <PATH>             JSON report path
@@ -179,7 +193,7 @@ src/
 ├── target/{url,raw_request,parameters,markers}
 ├── http/{client,identity,proxy,cookies,redirects,retry,jitter,rate_limit}
 ├── detection/{baseline,response_diff,confirmation,scanner/{engine,scheduler}}
-├── techniques/{boolean,time,error}/{detector,payloads}
+├── techniques/{boolean,time,error,union,stacked,oob}/{detector,payloads} (+oob/verifier) + tamper (WAF evasion) + request_tamper (HPP/chunked)
 ├── dbms/{common,mysql,postgres,mssql,oracle}/{fingerprint,payloads,queries}
 ├── extraction/{engine,inference,verification}
 ├── recon/{crawler,discovery,filters,parameter}

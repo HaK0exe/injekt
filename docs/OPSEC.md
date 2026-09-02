@@ -40,7 +40,7 @@ injekt --import ./session.enc
 
 - **JA3** : `rustls` JA3 stable. Pour anonymisation TLS avancée, utiliser proxy `boringssl` externe. Documenté.
 - **WAF** : détection 403/406 répétitifs → `Baseline::is_waf_blocked()`, ajuster threads/jitter.
-- **OOB** : DNS exfil non implémenté en v2 (nécessite infra attaquant).
+- **OOB** (`techniques/oob`, OPT-IN) : exfil DNS/HTTP via `--oob-domain <collaborateur>` + `--oob-poll-url <url>` (placeholder `{token}`). Sans `--oob-poll-url`, sondes envoyées mais jamais auto-confirmées (vérif manuelle UI collaborateur, aucun finding sans preuve). L'egress part du **serveur DB cible** (non proxyfiable) — collaborateur auto-hébergé recommandé, jamais de domaine tiers non contrôlé.
 
 ## Checklist opérateur
 

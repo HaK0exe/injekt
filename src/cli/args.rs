@@ -10,6 +10,8 @@ pub enum TechniqueOpt {
     Time,
     Error,
     Union,
+    Stacked,
+    Oob,
     All,
 }
 
@@ -81,6 +83,30 @@ pub struct Cli {
 
     #[arg(long, global = true)]
     pub marker: Option<String>,
+
+    /// OOB collaborator base domain (e.g. x.oastify.com) — enables techniques/oob DNS/HTTP probes (OPT-IN, requires operator infra)
+    #[arg(long, global = true)]
+    pub oob_domain: Option<String>,
+
+    /// Generic collaborator poll URL for OOB confirmation (may contain {token}); without it, OOB probes are sent but never auto-confirmed
+    #[arg(long, global = true)]
+    pub oob_poll_url: Option<String>,
+
+    /// Seconds to wait for the async DB-side OOB query before polling the collaborator
+    #[arg(long, global = true, default_value_t = 5)]
+    pub oob_wait_secs: u64,
+
+    /// WAF tamper scripts (comma-separated): space2comment,randomcase,versionedcomment,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2tab,space2newline,space2randomblank,betweencomment
+    #[arg(long, global = true, value_delimiter = ',')]
+    pub tamper: Vec<String>,
+
+    /// HTTP Parameter Pollution: duplicate param (?id=1&id=PAYLOAD) for Query/Body — WAFs inspecting only first occurrence are bypassed
+    #[arg(long, global = true)]
+    pub hpp: bool,
+
+    /// Chunked transfer: send Body injections with Transfer-Encoding: chunked (streamed) to bypass content-length inspection
+    #[arg(long, global = true)]
+    pub chunked: bool,
 
     #[arg(long, global = true)]
     pub export_encrypted: Option<String>,
