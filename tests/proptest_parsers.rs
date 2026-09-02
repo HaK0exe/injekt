@@ -76,6 +76,34 @@ proptest! {
     }
 
     #[test]
+    fn json_payloads_never_panic(s in "\\PC*") {
+        for dbms in [None, Some("mysql"), Some("postgres"), Some("mssql"), Some("oracle"), Some(&s[..])] {
+            let v = injekt::techniques::json::payloads::json_payloads_for(dbms);
+            prop_assert!(!v.is_empty());
+            for p in &v {
+                prop_assert_ne!(&p.true_payload, &p.false_payload);
+                prop_assert!(!p.dbms.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn json_detector_never_panics(a in "\\PC*", b in "\\PC*", c in "\\PC*") {
+        let d = injekt::techniques::json::detector::JsonDetector::new();
+        let _ = d.evaluate_boolean(&a, &b, &c, 100.0, 105.0, 110.0);
+        let r = d.evaluate_error(&b);
+        // without error context there is never a finding
+        if !(b.to_ascii_lowercase().contains("error")
+            || b.to_ascii_lowercase().contains("exception")
+            || b.to_ascii_lowercase().contains("ora-")
+            || b.to_ascii_lowercase().contains("msg ")
+            || b.to_ascii_lowercase().contains("sql"))
+        {
+            prop_assert!(!r.is_vulnerable);
+        }
+    }
+
+    #[test]
     fn oob_helpers_never_panic(s in "\\PC*") {
         use injekt::techniques::oob::payloads::{build_subdomain, is_valid_oob_domain, sanitize_dns_label};
         let _ = is_valid_oob_domain(&s);

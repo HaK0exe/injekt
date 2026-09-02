@@ -82,6 +82,7 @@ pub fn count_query_occurrences(url_str: &str, param_name: &str) -> usize {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

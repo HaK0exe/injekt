@@ -16,6 +16,7 @@ use crate::{
     techniques::{
         boolean::{detector::BooleanDetector, payloads::boolean_payloads_for},
         error::detector::ErrorDetector,
+        json::{detector::JsonDetector, payloads::json_payloads_for},
         oob::{
             detector::OobDetector,
             payloads::{is_valid_oob_domain, new_token, oob_payloads_for},
@@ -422,6 +423,22 @@ impl Engine {
                         .any(|t| t == "stacked" || t == "all")
                     {
                         test_stacked_bounded(
+                            &client,
+                            &state,
+                            &cancel,
+                            &target,
+                            &target_str,
+                            &param,
+                            &baseline,
+                            &marker_set,
+                            raw_request.as_ref().as_ref(),
+                            &tampers,
+                            opts,
+                        )
+                        .await;
+                    }
+                    if config.techniques.iter().any(|t| t == "json" || t == "all") {
+                        test_json_bounded(
                             &client,
                             &state,
                             &cancel,
@@ -1908,6 +1925,154 @@ async fn test_stacked_bounded(
                     ),
                 );
                 finding.dbms = r.dbms.clone();
+                state.write().await.push_finding(finding);
+                found = true;
+                break;
+            }
+        }
+        if found {
+            break;
+        }
+    }
+}
+
+/// JSON-function injection: boolean differential over `JSON_EXTRACT` / `->>` /
+/// `JSON_VALUE` pairs (3-trial confirmation) plus a single-shot error probe
+/// (`__bad__` sentinel document → per-DBMS JSON error text).
+#[allow(clippy::too_many_arguments)]
+async fn test_json_bounded(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    baseline: &baseline::Baseline,
+    marker_set: &MarkerSet,
+    raw: Option<&RawRequest>,
+    tampers: &[Tamper],
+    opts: ProbeOpts,
+) {
+    let detector = JsonDetector::new();
+    let payloads = json_payloads_for(None);
+    let baseline_body = baseline.representative_body_str();
+    let tamper_sets = tamper_transformation_sets(tampers);
+    for p in payloads.iter().take(2) {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let mut found = false;
+        for trans in &tamper_sets {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let true_payload = apply_tampers(&p.true_payload, trans);
+            let false_payload = apply_tampers(&p.false_payload, trans);
+            let error_probe = apply_tampers(&p.error_payload, trans);
+            let tamper_label = if trans.is_empty() {
+                "none".to_owned()
+            } else {
+                trans.iter().map(|t| t.name()).collect::<Vec<_>>().join(",")
+            };
+            // Channel 1 — boolean differential with confirmation (3 trials)
+            let mut trials: Vec<(bool, f64)> = Vec::with_capacity(3);
+            let mut last_res: Option<crate::techniques::boolean::detector::BooleanResult> = None;
+            for _ in 0..3 {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let (true_body, true_ms) = fetch_for_payload(
+                    client,
+                    state,
+                    cancel,
+                    target,
+                    target_str,
+                    param,
+                    &true_payload,
+                    marker_set,
+                    raw,
+                    opts,
+                )
+                .await;
+                let (false_body, false_ms) = fetch_for_payload(
+                    client,
+                    state,
+                    cancel,
+                    target,
+                    target_str,
+                    param,
+                    &false_payload,
+                    marker_set,
+                    raw,
+                    opts,
+                )
+                .await;
+                let res = detector.evaluate_boolean(
+                    &baseline_body,
+                    &true_body,
+                    &false_body,
+                    baseline.mean_ms,
+                    true_ms,
+                    false_ms,
+                );
+                trials.push((res.is_vulnerable, res.confidence));
+                last_res = Some(res);
+            }
+            let conf = confirmation::confirm(&trials);
+            if conf.confirmed {
+                let res = last_res.unwrap_or_else(|| {
+                    detector.evaluate_boolean(&baseline_body, "", "", baseline.mean_ms, 0.0, 0.0)
+                });
+                let mut finding = Finding::new(
+                    target.as_str(),
+                    param.key(),
+                    TechniqueKind::Json,
+                    conf.score,
+                    format!(
+                        "json channel=boolean dbms={} true_sim={:.2} false_sim={:.2} trials={}/3 fp={:.2} tamper={}{}",
+                        p.dbms,
+                        res.true_similarity,
+                        res.false_similarity,
+                        conf.trials,
+                        conf.false_positive_prob,
+                        tamper_label,
+                        opts.evidence_suffix()
+                    ),
+                );
+                finding.dbms = Some(p.dbms.clone());
+                state.write().await.push_finding(finding);
+                found = true;
+                break;
+            }
+            // Channel 2 — single-shot JSON error probe
+            let (body, _ms) = fetch_for_payload(
+                client,
+                state,
+                cancel,
+                target,
+                target_str,
+                param,
+                &error_probe,
+                marker_set,
+                raw,
+                opts,
+            )
+            .await;
+            let r = detector.evaluate_error(&body);
+            if r.is_vulnerable {
+                let mut finding = Finding::new(
+                    target.as_str(),
+                    param.key(),
+                    TechniqueKind::Json,
+                    r.confidence,
+                    format!(
+                        "json channel=error pattern={:?} tamper={}{}",
+                        r.matched_pattern,
+                        tamper_label,
+                        opts.evidence_suffix()
+                    ),
+                );
+                finding.dbms = r.dbms.clone().or_else(|| Some(p.dbms.clone()));
                 state.write().await.push_finding(finding);
                 found = true;
                 break;

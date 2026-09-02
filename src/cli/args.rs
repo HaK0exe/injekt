@@ -12,6 +12,7 @@ pub enum TechniqueOpt {
     Union,
     Stacked,
     Oob,
+    Json,
     All,
 }
 

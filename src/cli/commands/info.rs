@@ -1,19 +1,62 @@
 #![deny(unsafe_code)]
 
+use serde::{Deserialize, Serialize};
+
+/// Structured info about injekt capabilities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfoResult {
+    pub version: String,
+    pub techniques: Vec<String>,
+    pub tampers: Vec<String>,
+    pub oob: String,
+    pub request_tampers: String,
+    pub dbms: Vec<String>,
+    pub docs: String,
+}
+
+/// Return structured info without printing to stdout.
+pub fn info() -> InfoResult {
+    InfoResult {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        techniques: vec![
+            "boolean".to_string(),
+            "time".to_string(),
+            "error".to_string(),
+            "union".to_string(),
+            "stacked".to_string(),
+            "oob".to_string(),
+            "json".to_string(),
+        ],
+        tampers: crate::techniques::tamper::Tamper::all_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        oob: "opt-in via --oob-domain <collaborator> [--oob-poll-url <url> with {token}]"
+            .to_string(),
+        request_tampers:
+            "--hpp (duplicate ?id=1&id=PAYLOAD), --chunked (Transfer-Encoding: chunked body)"
+                .to_string(),
+        dbms: vec![
+            "mysql".to_string(),
+            "postgres".to_string(),
+            "mssql".to_string(),
+            "oracle".to_string(),
+        ],
+        docs: "docs/OPSEC.md (JA3, jitter, proxy socks5h)".to_string(),
+    }
+}
+
+/// Original CLI entry point — prints to stdout.
 pub fn run() {
+    let info = info();
     println!(
         "injekt v{} — modern SQLi detection (zero persistence, OPSEC by design)",
-        env!("CARGO_PKG_VERSION")
+        info.version
     );
-    println!("Techniques: boolean, time, error, union, stacked, oob");
-    println!(
-        "Tampers: {}",
-        crate::techniques::tamper::Tamper::all_names().join(", ")
-    );
-    println!("OOB: opt-in via --oob-domain <collaborator> [--oob-poll-url <url> with {{token}}]");
-    println!(
-        "Request tampers: --hpp (duplicate ?id=1&id=PAYLOAD), --chunked (Transfer-Encoding: chunked body)"
-    );
-    println!("DBMS: mysql, postgres, mssql, oracle");
-    println!("Docs: docs/OPSEC.md (JA3, jitter, proxy socks5h)");
+    println!("Techniques: {}", info.techniques.join(", "));
+    println!("Tampers: {}", info.tampers.join(", "));
+    println!("OOB: {}", info.oob);
+    println!("Request tampers: {}", info.request_tampers);
+    println!("DBMS: {}", info.dbms.join(", "));
+    println!("Docs: {}", info.docs);
 }

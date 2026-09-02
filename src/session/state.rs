@@ -15,6 +15,7 @@ pub enum TechniqueKind {
     Union,
     Stacked,
     Oob,
+    Json,
 }
 
 impl core::fmt::Display for TechniqueKind {
@@ -26,6 +27,7 @@ impl core::fmt::Display for TechniqueKind {
             Self::Union => write!(f, "union"),
             Self::Stacked => write!(f, "stacked"),
             Self::Oob => write!(f, "oob"),
+            Self::Json => write!(f, "json"),
         }
     }
 }
