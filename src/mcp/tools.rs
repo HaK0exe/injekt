@@ -244,6 +244,7 @@ impl InjektServer {
             target: params.target,
             depth: params.depth.unwrap_or(2),
             max_pages: params.max_pages.unwrap_or(100),
+            max_per_template: params.max_per_template.unwrap_or(3),
             include_subdomains: params.include_subdomains.unwrap_or(false),
             ignore_robots: params.ignore_robots.unwrap_or(false),
         };
@@ -272,6 +273,7 @@ impl InjektServer {
                 target: params.target,
                 depth: params.depth.unwrap_or(2),
                 max_pages: params.max_pages.unwrap_or(100),
+                max_per_template: params.max_per_template.unwrap_or(3),
                 include_subdomains: params.include_subdomains.unwrap_or(false),
                 ignore_robots: params.ignore_robots.unwrap_or(false),
             },
@@ -575,6 +577,9 @@ pub struct ReconCrawlParams {
     pub depth: Option<usize>,
     /// Maximum pages to crawl (default: 100, max: 100000)
     pub max_pages: Option<usize>,
+    /// Max pages fetched per page template — path shape + query param names
+    /// (default: 3), caps pagination/listing/calendar crawl traps
+    pub max_per_template: Option<usize>,
     /// Include subdomains
     pub include_subdomains: Option<bool>,
     /// Ignore robots.txt
@@ -610,6 +615,9 @@ pub struct ReconScanParams {
     pub depth: Option<usize>,
     /// Maximum pages to crawl (default: 100, max: 100000)
     pub max_pages: Option<usize>,
+    /// Max pages fetched per page template — path shape + query param names
+    /// (default: 3), caps pagination/listing/calendar crawl traps
+    pub max_per_template: Option<usize>,
     /// Include subdomains
     pub include_subdomains: Option<bool>,
     /// Ignore robots.txt

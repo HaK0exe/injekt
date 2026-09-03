@@ -65,4 +65,28 @@ impl DbmsDetector for PostgresDetector {
     fn file_read_query(&self, path: &str) -> Option<String> {
         Some(format!("SELECT pg_read_file('{path}')"))
     }
+    fn fingerprint_probe(&self) -> (String, String) {
+        // current_setting('server_version_num') only exists on Postgres and
+        // is never NULL there; elsewhere the unknown-function call errors
+        // identically for both branches.
+        (
+            "' AND (current_setting('server_version_num') IS NOT NULL) --".to_owned(),
+            "' AND (current_setting('server_version_num') IS NULL) --".to_owned(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_probe_uses_postgres_only_function() {
+        let (true_p, false_p) = PostgresDetector.fingerprint_probe();
+        assert!(true_p.contains("current_setting"));
+        assert!(false_p.contains("current_setting"));
+        assert!(true_p.contains("IS NOT NULL"));
+        assert!(false_p.contains("IS NULL") && !false_p.contains("IS NOT NULL"));
+        assert_ne!(true_p, false_p);
+    }
 }

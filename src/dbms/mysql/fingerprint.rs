@@ -66,9 +66,34 @@ impl DbmsDetector for MySqlDetector {
     fn file_read_query(&self, path: &str) -> Option<String> {
         Some(format!("SELECT LOAD_FILE('{path}')"))
     }
+    fn fingerprint_probe(&self) -> (String, String) {
+        // Versioned comment `/*!50000 ...*/` only executes its content on
+        // MySQL (>= 5.00.00); every other engine treats it as an inert
+        // block comment, leaving a dangling `AND` (syntax error) on both
+        // branches — no differential outside MySQL.
+        (
+            "' AND/*!50000 1=1*/ -- -".to_owned(),
+            "' AND/*!50000 1=0*/ -- -".to_owned(),
+        )
+    }
 }
 
 #[must_use]
 pub fn is_mysql_banner(s: &str) -> bool {
     s.to_ascii_lowercase().contains("mysql") || s.contains("@@version")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_probe_differs_only_in_truth_value() {
+        let (true_p, false_p) = MySqlDetector.fingerprint_probe();
+        assert!(true_p.contains("1=1"));
+        assert!(false_p.contains("1=0"));
+        assert!(true_p.contains("/*!50000"));
+        assert!(false_p.contains("/*!50000"));
+        assert_ne!(true_p, false_p);
+    }
 }

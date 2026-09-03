@@ -65,4 +65,28 @@ impl DbmsDetector for MsSqlDetector {
     fn file_read_query(&self, _path: &str) -> Option<String> {
         None
     }
+    fn fingerprint_probe(&self) -> (String, String) {
+        // SUSER_SNAME() only exists on MSSQL/Sybase and never returns NULL
+        // for the connecting login; elsewhere the unknown-function call
+        // errors identically for both branches.
+        (
+            "' AND (SUSER_SNAME() IS NOT NULL) --".to_owned(),
+            "' AND (SUSER_SNAME() IS NULL) --".to_owned(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_probe_uses_mssql_only_function() {
+        let (true_p, false_p) = MsSqlDetector.fingerprint_probe();
+        assert!(true_p.contains("SUSER_SNAME()"));
+        assert!(false_p.contains("SUSER_SNAME()"));
+        assert!(true_p.contains("IS NOT NULL"));
+        assert!(false_p.contains("IS NULL") && !false_p.contains("IS NOT NULL"));
+        assert_ne!(true_p, false_p);
+    }
 }

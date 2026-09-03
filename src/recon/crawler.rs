@@ -3,7 +3,7 @@
 use crate::{
     http::client::{HttpClient, RequestSpec},
     recon::{
-        filters::{is_in_scope, normalize_page_url},
+        filters::{is_in_scope, normalize_page_url, page_template_key},
         parameter::{CandidateMethod, FormContext, ParamType, ParameterCandidate},
     },
     target::{parameters::ParameterLocation, url::TargetUrl},
@@ -12,7 +12,7 @@ use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -22,6 +22,10 @@ use url::Url;
 pub struct CrawlConfig {
     pub depth: usize,
     pub max_pages: usize,
+    /// Cap on how many pages sharing the same [`page_template_key`] are
+    /// fetched — guards against pagination/listing/calendar traps burning
+    /// the whole `max_pages` budget on redundant instances of one page shape.
+    pub max_per_template: usize,
     pub include_subdomains: bool,
     pub respect_robots: bool,
     pub allow_private: bool,
@@ -32,6 +36,7 @@ impl Default for CrawlConfig {
         Self {
             depth: 2,
             max_pages: 100,
+            max_per_template: 3,
             include_subdomains: false,
             respect_robots: true,
             allow_private: false,
@@ -82,20 +87,29 @@ impl Crawler {
 
     /// # Errors
     /// Returns an error if the target URL fails to parse or a network request fails.
+    #[allow(clippy::too_many_lines)]
     pub async fn crawl(
         &self,
         target: &str,
         cancel: &CancellationToken,
     ) -> anyhow::Result<CrawlReport> {
+        let started = std::time::Instant::now();
         let root = parse_target(target, self.config.allow_private)?;
+        tracing::info!(
+            "starting crawl at '{root}' (depth: {}, max pages: {})",
+            self.config.depth,
+            self.config.max_pages
+        );
         let robots = if self.config.respect_robots {
-            self.load_robots(&root, cancel).await
+            self.load_robots_logged(&root, cancel).await
         } else {
             RobotsRules::default()
         };
         let mut queue = VecDeque::from([(root.clone(), 0usize)]);
         let mut queued = HashSet::from([normalize_page_url(root.clone()).to_string()]);
         let mut visited = HashSet::new();
+        let mut template_counts: HashMap<String, usize> = HashMap::new();
+        let mut capped_templates = HashSet::new();
         let mut candidate_keys = HashSet::new();
         let mut candidates = Vec::new();
         let mut warnings = Vec::new();
@@ -108,9 +122,26 @@ impl Crawler {
                 continue;
             }
             let page_key = normalize_page_url(page_url.clone()).to_string();
-            if !visited.insert(page_key) {
+            if visited.contains(&page_key) {
                 continue;
             }
+            // Cap instances of the same page shape (path pattern + query
+            // param names) before committing this page as visited, so
+            // pagination/listing/calendar traps can't burn the whole
+            // max_pages budget on redundant variants of one template.
+            let template_key = page_template_key(&page_url);
+            let template_count = template_counts.entry(template_key.clone()).or_insert(0);
+            if *template_count >= self.config.max_per_template {
+                if capped_templates.insert(template_key.clone()) {
+                    tracing::info!(
+                        "template '{template_key}' reached --max-per-template ({}), skipping further instances",
+                        self.config.max_per_template
+                    );
+                }
+                continue;
+            }
+            *template_count += 1;
+            visited.insert(page_key);
             let response = self
                 .client
                 .send_with_retry(RequestSpec::get(page_url.to_string()), cancel)
@@ -118,11 +149,13 @@ impl Crawler {
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
+                    tracing::warn!("{page_url}: {error}");
                     warnings.push(format!("{page_url}: {error}"));
                     continue;
                 }
             };
             if !response.status().is_success() {
+                tracing::warn!("{}: HTTP {}", page_url, response.status());
                 warnings.push(format!("{}: HTTP {}", page_url, response.status()));
                 continue;
             }
@@ -137,11 +170,13 @@ impl Crawler {
             let body = match response.text().await {
                 Ok(body) => body,
                 Err(error) => {
+                    tracing::warn!("{page_url}: body read failed: {error}");
                     warnings.push(format!("{page_url}: body read failed: {error}"));
                     continue;
                 }
             };
             let extracted = extract_document(&page_url, &body);
+            let mut found_here = 0usize;
             for candidate in extracted.candidates {
                 if is_in_scope(&root, &candidate.url, self.config.include_subdomains)
                     && TargetUrl::parse(candidate.url.as_str(), self.config.allow_private).is_ok()
@@ -149,7 +184,22 @@ impl Crawler {
                     && candidate_keys.insert(candidate.dedup_key())
                 {
                     candidates.push(candidate);
+                    found_here += 1;
                 }
+            }
+            if found_here > 0 {
+                tracing::info!(
+                    "[{}/{}] {page_url} ({found_here} parameter{} found)",
+                    visited.len(),
+                    self.config.max_pages,
+                    if found_here == 1 { "" } else { "s" }
+                );
+            } else {
+                tracing::debug!(
+                    "[{}/{}] {page_url} (no parameters)",
+                    visited.len(),
+                    self.config.max_pages
+                );
             }
             if depth < self.config.depth {
                 for link in extracted.links {
@@ -167,12 +217,32 @@ impl Crawler {
         }
 
         candidates.sort_by_key(ParameterCandidate::dedup_key);
+        tracing::info!(
+            "crawl finished: {} page(s) visited, {} parameter(s) found in {:.2}s",
+            visited.len(),
+            candidates.len(),
+            started.elapsed().as_secs_f64()
+        );
         Ok(CrawlReport {
             target: root,
             pages_visited: visited.len(),
             candidates,
             warnings,
         })
+    }
+
+    async fn load_robots_logged(&self, root: &Url, cancel: &CancellationToken) -> RobotsRules {
+        let rules = self.load_robots(root, cancel).await;
+        if rules.disallow.is_empty() && rules.allow.is_empty() {
+            tracing::info!("no robots.txt restrictions found");
+        } else {
+            tracing::info!(
+                "parsed robots.txt ({} disallow, {} allow rule(s))",
+                rules.disallow.len(),
+                rules.allow.len()
+            );
+        }
+        rules
     }
 
     async fn load_robots(&self, root: &Url, cancel: &CancellationToken) -> RobotsRules {

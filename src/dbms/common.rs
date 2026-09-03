@@ -64,6 +64,17 @@ pub trait DbmsDetector: Send + Sync {
     ) -> String;
     fn count_rows_query(&self, db: &str, table: &str) -> String;
     fn file_read_query(&self, path: &str) -> Option<String>;
+    /// Active differential fingerprint probe: `(true_payload, false_payload)`
+    /// base fragments (before tamper/opts transform), built around a function
+    /// or variable unique to this DBMS (e.g. MySQL versioned comments,
+    /// Postgres `current_setting`, MSSQL `SUSER_SNAME()`, Oracle
+    /// `SYS_CONTEXT`). On the real DBMS, `true_payload` renders like the
+    /// baseline and `false_payload` doesn't; on any other DBMS the unique
+    /// call itself errors identically for both branches, so no differential
+    /// appears — a false positive here would require another DBMS to expose
+    /// the same symbol under the same semantics, which the choices below
+    /// avoid.
+    fn fingerprint_probe(&self) -> (String, String);
 }
 
 /// Owned detector for a [`DbmsKind`], so generic blind-extraction code can

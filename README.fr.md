@@ -42,7 +42,19 @@
 
 ## Installation
 
-### Binaire précompilé (sans Rust)
+### Installation en une commande (Linux/macOS, sans Rust)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HaK0exe/injekt/main/install.sh | sh
+```
+
+Détecte ton OS/architecture, télécharge le binaire correspondant depuis la dernière
+[GitHub Release](https://github.com/HaK0exe/injekt/releases), le vérifie contre
+`SHA256SUMS`, et l'installe dans `~/.local/bin` (surcharge avec `INJEKT_INSTALL_DIR`;
+épingle une version avec `INJEKT_VERSION=v0.1.0`). Lis [`install.sh`](install.sh) avant
+de le piper dans `sh` — même règle que pour tout installeur curl-pipe.
+
+### Binaire précompilé (manuel, sans Rust)
 
 Chaque release taguée publie des binaires Linux, macOS (x86_64 + arm64) et Windows —
 récupère-les sur [GitHub Releases](https://github.com/HaK0exe/injekt/releases), vérifie

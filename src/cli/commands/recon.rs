@@ -182,6 +182,7 @@ async fn crawl(
     let config = CrawlConfig {
         depth: args.depth.min(16),
         max_pages: args.max_pages.min(100_000),
+        max_per_template: args.max_per_template.max(1),
         include_subdomains: args.include_subdomains,
         respect_robots: !args.ignore_robots,
         allow_private: cli.allow_private,

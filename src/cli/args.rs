@@ -262,6 +262,11 @@ pub struct ReconCrawlArgs {
     pub depth: usize,
     #[arg(long, default_value_t = 100)]
     pub max_pages: usize,
+    /// Cap on how many pages of the same shape (path pattern + query param
+    /// names) are fetched — guards against pagination/listing/calendar traps
+    /// burning the whole --max-pages budget on redundant instances.
+    #[arg(long, default_value_t = 3)]
+    pub max_per_template: usize,
     #[arg(long)]
     pub include_subdomains: bool,
     #[arg(long)]
