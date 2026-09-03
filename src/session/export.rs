@@ -202,7 +202,10 @@ mod tests {
     }
 
     fn temp_path() -> String {
-        let path = format!("/tmp/injekt_test_export_{}.enc", rand::random::<u64>());
+        let path = std::env::temp_dir()
+            .join(format!("injekt_test_export_{}.enc", rand::random::<u64>()))
+            .to_string_lossy()
+            .into_owned();
         std::fs::remove_file(&path).ok();
         path
     }
