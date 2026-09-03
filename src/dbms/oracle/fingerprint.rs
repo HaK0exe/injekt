@@ -65,4 +65,28 @@ impl DbmsDetector for OracleDetector {
     fn file_read_query(&self, _path: &str) -> Option<String> {
         None
     }
+    fn fingerprint_probe(&self) -> (String, String) {
+        // SYS_CONTEXT('USERENV','CURRENT_USER') only exists on Oracle and
+        // never returns NULL for an authenticated session; elsewhere the
+        // unknown-function call errors identically for both branches.
+        (
+            "' AND (SYS_CONTEXT('USERENV','CURRENT_USER') IS NOT NULL) --".to_owned(),
+            "' AND (SYS_CONTEXT('USERENV','CURRENT_USER') IS NULL) --".to_owned(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_probe_uses_oracle_only_function() {
+        let (true_p, false_p) = OracleDetector.fingerprint_probe();
+        assert!(true_p.contains("SYS_CONTEXT"));
+        assert!(false_p.contains("SYS_CONTEXT"));
+        assert!(true_p.contains("IS NOT NULL"));
+        assert!(false_p.contains("IS NULL") && !false_p.contains("IS NOT NULL"));
+        assert_ne!(true_p, false_p);
+    }
 }
