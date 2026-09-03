@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use http::Method;
 use injekt::{
     http::client::{HttpClient, RequestSpec},
@@ -79,7 +79,7 @@ async fn baseline_waf_detection() {
             duration: Duration::from_millis(52),
         },
     ];
-    let bl = Baseline::new(samples);
+    let bl = Baseline::new(&samples);
     assert!(bl.is_waf_blocked());
     assert!(!bl.representative_body.is_empty());
 }

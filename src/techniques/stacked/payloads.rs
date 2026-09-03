@@ -33,6 +33,7 @@ pub fn stacked_payloads_for(dbms: Option<&str>) -> Vec<StackedPayload> {
         "stacked_{}",
         uuid::Uuid::new_v4().simple().to_string().replace('-', "")
     );
+    #[allow(clippy::match_same_arms)]
     let comment = match dbms {
         Some("mysql") => " -- -",
         Some("postgres") => " --",
@@ -48,7 +49,7 @@ pub fn stacked_payloads_for(dbms: Option<&str>) -> Vec<StackedPayload> {
         base_marker.clone(),
     ));
     // SELECT with string concat (MySQL/Postgres)
-    if matches!(dbms, Some("mysql") | Some("postgres")) {
+    if matches!(dbms, Some("mysql" | "postgres")) {
         out.push(StackedPayload::new(
             format!("; SELECT CONCAT('{base_marker}'){comment}"),
             dbms.unwrap_or("generic"),

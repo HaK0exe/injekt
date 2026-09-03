@@ -1,7 +1,8 @@
 #![deny(unsafe_code)]
-#![allow(clippy::pedantic)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
+#![deny(clippy::dbg_macro)]
+#![deny(clippy::todo)]
 
 use clap::Parser as _;
 use injekt::cli::{
@@ -15,12 +16,22 @@ use tracing_subscriber::{EnvFilter, fmt};
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // MCP mode branches off before any stdout tracing is installed:
+    // on stdio transport, stdout is the JSON-RPC channel.
+    if matches!(cli.command, Some(Commands::Mcp(_))) {
+        return injekt::mcp::server::run_mcp().await;
+    }
+
     let filter = if cli.verbose { "debug" } else { "info" };
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
         )
         .init();
+
+    if !cli.no_banner {
+        injekt::cli::output::console::banner();
+    }
 
     let cancel = CancellationToken::new();
     let c = cancel.clone();
@@ -39,17 +50,19 @@ async fn main() -> anyhow::Result<()> {
             commands::recon::run(cli, cancel).await?;
         }
         Some(Commands::Replay(_)) => {
-            commands::replay::run(cli).await?;
+            commands::replay::run(cli)?;
         }
         Some(Commands::Info(_)) => {
             commands::info::run();
         }
+        // `Mcp` is handled before tracing init above (stdout must stay pure
+        // JSON-RPC); no second branch here.
         Some(_) => {
             eprintln!("Unknown command");
             std::process::exit(2);
         }
         None => {
-            if cli.effective_target().is_some() {
+            if cli.bulk_file.is_some() || cli.effective_target().is_some() {
                 commands::scan::run(cli, cancel).await?;
             } else {
                 eprintln!("No target provided. Use --target <URL> or `injekt scan --target <URL>`");

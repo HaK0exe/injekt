@@ -23,6 +23,24 @@ impl DbmsDetector for MySqlDetector {
     fn extract_user_query(&self) -> String {
         "SELECT USER()".to_owned()
     }
+    fn banner_query(&self) -> String {
+        super::queries::banner().to_owned()
+    }
+    fn current_user_query(&self) -> String {
+        super::queries::user().to_owned()
+    }
+    fn current_db_query(&self) -> String {
+        super::queries::current_db().to_owned()
+    }
+    fn hostname_query(&self) -> String {
+        super::queries::hostname().to_owned()
+    }
+    fn length_expr(&self, query: &str) -> String {
+        format!("LENGTH(({query}))")
+    }
+    fn ascii_cmp_expr(&self, query: &str, pos: usize, mid: u8) -> String {
+        format!("ASCII(SUBSTRING(({query}),{},1))>={mid}", pos + 1)
+    }
     fn list_databases_query(&self) -> String {
         enumeration::list_databases().to_owned()
     }

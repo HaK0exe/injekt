@@ -20,6 +20,19 @@ pub struct DiscoveryReport {
     pub errors: Vec<String>,
 }
 
+impl DiscoveryReport {
+    /// Scrubbed clone for CLI / MCP output.
+    #[must_use]
+    pub fn scrubbed(&self, scrubber: &crate::session::scrubber::Scrubber) -> Self {
+        Self {
+            candidates_tested: self.candidates_tested,
+            findings: self.findings.iter().map(|f| f.scrubbed(scrubber)).collect(),
+            request_count: self.request_count,
+            errors: self.errors.iter().map(|e| scrubber.scrub(e)).collect(),
+        }
+    }
+}
+
 pub async fn scan_candidates(
     candidates: Vec<ParameterCandidate>,
     config: EngineConfig,

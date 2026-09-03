@@ -27,6 +27,7 @@ pub fn normalize_page_url(mut url: Url) -> Url {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

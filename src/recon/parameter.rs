@@ -74,13 +74,10 @@ impl ParameterCandidate {
                 "Content-Type".to_owned(),
                 "application/x-www-form-urlencoded".to_owned(),
             );
-            let fields = self
-                .form_context
-                .as_ref()
-                .map(|context| context.fields.clone())
-                .unwrap_or_else(|| {
-                    BTreeMap::from([(self.param_name.clone(), self.original_value.clone())])
-                });
+            let fields = self.form_context.as_ref().map_or_else(
+                || BTreeMap::from([(self.param_name.clone(), self.original_value.clone())]),
+                |context| context.fields.clone(),
+            );
             Some(
                 url::form_urlencoded::Serializer::new(String::new())
                     .extend_pairs(fields)
@@ -126,5 +123,32 @@ impl ParameterCandidate {
             self.location,
             self.param_name
         )
+    }
+
+    /// Scrubbed clone for reports / MCP output (URLs may carry session tokens).
+    #[must_use]
+    pub fn scrubbed(&self, scrubber: &crate::session::scrubber::Scrubber) -> Self {
+        let scrubbed_url = scrubber.scrub(self.url.as_str());
+        let url = scrubbed_url.parse().unwrap_or_else(|_| self.url.clone());
+        let form_context = self.form_context.as_ref().map(|ctx| {
+            let source = scrubber.scrub(ctx.source_url.as_str());
+            FormContext {
+                source_url: source.parse().unwrap_or_else(|_| ctx.source_url.clone()),
+                fields: ctx
+                    .fields
+                    .iter()
+                    .map(|(k, v)| (scrubber.scrub(k), scrubber.scrub(v)))
+                    .collect(),
+            }
+        });
+        Self {
+            url,
+            method: self.method,
+            param_name: scrubber.scrub(&self.param_name),
+            location: self.location.clone(),
+            param_type: self.param_type,
+            original_value: scrubber.scrub(&self.original_value),
+            form_context,
+        }
     }
 }

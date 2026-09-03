@@ -73,8 +73,7 @@ impl CookieJar {
             {
                 let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
                 if let Some(d) = &meta.domain
-                    && !host.ends_with(d)
-                    && host != d.as_str()
+                    && !(host == d.as_str() || host.ends_with(&format!(".{d}")))
                 {
                     continue;
                 }
@@ -119,7 +118,7 @@ impl CookieJar {
         for attr in parts {
             if let Some((ak, av)) = attr.split_once('=') {
                 match ak.trim().to_ascii_lowercase().as_str() {
-                    "path" => meta.path = av.trim().to_owned(),
+                    "path" => av.trim().clone_into(&mut meta.path),
                     "domain" => {
                         meta.domain = Some(av.trim().trim_start_matches('.').to_ascii_lowercase());
                     }
@@ -143,6 +142,7 @@ impl CookieJar {
                     _ => {}
                 }
             } else {
+                #[allow(clippy::match_same_arms)]
                 match attr.to_ascii_lowercase().as_str() {
                     "secure" => meta.secure = true,
                     "httponly" => {}
@@ -153,7 +153,7 @@ impl CookieJar {
         // Domain validation if url present
         if let (Some(d), Some(u)) = (&meta.domain, url) {
             let host = u.host_str().unwrap_or("").to_ascii_lowercase();
-            if !host.ends_with(d) && host != d.as_str() {
+            if !(host == d.as_str() || host.ends_with(&format!(".{d}"))) {
                 return;
             }
         }
@@ -161,14 +161,18 @@ impl CookieJar {
     }
 
     pub fn clear(&mut self) {
+        for meta in self.cookies.values_mut() {
+            meta.value.zeroize();
+        }
         self.cookies.clear();
+        self.cookies.shrink_to_fit();
     }
 }
 
 fn default_path(url: &url::Url) -> String {
     let p = url.path();
     if let Some(idx) = p.rfind('/') {
-        p[..idx + 1].to_owned()
+        p[..=idx].to_owned()
     } else {
         "/".to_owned()
     }
@@ -176,7 +180,11 @@ fn default_path(url: &url::Url) -> String {
 
 impl Zeroize for CookieJar {
     fn zeroize(&mut self) {
+        for meta in self.cookies.values_mut() {
+            meta.value.zeroize();
+        }
         self.cookies.clear();
+        self.cookies.shrink_to_fit();
     }
 }
 impl Drop for CookieJar {

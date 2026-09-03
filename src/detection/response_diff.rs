@@ -18,11 +18,17 @@ impl DiffResult {
     }
 }
 
-/// Normalized Levenshtein similarity 0..1.
+const MAX_LEVENSHTEIN_LEN: usize = 4096;
+
+/// Normalized Levenshtein similarity 0..1. Truncates inputs to 4096 chars.
 #[must_use]
+// Inputs are truncated to MAX_LEVENSHTEIN_LEN (4096); casts are always lossless.
+#[allow(clippy::cast_precision_loss)]
 pub fn levenshtein_similarity(a: &str, b: &str) -> f64 {
-    let dist = levenshtein_distance(a, b);
-    let max_len = a.len().max(b.len()).max(1) as f64;
+    let a_trunc = truncate(a);
+    let b_trunc = truncate(b);
+    let dist = levenshtein_distance(a_trunc, b_trunc);
+    let max_len = a_trunc.len().max(b_trunc.len()).max(1) as f64;
     1.0 - (dist as f64 / max_len)
 }
 
@@ -50,8 +56,29 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
     prev[m]
 }
 
+#[inline]
+fn truncate(s: &str) -> &str {
+    if s.len() <= MAX_LEVENSHTEIN_LEN {
+        s
+    } else {
+        &s[..MAX_LEVENSHTEIN_LEN]
+    }
+}
+
+/// Choose similarity strategy based on body size: Levenshtein for small, Jaccard for large.
+#[must_use]
+pub fn adaptive_similarity(a: &str, b: &str) -> f64 {
+    if a.len() > MAX_LEVENSHTEIN_LEN || b.len() > MAX_LEVENSHTEIN_LEN {
+        jaccard(a, b)
+    } else {
+        levenshtein_similarity(a, b)
+    }
+}
+
 /// Jaccard index over whitespace tokens.
 #[must_use]
+// Token-set sizes never approach f64's 2^52 mantissa limit for HTTP response bodies.
+#[allow(clippy::cast_precision_loss)]
 pub fn jaccard(a: &str, b: &str) -> f64 {
     let sa: std::collections::HashSet<&str> = a.split_whitespace().collect();
     let sb: std::collections::HashSet<&str> = b.split_whitespace().collect();
@@ -65,6 +92,8 @@ pub fn jaccard(a: &str, b: &str) -> f64 {
 
 /// Build `DiffResult` from baseline and candidate response.
 #[must_use]
+// HTTP response bodies never approach i64::MAX/usize precision-loss thresholds.
+#[allow(clippy::cast_possible_wrap)]
 pub fn diff_against_baseline(
     baseline_body: &str,
     candidate_body: &str,
@@ -72,7 +101,7 @@ pub fn diff_against_baseline(
     candidate_ms: f64,
     sigma: f64,
 ) -> DiffResult {
-    let similarity = levenshtein_similarity(baseline_body, candidate_body);
+    let similarity = adaptive_similarity(baseline_body, candidate_body);
     let j = jaccard(baseline_body, candidate_body);
     let combined_sim = (similarity * 0.7 + j * 0.3).clamp(0.0, 1.0);
     let time_delta = candidate_ms - baseline_ms;
@@ -104,6 +133,8 @@ mod tests {
         assert!((levenshtein_similarity("hello", "hello") - 1.0).abs() < 1e-6);
     }
     #[test]
+    // jaccard("", "") takes the early-return literal-1.0 path; exact comparison is safe.
+    #[allow(clippy::float_cmp)]
     fn jaccard_empty() {
         assert_eq!(jaccard("", ""), 1.0);
     }

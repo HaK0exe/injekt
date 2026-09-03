@@ -32,31 +32,25 @@ impl JsonReport {
     }
 
     #[must_use]
-    pub fn to_json(&self, scrubber: &Scrubber) -> String {
+    pub fn scrubbed(&self, scrubber: &Scrubber) -> Self {
         let scrubbed_evidences: Vec<Evidence> = self
             .evidences
             .iter()
             .map(|e| e.scrubbed(scrubber))
             .collect();
-        let scrubbed_findings: Vec<Finding> = self
-            .findings
-            .iter()
-            .map(|f| Finding {
-                target: scrubber.scrub(&f.target),
-                parameter: scrubber.scrub(&f.parameter),
-                technique: f.technique,
-                confidence: f.confidence,
-                dbms: f.dbms.clone().map(|d| scrubber.scrub(&d)),
-                evidence: scrubber.scrub(&f.evidence),
-                timestamp: f.timestamp,
-            })
-            .collect();
-        let report = JsonReport {
+        let scrubbed_findings: Vec<Finding> =
+            self.findings.iter().map(|f| f.scrubbed(scrubber)).collect();
+        Self {
             target: scrubber.scrub(&self.target),
             findings: scrubbed_findings,
             evidences: scrubbed_evidences,
             request_count: self.request_count,
-        };
+        }
+    }
+
+    #[must_use]
+    pub fn to_json(&self, scrubber: &Scrubber) -> String {
+        let report = self.scrubbed(scrubber);
         serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
     }
 }

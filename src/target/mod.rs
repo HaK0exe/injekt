@@ -1,8 +1,10 @@
 #![deny(unsafe_code)]
 
+pub mod bulk;
 pub mod markers;
 pub mod parameters;
 pub mod raw_request;
+pub mod structured;
 pub mod url;
 
 pub use markers::{InjectionMarker, MarkerSet};

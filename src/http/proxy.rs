@@ -11,14 +11,47 @@ pub enum ProxyError {
     DnsLeak,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum ProxyConfig {
     Http(String),
     Socks5h(String),
 }
 
+impl core::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Http(s) | Self::Socks5h(s) => {
+                let redacted = redact_credentials(s);
+                f.debug_tuple(match self {
+                    Self::Http(_) => "Http",
+                    Self::Socks5h(_) => "Socks5h",
+                })
+                .field(&redacted)
+                .finish()
+            }
+        }
+    }
+}
+
+fn redact_credentials(url: &str) -> String {
+    if let Some(at_idx) = url.find('@') {
+        let (before_at, after_at) = url.split_at(at_idx);
+        if let Some(colon_idx) = before_at.rfind(':') {
+            let scheme_and_user = &before_at[..colon_idx];
+            format!("{scheme_and_user}:[REDACTED]@{after_at}")
+        } else {
+            url.to_owned()
+        }
+    } else {
+        url.to_owned()
+    }
+}
+
 impl ProxyConfig {
+    /// # Errors
+    /// Returns an error if `input` uses the unsupported `socks5://` scheme
+    /// (DNS-leak risk) or otherwise fails to parse as a proxy URL.
     pub fn parse(input: &str) -> Result<Self, ProxyError> {
         if input.starts_with("socks5://") {
             return Err(ProxyError::DnsLeak);

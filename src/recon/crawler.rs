@@ -47,6 +47,27 @@ pub struct CrawlReport {
     pub warnings: Vec<String>,
 }
 
+impl CrawlReport {
+    /// Scrubbed clone for CLI / MCP output (candidate URLs may carry tokens).
+    #[must_use]
+    pub fn scrubbed(&self, scrubber: &crate::session::scrubber::Scrubber) -> Self {
+        let target = scrubber
+            .scrub(self.target.as_str())
+            .parse()
+            .unwrap_or_else(|_| self.target.clone());
+        Self {
+            target,
+            pages_visited: self.pages_visited,
+            candidates: self
+                .candidates
+                .iter()
+                .map(|c| c.scrubbed(scrubber))
+                .collect(),
+            warnings: self.warnings.iter().map(|w| scrubber.scrub(w)).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Crawler {
     client: HttpClient,
@@ -59,6 +80,8 @@ impl Crawler {
         Self { client, config }
     }
 
+    /// # Errors
+    /// Returns an error if the target URL fails to parse or a network request fails.
     pub async fn crawl(
         &self,
         target: &str,
@@ -95,7 +118,7 @@ impl Crawler {
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
-                    warnings.push(format!("{}: {error}", page_url));
+                    warnings.push(format!("{page_url}: {error}"));
                     continue;
                 }
             };
@@ -114,7 +137,7 @@ impl Crawler {
             let body = match response.text().await {
                 Ok(body) => body,
                 Err(error) => {
-                    warnings.push(format!("{}: body read failed: {error}", page_url));
+                    warnings.push(format!("{page_url}: body read failed: {error}"));
                     continue;
                 }
             };
@@ -382,6 +405,7 @@ impl RobotsRules {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -390,7 +414,7 @@ mod tests {
         let base = Url::parse("https://example.com/start").unwrap();
         let doc = extract_document(
             &base,
-            r#"<a href='/item?id=7'>x</a><form method='post' action='/login'><input name='user' value='a'><input type='hidden' name='csrf' value='x'></form>"#,
+            r"<a href='/item?id=7'>x</a><form method='post' action='/login'><input name='user' value='a'><input type='hidden' name='csrf' value='x'></form>",
         );
         assert_eq!(doc.candidates.len(), 4);
         assert!(doc.candidates.iter().any(|c| c.param_name == "id"));

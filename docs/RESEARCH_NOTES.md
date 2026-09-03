@@ -6,8 +6,8 @@
 - **Boolean-based** : différentiel TRUE/FALSE, Levenshtein/Jaccard, confirmation inversée (3 trials). Adaptations commentaires par DBMS (`-- -`, `--`, `#`). Réf: OWASP SQL Injection Prevention Cheat Sheet 2024, PortSwigger Web Security Academy (SQLi labs 2024).
 - **Time-based** : `SLEEP()` (MySQL), `pg_sleep()` (Postgres), `WAITFOR DELAY` (MSSQL), `DBMS_PIPE.RECEIVE_MESSAGE` (Oracle). Seuil baseline + 2σ, retry sur timeout. Blind exploitation 2024: optimisation binary search ASCII 32-126.
 - **Error-based** : `EXTRACTVALUE`, `UPDATE XML`, `CAST`/`CONVERT` errors, `CTXSYS.DRITHSX`. Regex version extraction. Évasion via commentaires inline `/**/`, encodages.
-- **Union / Stacked / OOB** : Union enumeration `information_schema`, stacked `; SELECT ...`, OOB DNS/HTTP exfil (`LOAD_FILE`, `UTL_HTTP`, `pg_read_file`). Non implémenté en v2 sans OOB infra (roadmap).
-- **JSON injection** : `JSON_EXTRACT`, `->>` operator (MySQL 8.x, Postgres 15+). Payloads JSON path.
+- **Union / Stacked / OOB** : Union enumeration `information_schema`, stacked `; SELECT ...`, OOB DNS/HTTP exfil (`LOAD_FILE` UNC MySQL/Windows, `COPY TO PROGRAM nslookup/curl` + `dblink` Postgres, `xp_dirtree/xp_fileexist/sp_OACreate` MSSQL, `UTL_INADDR/UTL_HTTP/DBMS_LDAP`/XXE `EXTRACTVALUE` Oracle). Implémenté en `techniques/oob` (OPT-IN `--oob-domain`, token unique `<token>.<domain>`, polling collaborateur générique `{token}`, exfil `oob_exfil_payloads_for`).
+- **JSON injection** : `JSON_EXTRACT`/`->>` (MySQL 8.x), `->`/`->>`/`::json` (Postgres 15+), `JSON_VALUE`/`OPENJSON` (MSSQL 2022), `JSON_VALUE`/`JSON_EXISTS` (Oracle 21c). Double canal boolean + erreurs (`Invalid JSON text`, `invalid input syntax for type json`, `JSON text is not properly formatted` Msg 13609, ORA-40442/40454). Implémenté en `techniques/json` (ADR 0008, `--techniques json`).
 
 ### Évasion WAF (2024-2026)
 - Encodages: URL, double-URL, hex `%2e`, unicode `%u`, UTF-8 overlong.

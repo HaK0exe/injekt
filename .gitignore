@@ -24,3 +24,11 @@ debug
 # Added by cargo
 
 /target
+
+# Local scan output (zero-persistence by design — never committed)
+report*.json
+*.enc
+
+# OS / editor cruft
+.DS_Store
+.env

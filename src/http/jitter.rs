@@ -5,6 +5,8 @@ use rand_distr::{Distribution, Normal};
 /// Human-like jitter between requests: normal distribution, never negative.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
+// All fields carry a `_ms` unit suffix by design — that's the point, not a naming collision.
+#[allow(clippy::struct_field_names)]
 pub struct Jitter {
     mean_ms: f64,
     stddev_ms: f64,
@@ -28,20 +30,27 @@ impl Jitter {
     }
 
     #[must_use]
+    // Delay values are small millisecond magnitudes, always non-negative; casts are safe here.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     pub fn next_delay(&self) -> std::time::Duration {
         let mut rng = rand::rng();
         let normal = match Normal::new(self.mean_ms, self.stddev_ms.max(1.0)) {
             Ok(n) => n,
-            Err(_) => match Normal::new(self.mean_ms, 50.0) {
-                Ok(n) => n,
-                Err(_) => {
+            Err(_) => {
+                if let Ok(n) = Normal::new(self.mean_ms, 50.0) {
+                    n
+                } else {
                     // Both attempts failed (stddev invalid) — fallback to uniform jitter around mean
                     let fallback: f64 = rand::random_range(500.0..1000.0);
                     return std::time::Duration::from_millis(
                         fallback.max(self.min_ms as f64).round() as u64,
                     );
                 }
-            },
+            }
         };
         let sample = normal
             .sample(&mut rng)

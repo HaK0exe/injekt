@@ -29,9 +29,10 @@ tokio-util = "0.7"
 futures = "0.3"
 
 # HTTP
-reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "brotli", "socks", "cookies", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "brotli", "socks", "cookies", "rustls-tls", "stream"] }
 url = { version = "2", features = ["serde"] }
 http = "1"
+bytes = "1"
 scraper = "0.24"
 
 # CLI
@@ -39,6 +40,10 @@ clap = { version = "4", features = ["derive", "env"] }
 owo-colors = "4"
 indicatif = "0.17"
 tabled = "0.15"
+
+# MCP
+rmcp = { version = "3.2", features = ["server", "transport-io"] }
+schemars = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

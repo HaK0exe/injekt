@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-/// MySQL 8.x enumeration queries using information_schema
+/// MySQL 8.x enumeration queries using `information_schema`
 #[must_use]
 pub fn list_databases() -> &'static str {
     "SELECT GROUP_CONCAT(schema_name ORDER BY schema_name) FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema','mysql','performance_schema','sys')"

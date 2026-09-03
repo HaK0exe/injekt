@@ -56,6 +56,8 @@ pub fn guess_from_findings(findings: &[crate::session::state::Finding]) -> Optio
     None
 }
 
+/// # Panics
+/// Panics if the internal static regex fails to compile (never happens in practice).
 #[must_use]
 pub fn extract_banner_version(body: &str) -> Option<(DbmsKind, String)> {
     // MySQL XPATH etc already in error detector; broader here
@@ -81,6 +83,19 @@ pub fn extract_banner_version(body: &str) -> Option<(DbmsKind, String)> {
     })
 }
 
+/// Returns a boxed `DbmsDetector` for the given `DbmsKind`.
+#[must_use]
+pub fn get_detector(kind: DbmsKind) -> Box<dyn crate::dbms::common::DbmsDetector> {
+    #[allow(clippy::match_same_arms)]
+    match kind {
+        DbmsKind::MySql => Box::new(crate::dbms::mysql::MySqlDetector),
+        DbmsKind::Postgres => Box::new(crate::dbms::postgres::PostgresDetector),
+        DbmsKind::MsSql => Box::new(crate::dbms::mssql::MsSqlDetector),
+        DbmsKind::Oracle => Box::new(crate::dbms::oracle::OracleDetector),
+        DbmsKind::Unknown => Box::new(crate::dbms::mysql::MySqlDetector),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,16 +116,5 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
         assert_eq!(guess_from_findings(&[f]), Some(Kind::MySql));
-    }
-}
-
-/// Returns a boxed DbmsDetector for the given DbmsKind.
-pub fn get_detector(kind: DbmsKind) -> Box<dyn crate::dbms::common::DbmsDetector> {
-    match kind {
-        DbmsKind::MySql => Box::new(crate::dbms::mysql::MySqlDetector),
-        DbmsKind::Postgres => Box::new(crate::dbms::postgres::PostgresDetector),
-        DbmsKind::MsSql => Box::new(crate::dbms::mssql::MsSqlDetector),
-        DbmsKind::Oracle => Box::new(crate::dbms::oracle::OracleDetector),
-        DbmsKind::Unknown => Box::new(crate::dbms::mysql::MySqlDetector),
     }
 }
