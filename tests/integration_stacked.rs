@@ -37,7 +37,7 @@ fn stacked_responder(req: &wiremock::Request) -> ResponseTemplate {
         return ResponseTemplate::new(200).set_body_string("welcome page id=1 normal content");
     }
     // Stacked query with marker - echo the marker back
-    let response_body = format!("welcome page id=1 normal content {} EXTRA DATA", marker);
+    let response_body = format!("welcome page id=1 normal content {marker} EXTRA DATA");
     ResponseTemplate::new(200).set_body_string(response_body)
 }
 
@@ -114,8 +114,7 @@ async fn stacked_no_false_positive() {
         .collect();
     assert!(
         stacked_findings.is_empty(),
-        "should have no stacked findings when not vulnerable, got {:?}",
-        stacked_findings
+        "should have no stacked findings when not vulnerable, got {stacked_findings:?}"
     );
 }
 

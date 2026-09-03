@@ -2,66 +2,56 @@
 
 use crate::{
     cli::args::Cli,
+    cli::client_builder::build_client,
     engine::orchestrator::{Engine, EngineConfig},
-    http::{client::HttpClient, jitter::Jitter, rate_limit::RateLimiter},
     reporting::{console, json::JsonReport},
     session::scrubber::Scrubber,
 };
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-use std::{io::Write as _, sync::Arc, time::Duration};
+use anyhow::Result;
+use std::sync::Arc;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
-pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
-    let target = cli
-        .effective_target()
-        .ok_or_else(|| anyhow::anyhow!("--target required"))?;
+/// Result of a scan operation containing all findings and metadata.
+#[derive(Debug)]
+pub struct ScanResult {
+    pub report: JsonReport,
+    pub engine_state: crate::engine::orchestrator::EngineState,
+    pub target: String,
+    pub config: EngineConfig,
+    pub state_handle: Arc<tokio::sync::RwLock<crate::session::state::SessionState>>,
+}
 
-    // Build HTTP client (type-state: timeout mandatory)
-    let jitter = cli
-        .jitter
-        .as_deref()
-        .map(|s| {
-            let parts: Vec<f64> = s.split(',').filter_map(|x| x.parse().ok()).collect();
-            match parts.as_slice() {
-                [mean, std] => Jitter::new(*mean, *std),
-                _ => Jitter::default(),
-            }
-        })
-        .unwrap_or_default();
-
-    let rl = cli
-        .rate_limit
-        .map(RateLimiter::new)
-        .map_or_else(|| Arc::new(RateLimiter::new(10.0)), Arc::new);
-
-    let mut builder = HttpClient::builder().timeout(Duration::from_secs(15));
-    builder = builder.jitter(jitter).rate_limiter(rl);
-    if let Some(proxy) = &cli.proxy {
-        match crate::http::proxy::ProxyConfig::parse(proxy) {
-            Ok(p) => builder = builder.proxy(p),
-            Err(e) => warn!(error=%e, "invalid proxy, ignoring"),
-        }
-    }
-    let client = builder
-        .build()
-        .map_err(|e| anyhow::anyhow!("client build: {e}"))?;
-
+/// Build engine config from CLI detection/enumeration options.
+fn engine_config(cli: &Cli) -> EngineConfig {
     let tampers = if cli.tamper.is_empty() {
         Vec::new()
     } else {
         crate::techniques::tamper::parse_tamper_list(Some(&cli.tamper.join(",")))
     };
-    let cfg = EngineConfig {
+    EngineConfig {
         threads: cli.threads,
         techniques: if cli.techniques.is_empty() {
-            vec!["all".to_owned()]
+            // --fetch-using narrows the default technique set (explicit --techniques wins)
+            match cli.fetch_using.as_deref() {
+                Some("boolean") => vec!["boolean".to_owned()],
+                Some("time") => vec!["time".to_owned()],
+                _ => vec!["all".to_owned()],
+            }
         } else {
             cli.techniques.clone()
         },
+        test_params: cli.params.clone(),
+        post_data: cli.data.clone(),
+        payload_opts: cli.payload_opts(),
+        matcher: cli.matcher_config(),
         tampers,
+        level: cli.level.unwrap_or(1),
+        confirm: cli.confirm,
+        ignore_codes: cli.ignore_codes.clone(),
         oob_domain: cli.oob_domain.clone(),
         oob_poll_url: cli.oob_poll_url.clone(),
         oob_wait_secs: cli.oob_wait_secs,
@@ -74,24 +64,35 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
         tables: cli.tables,
         columns: cli.columns,
         dump: cli.dump,
-        db: cli.db,
-        table: cli.table,
-        column: cli.column,
+        banner: cli.banner,
+        current_user: cli.current_user,
+        current_db: cli.current_db,
+        hostname: cli.hostname,
+        db: cli.db.clone(),
+        table: cli.table.clone(),
+        column: cli.column.clone(),
         start: cli.start,
         stop: cli.stop,
         count: cli.count,
-    };
+    }
+}
+
+/// Run a scan and return structured results without printing to stdout.
+/// This is the core logic reusable by both CLI and MCP server.
+///
+/// # Errors
+/// Returns an error if no target is given, the HTTP client fails to build,
+/// or the scan engine fails.
+pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult> {
+    let target = cli
+        .effective_target()
+        .ok_or_else(|| crate::error::InjektError::Other("target required".into()))?;
+
+    let client = build_client(cli, cli.allow_private)?;
+    let cfg = engine_config(cli);
 
     let engine = Engine::new(cfg.clone(), client, cancel.clone());
     let state = engine.run(&target).await?;
-    {
-        let scrubber = Scrubber::new(cfg.no_redact);
-        info!(
-            target=%scrubber.scrub(&target),
-            state=?state,
-            "scan finished"
-        );
-    }
 
     // Reporting
     let handle = engine.state_handle();
@@ -101,50 +102,171 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
     drop(s);
 
     let scrubber = Scrubber::new(cfg.no_redact);
-    console::print_findings(&findings);
+    let report = JsonReport::new(target.clone(), findings, vec![], count).scrubbed(&scrubber);
 
+    Ok(ScanResult {
+        report,
+        engine_state: state,
+        target,
+        config: cfg,
+        state_handle: handle,
+    })
+}
+
+/// Bulk CLI entry point (`-m/--bulk-file`): sequential multi-target scan.
+async fn run_bulk_cli(cli: &Cli, cancel: CancellationToken) -> Result<()> {
+    let bulk_path = cli.bulk_file.as_deref().ok_or_else(|| {
+        anyhow::Error::from(crate::error::InjektError::Other(
+            "--bulk-file required".into(),
+        ))
+    })?;
+    if cli.effective_target().is_some() {
+        return Err(crate::error::InjektError::Other(
+            "--bulk-file conflicts with --target/--raw-file (one mode at a time)".into(),
+        )
+        .into());
+    }
+    if cli.export_encrypted.is_some() {
+        return Err(crate::error::InjektError::Other(
+            "--export-encrypted is not supported with --bulk-file (use --output for the aggregated report)".into(),
+        )
+        .into());
+    }
+    if cli.cookies.is_some() {
+        warn!("--cookies combined with --bulk-file replays the same cookies on every target");
+    }
+    if cli.headers.iter().any(|h| {
+        h.split_once(':')
+            .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("authorization"))
+    }) {
+        warn!("Authorization header combined with --bulk-file is replayed on every target");
+    }
+    let targets = crate::target::bulk::load_targets(bulk_path, cli.allow_private)?;
+    // Fail fast on broken network config; per-target rebuilds stay fresh
+    // (CookieJar/RateLimiter isolation).
+    build_client(cli, cli.allow_private)?;
+    let cfg = engine_config(cli);
+    let scrubber = Scrubber::new(cfg.no_redact);
+    info!(count = targets.len(), "bulk scan start");
+    let report = super::bulk::run_bulk(
+        targets,
+        &cfg,
+        || build_client(cli, cli.allow_private),
+        &cancel,
+        &scrubber,
+    )
+    .await;
+    for r in &report.per_target {
+        println!("=== [{}] ===", scrubber.scrub(&r.target));
+        console::print_findings(&r.findings, &scrubber);
+    }
+    report.print_summary(&scrubber);
     if let Some(out) = &cli.output {
-        let report = JsonReport::new(target.clone(), findings.clone(), vec![], count);
-        let json = report.to_json(&scrubber);
-        // Write with 0o600 perms on Unix (sensitive report)
-        let mut opts = std::fs::OpenOptions::new();
+        let json = serde_json::to_string_pretty(&report.to_json(&scrubber))?;
+        let mut opts = fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
         opts.mode(0o600);
-        let mut file = opts.open(out)?;
-        file.write_all(json.as_bytes())?;
-        file.sync_all()?;
+        let mut file = opts.open(out).await?;
+        file.write_all(json.as_bytes()).await?;
+        file.write_all(b"\n").await?;
+        file.sync_all().await?;
+        info!(path=%scrubber.scrub(out), "bulk json report written (0o600)");
+    }
+    Ok(())
+}
+
+/// Original CLI entry point — prints to stdout/stderr.
+///
+/// # Errors
+/// Returns an error if the scan (or bulk scan) fails, or the output report
+/// can't be written to disk.
+pub async fn run(cli: Cli, cancel: CancellationToken) -> Result<()> {
+    if cli.bulk_file.is_some() {
+        return run_bulk_cli(&cli, cancel).await;
+    }
+    let result = run_scan(&cli, cancel).await?;
+
+    let scrubber = Scrubber::new(result.config.no_redact);
+    info!(
+        target=%scrubber.scrub(&result.target),
+        state=?result.engine_state,
+        "scan finished"
+    );
+
+    console::print_findings(&result.report.findings, &scrubber);
+
+    if let Some(out) = &cli.output {
+        let json = result.report.to_json(&scrubber);
+        // Write with 0o600 perms on Unix (sensitive report)
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut file = opts.open(out).await?;
+        file.write_all(json.as_bytes()).await?;
+        file.sync_all().await?;
         info!(path=%scrubber.scrub(out), "json report written (0o600)");
     }
 
     if let Some(path) = &cli.export_encrypted {
-        let scrubbed_path = Scrubber::new(cfg.no_redact).scrub(path);
+        let scrubbed_path = Scrubber::new(result.config.no_redact).scrub(path);
         warn!(path=%scrubbed_path, "export chiffré demandé — artefact sensible");
         // Secure passphrase prompt (rpassword) with fallback to env for CI
         let pass = if let Ok(env_pass) = std::env::var("INJEKT_PASSPHRASE") {
             if env_pass.len() < 12 {
-                anyhow::bail!("INJEKT_PASSPHRASE trop courte (min 12)");
+                return Err(crate::error::InjektError::Other(
+                    "INJEKT_PASSPHRASE trop courte (min 12)".into(),
+                )
+                .into());
             }
             secrecy::SecretString::from(env_pass)
         } else {
             let p1 = Zeroizing::new(
-                rpassword::prompt_password("Passphrase export (min 12 chars): ")
-                    .map_err(|e| anyhow::anyhow!("tty read: {e}"))?,
+                tokio::task::spawn_blocking(|| {
+                    rpassword::prompt_password("Passphrase export (min 12 chars): ")
+                })
+                .await
+                .map_err(|e| {
+                    anyhow::Error::from(crate::error::InjektError::Other(
+                        format!("tty read task failed: {e}").into(),
+                    ))
+                })?
+                .map_err(|e| {
+                    anyhow::Error::from(crate::error::InjektError::Other(
+                        format!("tty read: {e}").into(),
+                    ))
+                })?,
             );
             if p1.len() < 12 {
-                anyhow::bail!("passphrase trop courte (min 12)");
+                return Err(crate::error::InjektError::Other(
+                    "passphrase trop courte (min 12)".into(),
+                )
+                .into());
             }
             let p2 = Zeroizing::new(
-                rpassword::prompt_password("Confirmer passphrase: ")
-                    .map_err(|e| anyhow::anyhow!("tty read: {e}"))?,
+                tokio::task::spawn_blocking(|| {
+                    rpassword::prompt_password("Confirmer passphrase: ")
+                })
+                .await
+                .map_err(|e| {
+                    anyhow::Error::from(crate::error::InjektError::Other(
+                        format!("tty read task failed: {e}").into(),
+                    ))
+                })?
+                .map_err(|e| {
+                    anyhow::Error::from(crate::error::InjektError::Other(
+                        format!("tty read: {e}").into(),
+                    ))
+                })?,
             );
             if p1.as_str() != p2.as_str() {
-                anyhow::bail!("passphrases mismatch");
+                return Err(crate::error::InjektError::Other("passphrases mismatch".into()).into());
             }
             secrecy::SecretString::from(p1.as_str().to_owned())
         };
         if let Err(e) = crate::session::export::EncryptedExport::encrypt_to_file(
-            &*handle.read().await,
+            &*result.state_handle.read().await,
             &pass,
             path,
         ) {

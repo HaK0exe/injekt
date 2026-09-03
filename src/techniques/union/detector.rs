@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 use crate::detection::response_diff::{diff_against_baseline, jaccard};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -19,6 +20,12 @@ impl UnionDetector {
         Self
     }
 
+    /// Generate a random 8-char hex marker for UNION probes.
+    #[must_use]
+    pub fn generate_marker() -> String {
+        Uuid::new_v4().simple().to_string()[..8].to_string()
+    }
+
     /// Heuristic: UNION should change response but keep structure; check Jaccard drop and ordered marker presence.
     #[must_use]
     pub fn evaluate(
@@ -28,7 +35,16 @@ impl UnionDetector {
         baseline_ms: f64,
         candidate_ms: f64,
         tested_columns: usize,
+        marker: &str,
     ) -> UnionResult {
+        // Reject if marker already present in baseline (echo/false positive)
+        if baseline_body.contains(marker) {
+            return UnionResult {
+                is_vulnerable: false,
+                confidence: 0.1,
+                columns: None,
+            };
+        }
         let diff = diff_against_baseline(
             baseline_body,
             candidate_body,
@@ -37,17 +53,8 @@ impl UnionDetector {
             100.0,
         );
         let j = jaccard(baseline_body, candidate_body);
-        // UNION payloads inject sequences like "1,2,3". Require ordered occurrence
-        // to avoid FP on any HTML containing "1" and "2" separately.
-        let has_union_marker = Self::has_ordered_union_marker(candidate_body, tested_columns);
-        // Require both diff + jaccard jointly; marker tightens threshold rather
-        // than loosening it. Previous `j<0.95 && diff>0.4` was far too permissive.
-        // With marker we allow 0.6/0.85, without marker require stronger change.
-        let is_vuln = if has_union_marker {
-            diff.confidence > 0.6 && j < 0.85
-        } else {
-            diff.confidence > 0.65 && j < 0.80
-        };
+        let has_marker = candidate_body.contains(marker);
+        let is_vuln = has_marker && diff.confidence > 0.6 && j < 0.85;
         let confidence = if is_vuln {
             let c = (diff.confidence * 0.6 + (1.0 - j) * 0.4).clamp(0.0, 1.0);
             c.max(0.65)
@@ -59,33 +66,6 @@ impl UnionDetector {
             confidence,
             columns: if is_vuln { Some(tested_columns) } else { None },
         }
-    }
-
-    fn has_ordered_union_marker(body: &str, columns: usize) -> bool {
-        if columns < 2 {
-            return body.contains('1');
-        }
-        let seq = (1..=columns)
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let spaced = (1..=columns)
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        if body.contains(&seq) || body.contains(&spaced) {
-            return true;
-        }
-        // Fallback: check numbers 1..columns appear in order without requiring commas
-        let mut last = 0usize;
-        for i in 1..=columns {
-            let token = i.to_string();
-            match body[last..].find(&token) {
-                Some(pos) => last += pos + token.len(),
-                None => return false,
-            }
-        }
-        true
     }
 
     /// ORDER BY probe: error indicates column count exceeded.
@@ -143,28 +123,50 @@ mod tests {
     #[test]
     fn union_evaluate_requires_marker_and_diff() {
         let d = UnionDetector::new();
+        let marker = "abc12345";
         let baseline = "welcome page normal content id=1";
-        let with_marker =
-            "welcome page 1,2,3 injected content extra data different enough to drop jaccard";
-        let r = d.evaluate(baseline, with_marker, 100.0, 110.0, 3);
+        let with_marker = format!(
+            "welcome page {marker} injected content extra data different enough to drop jaccard"
+        );
+        let r = d.evaluate(baseline, &with_marker, 100.0, 110.0, 3, marker);
         // Should be vulnerable because marker present and diff significant
         assert!(r.is_vulnerable);
         assert_eq!(r.columns, Some(3));
 
         let without_marker = "welcome page normal content id=1";
-        let r2 = d.evaluate(baseline, without_marker, 100.0, 105.0, 3);
+        let r2 = d.evaluate(baseline, without_marker, 100.0, 105.0, 3, marker);
         assert!(!r2.is_vulnerable);
     }
 
     #[test]
     fn union_evaluate_rejects_high_similarity() {
         let d = UnionDetector::new();
-        let baseline = "identical content with numbers 1,2,3 but actually baseline";
-        let candidate = "identical content with numbers 1,2,3 but actually baseline";
-        let r = d.evaluate(baseline, candidate, 100.0, 102.0, 3);
+        let marker = "abc12345";
+        let baseline = format!("identical content with marker {marker} but actually baseline");
+        let candidate = format!("identical content with marker {marker} but actually baseline");
+        let r = d.evaluate(&baseline, &candidate, 100.0, 102.0, 3, marker);
         assert!(
             !r.is_vulnerable,
             "identical bodies should not be vuln even with marker"
         );
+    }
+
+    #[test]
+    fn union_evaluate_rejects_marker_in_baseline() {
+        let d = UnionDetector::new();
+        let marker = "abc12345";
+        let baseline = format!("welcome page {marker} normal content");
+        let candidate = format!("welcome page {marker} injected content");
+        let r = d.evaluate(&baseline, &candidate, 100.0, 110.0, 3, marker);
+        assert!(!r.is_vulnerable, "marker in baseline should reject");
+    }
+
+    #[test]
+    fn generate_marker_is_random_hex() {
+        let m1 = UnionDetector::generate_marker();
+        let m2 = UnionDetector::generate_marker();
+        assert_eq!(m1.len(), 8);
+        assert!(m1.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(m1, m2, "markers should be unique");
     }
 }

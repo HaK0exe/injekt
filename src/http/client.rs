@@ -1,8 +1,13 @@
 #![deny(unsafe_code)]
 
 use crate::http::{
-    cookies::CookieJar, identity::Identity, jitter::Jitter, proxy::ProxyConfig,
-    rate_limit::RateLimiter, redirects::RedirectPolicy, retry::RetryPolicy,
+    cookies::CookieJar,
+    identity::Identity,
+    jitter::Jitter,
+    proxy::{ProxyConfig, ProxyError},
+    rate_limit::RateLimiter,
+    redirects::RedirectPolicy,
+    retry::RetryPolicy,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use reqwest::{Client, RequestBuilder};
@@ -16,10 +21,10 @@ use tokio_util::sync::CancellationToken;
 pub enum ClientError {
     #[error("timeout not set — builder requires timeout() before build()")]
     MissingTimeout,
-    #[error("reqwest error: {0}")]
-    Reqwest(String),
-    #[error("proxy error: {0}")]
-    Proxy(String),
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
+    #[error(transparent)]
+    Proxy(#[from] ProxyError),
     #[error("cancelled")]
     Cancelled,
     #[error("timeout after {0:?}")]
@@ -134,6 +139,8 @@ impl<State> ClientBuilder<State> {
 }
 
 impl ClientBuilder<HasTimeout> {
+    /// # Errors
+    /// Returns an error if timeout is missing or the underlying `reqwest` client fails to build.
     pub fn build(self) -> Result<HttpClient, ClientError> {
         let timeout = self.timeout.ok_or(ClientError::MissingTimeout)?;
         let reqwest_policy = match self.redirect_policy {
@@ -150,8 +157,7 @@ impl ClientBuilder<HasTimeout> {
             .redirect(reqwest_policy);
 
         if let Some(proxy) = self.proxy {
-            let p = reqwest::Proxy::all(proxy.as_str())
-                .map_err(|e| ClientError::Proxy(e.to_string()))?;
+            let p = reqwest::Proxy::all(proxy.as_str())?;
             builder = builder.proxy(p);
         }
 
@@ -170,9 +176,7 @@ impl ClientBuilder<HasTimeout> {
         }
         builder = builder.default_headers(default_headers);
 
-        let inner = builder
-            .build()
-            .map_err(|e| ClientError::Reqwest(e.to_string()))?;
+        let inner = builder.build()?;
 
         Ok(HttpClient {
             inner: Arc::new(inner),
@@ -195,7 +199,7 @@ impl Default for ClientBuilder<NeedTimeout> {
 }
 
 /// Shared HTTP client (Arc internally).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct HttpClient {
     inner: Arc<Client>,
@@ -205,6 +209,18 @@ pub struct HttpClient {
     retry: RetryPolicy,
     timeout: Duration,
     redirect_policy: RedirectPolicy,
+}
+
+impl core::fmt::Debug for HttpClient {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HttpClient")
+            .field("jitter", &self.jitter)
+            .field("rate_limiter", &self.rate_limiter)
+            .field("retry", &self.retry)
+            .field("timeout", &self.timeout)
+            .field("redirect_policy", &self.redirect_policy)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Request specification for generic HTTP calls (2026 best practice).
@@ -268,6 +284,9 @@ impl HttpClient {
     }
 
     /// Generic send with jitter, rate-limit, retry, timeout and cancellation.
+    ///
+    /// # Errors
+    /// Returns an error if the request is cancelled, times out, or fails after retries.
     pub async fn send_with_retry(
         &self,
         spec: RequestSpec,
@@ -296,7 +315,7 @@ impl HttpClient {
                 () = cancel.cancelled() => return Err(ClientError::Cancelled),
                 r = tokio::time::timeout(self.timeout, send_fut) => match r {
                     Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err(ClientError::Reqwest(e.to_string())),
+                    Ok(Err(e)) => Err(e.into()),
                     Err(_) => Err(ClientError::Timeout(self.timeout)),
                 }
             };
@@ -330,8 +349,11 @@ impl HttpClient {
                     return Ok(resp);
                 }
                 Err(e) => {
-                    let retryable = matches!(e, ClientError::Timeout(_) | ClientError::Reqwest(_))
-                        && self.retry.should_retry(attempt, None);
+                    let retryable = match &e {
+                        ClientError::Timeout(_) => true,
+                        ClientError::Reqwest(e) => crate::http::retry::is_retryable_error(e),
+                        _ => false,
+                    } && self.retry.should_retry(attempt, None);
                     if retryable {
                         attempt += 1;
                         let delay = self.retry.delay_for(attempt);
@@ -370,11 +392,13 @@ impl HttpClient {
                         .contains("chunked")
                 });
             if is_chunked {
-                let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = b
-                    .chunks(5)
-                    .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
-                    .collect();
-                let stream = futures::stream::iter(chunks);
+                let body = bytes::Bytes::copy_from_slice(b);
+                let len = body.len();
+                let stream = futures::stream::iter(
+                    (0..len)
+                        .step_by(8192)
+                        .map(move |i| Ok::<_, std::io::Error>(body.slice(i..(i + 8192).min(len)))),
+                );
                 req = req.body(reqwest::Body::wrap_stream(stream));
             } else {
                 req = req.body(b.clone());
@@ -392,11 +416,30 @@ impl HttpClient {
     }
 
     /// Legacy GET with jitter/rate-limit/retry — delegates to `send_with_retry` with no cancellation.
+    ///
+    /// # Errors
+    /// Returns an error if the request times out or fails after retries.
     pub async fn get_with_retry(&self, url: String) -> Result<reqwest::Response, ClientError> {
         let spec = RequestSpec::get(url);
         // Use a detached token that never cancels for backwards compat
         let cancel = CancellationToken::new();
         self.send_with_retry(spec, &cancel).await
+    }
+
+    /// Read response body with timeout to prevent hanging on slow/incomplete responses.
+    ///
+    /// # Errors
+    /// Returns an error if reading the body times out or the underlying stream fails.
+    pub async fn read_body_with_timeout(
+        &self,
+        resp: reqwest::Response,
+    ) -> Result<Vec<u8>, ClientError> {
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, resp.bytes())
+            .await
+            .map_err(|_| ClientError::Timeout(timeout))?
+            .map(|b| b.to_vec())
+            .map_err(std::convert::Into::into)
     }
 
     #[must_use]

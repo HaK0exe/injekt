@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use injekt::target::{markers::MarkerSet, raw_request::RawRequest, url::TargetUrl};
 use proptest::prelude::*;
 

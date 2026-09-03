@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-/// MSSQL 2022 enumeration queries using sys and information_schema
+/// MSSQL 2022 enumeration queries using sys and `information_schema`
 #[must_use]
 pub fn list_databases() -> &'static str {
     "SELECT STRING_AGG(name, ',') FROM sys.databases WHERE name NOT IN ('master','tempdb','model','msdb')"

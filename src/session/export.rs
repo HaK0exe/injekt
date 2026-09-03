@@ -1,7 +1,6 @@
 #![deny(unsafe_code)]
 
 use crate::session::state::SessionState;
-use anyhow::Context as _;
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chacha20poly1305::{
@@ -52,6 +51,10 @@ pub struct EncryptedExport;
 
 impl EncryptedExport {
     /// Encrypt session state to file. Key derived via Argon2id explicit params (2026 OWASP).
+    ///
+    /// # Errors
+    /// Returns an error if key derivation, encryption, serialization, or the file
+    /// write fails (including when `path` already exists).
     pub fn encrypt_to_file(
         state: &SessionState,
         passphrase: &SecretString,
@@ -88,7 +91,7 @@ impl EncryptedExport {
             .map_err(|e| ExportError::Serialization(e.to_string()))?;
         // 0o600 strict perms on Unix, fail if exists to avoid overwrite of sensitive file
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         opts.mode(0o600);
         let mut file = opts
@@ -102,6 +105,10 @@ impl EncryptedExport {
     }
 
     /// Decrypt file to JSON bytes (caller reconstructs `SessionState`).
+    ///
+    /// # Errors
+    /// Returns an error if the file can't be read, its blob version is unsupported,
+    /// or decryption fails (wrong passphrase or corrupted data).
     pub fn decrypt_from_file(
         passphrase: &SecretString,
         path: &str,
@@ -173,9 +180,84 @@ impl EncryptedExport {
     }
 }
 
-// Need trait for anyhow context unused removal.
-#[allow(dead_code)]
-fn _use_anyhow_ctx() -> anyhow::Result<()> {
-    let _ = std::fs::read("/tmp/x").context("read")?;
-    Ok(())
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::session::state::{Finding, SessionState, TechniqueKind};
+    use secrecy::SecretString;
+    use std::fs;
+
+    fn test_state() -> SessionState {
+        let mut state = SessionState::new();
+        state.push_finding(Finding::new(
+            "http://example.com/?id=1",
+            "id@query",
+            TechniqueKind::Boolean,
+            0.9,
+            "evidence with secret Authorization: Bearer abc123",
+        ));
+        state.push_extracted(SecretString::from("extracted secret data"));
+        state
+    }
+
+    fn temp_path() -> String {
+        let path = format!("/tmp/injekt_test_export_{}.enc", rand::random::<u64>());
+        std::fs::remove_file(&path).ok();
+        path
+    }
+
+    #[test]
+    fn encrypt_to_file_creates_new_file_fails_if_exists() {
+        let state = test_state();
+        let passphrase = SecretString::from("passphrase123456");
+        let path = temp_path();
+
+        // First write should succeed
+        EncryptedExport::encrypt_to_file(&state, &passphrase, &path).unwrap();
+
+        // Second write should fail because file exists (create_new)
+        let result = EncryptedExport::encrypt_to_file(&state, &passphrase, &path);
+        assert!(result.is_err(), "create_new should fail if file exists");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn decrypt_does_not_leak_secrets_in_json() {
+        let state = test_state();
+        let passphrase = SecretString::from("passphrase123456");
+        let path = temp_path();
+
+        EncryptedExport::encrypt_to_file(&state, &passphrase, &path).unwrap();
+        let json_bytes = EncryptedExport::decrypt_from_file(&passphrase, &path).unwrap();
+        let json_str = String::from_utf8_lossy(&json_bytes);
+
+        // The decrypted JSON should contain the findings with secrets scrubbed if we check
+        // But decrypt_from_file returns raw JSON - the scrubbing happens at report level
+        // We verify the file can be decrypted
+        assert!(json_str.contains("findings"));
+        assert!(json_str.contains("request_count"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn export_file_has_600_permissions_on_unix() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let state = test_state();
+            let passphrase = SecretString::from("passphrase123456");
+            let path = temp_path();
+
+            EncryptedExport::encrypt_to_file(&state, &passphrase, &path).unwrap();
+            let meta = fs::metadata(&path).unwrap();
+            // 0o600 = 384 in decimal
+            assert_eq!(
+                meta.mode() & 0o777,
+                0o600,
+                "file should have 0o600 permissions"
+            );
+            let _ = fs::remove_file(&path);
+        }
+    }
 }

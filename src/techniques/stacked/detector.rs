@@ -20,6 +20,11 @@ impl StackedDetector {
         Self
     }
 
+    /// Strip raw payload from body to avoid false positives from echoed input.
+    fn strip_payload(body: &str, payload: &str) -> String {
+        body.replace(payload, "")
+    }
+
     /// Stacked queries: second statement should execute and produce visible side-effect.
     /// We probe with a tautology that changes response (e.g., `; SELECT 1 --`).
     /// Detection: response differs from baseline AND contains marker from second query.
@@ -32,18 +37,27 @@ impl StackedDetector {
         candidate_ms: f64,
         payload: &StackedPayload,
     ) -> StackedResult {
+        // Reject if marker already present in baseline (echo/false positive)
+        if baseline_body.contains(&payload.marker) {
+            return StackedResult {
+                is_vulnerable: false,
+                confidence: 0.1,
+                dbms: None,
+            };
+        }
+        let stripped_candidate = Self::strip_payload(candidate_body, &payload.payload);
         let diff = diff_against_baseline(
             baseline_body,
-            candidate_body,
+            &stripped_candidate,
             baseline_ms,
             candidate_ms,
             100.0,
         );
-        let j = jaccard(baseline_body, candidate_body);
-        let has_marker = candidate_body.contains(&payload.marker);
+        let j = jaccard(baseline_body, &stripped_candidate);
+        let has_marker = stripped_candidate.contains(&payload.marker);
         // Stacked queries often produce subtle changes; lower thresholds than UNION.
-        // Require marker + some diff + reasonable jaccard drop.
-        let is_vuln = has_marker && diff.confidence > 0.4 && j < 0.95;
+        // Require marker + some diff + reasonable jaccard drop (j < 0.85).
+        let is_vuln = has_marker && diff.confidence > 0.4 && j < 0.85;
         let confidence = if is_vuln {
             (diff.confidence * 0.5 + (1.0 - j) * 0.3 + 0.2)
                 .clamp(0.0, 1.0)
@@ -111,6 +125,35 @@ mod tests {
         assert!(
             !r2.is_vulnerable,
             "diff alone without marker should not trigger"
+        );
+    }
+
+    #[test]
+    fn rejects_marker_in_baseline() {
+        let d = StackedDetector::new();
+        let baseline = "welcome page marker_here normal content";
+        let candidate = "welcome page marker_here injected content";
+        let payload = StackedPayload::new("; SELECT 'marker_here' -- -", "mysql", "marker_here");
+        let r = d.evaluate(baseline, candidate, 100.0, 110.0, &payload);
+        assert!(!r.is_vulnerable, "marker in baseline should reject");
+    }
+
+    #[test]
+    fn strips_payload_from_candidate() {
+        let d = StackedDetector::new();
+        let baseline = "welcome page";
+        // Candidate includes the raw payload text echoed back PLUS significant additional content
+        // to ensure diff.confidence > 0.4
+        let payload_text = "; SELECT 'found_it' -- -";
+        let candidate = format!(
+            "welcome page {payload_text} marker EXTRA CONTENT THAT MAKES RESPONSE DIFFERENT"
+        );
+        let payload = StackedPayload::new(payload_text, "mysql", "marker");
+        let r = d.evaluate(baseline, &candidate, 100.0, 110.0, &payload);
+        // Should detect because marker is present after stripping payload
+        assert!(
+            r.is_vulnerable,
+            "should detect marker after stripping payload"
         );
     }
 }

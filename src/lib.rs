@@ -1,7 +1,8 @@
 #![deny(unsafe_code)]
-#![allow(clippy::pedantic)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
+#![deny(clippy::dbg_macro)]
+#![deny(clippy::todo)]
 
 pub mod cli;
 pub mod dbms;
@@ -9,6 +10,7 @@ pub mod detection;
 pub mod engine;
 pub mod extraction;
 pub mod http;
+pub mod mcp;
 pub mod recon;
 pub mod reporting;
 pub mod session;
@@ -35,7 +37,49 @@ pub mod error {
         #[error("io error: {0}")]
         Io(String),
         #[error(transparent)]
-        Other(#[from] anyhow::Error),
+        Other(Box<dyn std::error::Error + Send + Sync + 'static>),
+    }
+
+    impl From<std::io::Error> for InjektError {
+        fn from(err: std::io::Error) -> Self {
+            Self::Other(Box::new(err))
+        }
+    }
+
+    impl From<reqwest::Error> for InjektError {
+        fn from(err: reqwest::Error) -> Self {
+            Self::Other(Box::new(err))
+        }
+    }
+
+    impl From<serde_json::Error> for InjektError {
+        fn from(err: serde_json::Error) -> Self {
+            Self::Other(Box::new(err))
+        }
+    }
+
+    impl From<url::ParseError> for InjektError {
+        fn from(err: url::ParseError) -> Self {
+            Self::Other(Box::new(err))
+        }
+    }
+
+    impl From<regex::Error> for InjektError {
+        fn from(err: regex::Error) -> Self {
+            Self::Other(Box::new(err))
+        }
+    }
+
+    impl From<chrono::ParseError> for InjektError {
+        fn from(err: chrono::ParseError) -> Self {
+            Self::Other(Box::new(err))
+        }
+    }
+
+    impl From<tokio::time::error::Elapsed> for InjektError {
+        fn from(err: tokio::time::error::Elapsed) -> Self {
+            Self::Other(Box::new(err))
+        }
     }
 
     pub type Result<T, E = InjektError> = core::result::Result<T, E>;

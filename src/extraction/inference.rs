@@ -21,6 +21,9 @@ impl InferenceExtractor {
 
     /// Simulate narrowing: given oracle `Fn(guess) -> bool` where bool = (actual >= guess), infer char.
     /// Returns None if oracle inconsistent (out of alphabet).
+    ///
+    /// # Errors
+    /// Propagates any error returned by `oracle`.
     pub fn infer_char<F, E>(&self, mut oracle: F) -> Result<Option<char>, E>
     where
         F: FnMut(u8) -> Result<bool, E>,
@@ -52,6 +55,9 @@ impl InferenceExtractor {
     }
 
     /// Infer string of known length via oracle per position. Oracle: (pos, guess) -> actual[pos] >= guess
+    ///
+    /// # Errors
+    /// Propagates any error returned by `oracle`.
     pub fn infer_string<F, E>(&self, len: usize, mut oracle: F) -> Result<String, E>
     where
         F: FnMut(usize, u8) -> Result<bool, E>,

@@ -34,6 +34,9 @@ pub struct RawRequest {
 
 impl RawRequest {
     /// Parse from raw string (headers + optional body).
+    ///
+    /// # Errors
+    /// Returns an error if the request line or method is missing/malformed.
     pub fn parse(input: &str) -> Result<Self, RawRequestError> {
         let mut lines = input.lines();
         let request_line = lines
@@ -115,6 +118,7 @@ impl RawRequest {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

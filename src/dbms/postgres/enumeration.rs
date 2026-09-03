@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-/// Postgres 15+ enumeration queries using information_schema and pg_catalog
+/// Postgres 15+ enumeration queries using `information_schema` and `pg_catalog`
 #[must_use]
 pub fn list_databases() -> &'static str {
     "SELECT string_agg(datname, ',' ORDER BY datname) FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres','template0','template1')"

@@ -15,6 +15,7 @@ pub struct InfoResult {
 }
 
 /// Return structured info without printing to stdout.
+#[must_use]
 pub fn info() -> InfoResult {
     InfoResult {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -29,7 +30,7 @@ pub fn info() -> InfoResult {
         ],
         tampers: crate::techniques::tamper::Tamper::all_names()
             .iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect(),
         oob: "opt-in via --oob-domain <collaborator> [--oob-poll-url <url> with {token}]"
             .to_string(),
@@ -48,15 +49,22 @@ pub fn info() -> InfoResult {
 
 /// Original CLI entry point — prints to stdout.
 pub fn run() {
+    use owo_colors::OwoColorize;
+
     let info = info();
     println!(
-        "injekt v{} — modern SQLi detection (zero persistence, OPSEC by design)",
-        info.version
+        "{} {}",
+        "modern SQLi detection".bold(),
+        "— zero persistence, OPSEC by design".bright_black()
     );
-    println!("Techniques: {}", info.techniques.join(", "));
-    println!("Tampers: {}", info.tampers.join(", "));
-    println!("OOB: {}", info.oob);
-    println!("Request tampers: {}", info.request_tampers);
-    println!("DBMS: {}", info.dbms.join(", "));
-    println!("Docs: {}", info.docs);
+    println!();
+    let row = |label: &str, value: &str| {
+        println!("  {:<18} {}", label.bright_cyan().bold(), value);
+    };
+    row("Techniques", &info.techniques.join(", "));
+    row("Tampers", &info.tampers.join(", "));
+    row("OOB", &info.oob);
+    row("Request tampers", &info.request_tampers);
+    row("DBMS", &info.dbms.join(", "));
+    row("Docs", &info.docs);
 }

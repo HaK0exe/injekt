@@ -48,6 +48,8 @@ impl MarkerSet {
         self.asterisk || self.section || self.double_brace
     }
 
+    /// # Panics
+    /// Panics if an internal static regex fails to compile (never happens in practice).
     #[must_use]
     pub fn positions(&self, input: &str) -> Vec<(usize, InjectionMarker)> {
         let mut v = Vec::new();
@@ -74,7 +76,7 @@ impl MarkerSet {
             let re = RE2.get_or_init(|| {
                 #[allow(clippy::expect_used)]
                 {
-                    Regex::new(r"\{\{[^}]+\}\}").expect("static regex double brace")
+                    Regex::new(r"\{\{[^}]*\}\}").expect("static regex double brace")
                 }
             });
             for m in re.find_iter(input) {

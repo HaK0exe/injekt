@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      # Lint policy lives in Cargo.toml's [lints] table (unwrap_used/expect_used/
+      # dbg_macro/todo deny, clippy::pedantic warn) — no blanket -D warnings here,
+      # that would fail CI on every pedantic nit instead of the denies that matter.
+      - name: cargo clippy
+        run: cargo clippy --all-targets
+
+  test:
+    name: build + test
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: cargo build --all-targets
+        run: cargo build --all-targets
+      - name: cargo test
+        run: cargo test --all-targets -- --test-threads=4
+      - name: smoke test — binary runs, info command works
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            ./target/debug/injekt.exe --no-banner info
+          else
+            ./target/debug/injekt --no-banner info
+          fi

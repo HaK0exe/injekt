@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
-/// Helper to build a minimal HttpClient for tests (no jitter delay, high rate limit).
+/// Helper to build a minimal `HttpClient` for tests (no jitter delay, high rate limit).
 fn test_client() -> HttpClient {
     HttpClient::builder()
         .timeout(Duration::from_secs(5))
@@ -18,61 +18,64 @@ fn test_client() -> HttpClient {
         .expect("client build")
 }
 
+/// Decode the `id` query param from a wiremock request (empty string if absent).
+fn decoded_id(req: &wiremock::Request) -> String {
+    req.url
+        .query_pairs()
+        .find(|(k, _)| k == "id")
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default()
+}
+
+/// The union payloads embed a unique marker as a quoted string literal (e.g. `'u1a2b3c4'`)
+/// in place of one selected column. Extract it if present.
+fn extract_marker(decoded: &str) -> Option<String> {
+    let re = regex::Regex::new(r"'(u[0-9a-f]{8})'").unwrap();
+    re.captures(decoded)
+        .map(|c| c.get(1).unwrap().as_str().to_owned())
+}
+
 /// Wiremock responder for ORDER BY enumeration + UNION scenario:
 /// - baseline (no order by / no union): normal page
 /// - ORDER BY i < 4: normal page (no error)
 /// - ORDER BY i >= 4: SQL error containing "Unknown column '4' in order clause" + "ORDER BY"
-/// - UNION SELECT 1,2,3: page containing "1,2,3" marker + diff
-/// - other UNION: normal page
+/// - UNION SELECT with 3 columns (marker present, 2 numeric siblings): reflect marker
+/// - other UNION (wrong column count): normal page
 fn union_responder_with_order_by(req: &wiremock::Request) -> ResponseTemplate {
-    let url = req.url.to_string().to_ascii_lowercase();
-    // ORDER BY probes
-    if url.contains("order%20by") || url.contains("order+by") {
-        // Check for ORDER BY 4..10 as error (infer 3 columns)
-        if url.contains("order%20by%204")
-            || url.contains("order%20by%205")
-            || url.contains("order%20by%206")
-            || url.contains("order%20by%207")
-            || url.contains("order%20by%208")
-            || url.contains("order%20by%209")
-            || url.contains("order%20by%2010")
-            || url.contains("order+by+4")
-            || url.contains("order+by+5")
-        {
+    let decoded = decoded_id(req).to_ascii_lowercase();
+    if decoded.contains("order by") {
+        if (4..=10).any(|i| decoded.contains(&format!("order by {i}"))) {
             return ResponseTemplate::new(200)
                 .set_body_string("SQL error: Unknown column '4' in 'order clause' ORDER BY 4");
         }
-        // ORDER BY 1..3 => normal
         return ResponseTemplate::new(200).set_body_string("welcome normal page id=1 content");
     }
-    if url.contains("union") {
-        // Decode-ish check for 1,2,3 marker (encoded or raw)
-        if url.contains("1%2c2%2c3")
-            || url.contains("1,2,3")
-            || url.contains("1%2c+2%2c+3")
-            || url.contains("1%2c2%2c3%20")
-        {
-            return ResponseTemplate::new(200).set_body_string(
-                "welcome page injected 1,2,3 marker success different content extra",
-            );
+    if decoded.contains("union select") {
+        // Only reflect the marker when the payload carries exactly 3 columns
+        // (two numeric siblings + the marker), matching the inferred/heuristic count.
+        let has_three_cols = decoded.contains("1,2,'") || decoded.contains("null,2,'");
+        if has_three_cols && let Some(marker) = extract_marker(&decoded) {
+            return ResponseTemplate::new(200).set_body_string(format!(
+                "welcome page injected {marker} success different content extra"
+            ));
         }
-        // wrong column count => normal (no marker)
         return ResponseTemplate::new(200).set_body_string("welcome normal page id=1 content");
     }
     ResponseTemplate::new(200).set_body_string("welcome normal page id=1 content")
 }
 
 fn union_responder_no_order_by_error(req: &wiremock::Request) -> ResponseTemplate {
-    let url = req.url.to_string().to_ascii_lowercase();
-    if url.contains("order%20by") || url.contains("order+by") {
+    let decoded = decoded_id(req).to_ascii_lowercase();
+    if decoded.contains("order by") {
         // Never error — enumeration undetermined
         return ResponseTemplate::new(200).set_body_string("welcome normal page id=1 content");
     }
-    if url.contains("union") {
-        if url.contains("1%2c2%2c3") || url.contains("1,2,3") {
-            return ResponseTemplate::new(200).set_body_string(
-                "welcome page injected 1,2,3 marker success different content extra",
-            );
+    if decoded.contains("union select") {
+        let has_three_cols = decoded.contains("1,2,'") || decoded.contains("null,2,'");
+        if has_three_cols && let Some(marker) = extract_marker(&decoded) {
+            return ResponseTemplate::new(200).set_body_string(format!(
+                "welcome page injected {marker} success different content extra"
+            ));
         }
         return ResponseTemplate::new(200).set_body_string("welcome normal page id=1 content");
     }
@@ -80,8 +83,8 @@ fn union_responder_no_order_by_error(req: &wiremock::Request) -> ResponseTemplat
 }
 
 fn union_responder_no_vuln(req: &wiremock::Request) -> ResponseTemplate {
-    let url = req.url.to_string().to_ascii_lowercase();
-    if url.contains("union") || url.contains("order%20by") || url.contains("order+by") {
+    let decoded = decoded_id(req).to_ascii_lowercase();
+    if decoded.contains("union select") || decoded.contains("order by") {
         // Always normal, never marker, never error
         return ResponseTemplate::new(200).set_body_string("welcome normal page id=1 content");
     }
@@ -130,7 +133,7 @@ async fn union_order_by_infers_3_and_finds_union() {
         union_finding.evidence
     );
     assert!(
-        union_finding.evidence.contains("Some(3)") || union_finding.evidence.contains("3"),
+        union_finding.evidence.contains("Some(3)") || union_finding.evidence.contains('3'),
         "evidence should indicate inferred 3, got {}",
         union_finding.evidence
     );
@@ -163,7 +166,7 @@ async fn union_order_by_no_error_fallback_still_finds_union() {
     let target = format!("{}/?id=1", server.uri());
     let _ = engine.run(&target).await.expect("engine run");
     let findings = engine.state_handle().read().await.findings().to_vec();
-    // With no ORDER BY error, fallback heuristic [3,2,4,5] should still find UNION 1,2,3
+    // With no ORDER BY error, fallback heuristic [3,2,4,5] should still find UNION 1,2,'marker'
     assert!(
         !findings.is_empty(),
         "fallback should still find union even when ORDER BY undetermined"
@@ -207,15 +210,18 @@ async fn union_order_by_only_first_error_is_inconclusive() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .respond_with(|req: &wiremock::Request| {
-            let url = req.url.to_string().to_ascii_lowercase();
-            if url.contains("order%20by") || url.contains("order+by") {
+            let decoded = decoded_id(req).to_ascii_lowercase();
+            if decoded.contains("order by") {
                 return ResponseTemplate::new(200)
                     .set_body_string("SQL error: Unknown column '1' in 'order clause' ORDER BY 1");
             }
-            if url.contains("union") && (url.contains("1%2c2%2c3") || url.contains("1,2,3")) {
-                return ResponseTemplate::new(200).set_body_string(
-                    "welcome page injected 1,2,3 marker success different content extra",
-                );
+            if decoded.contains("union select") {
+                let has_three_cols = decoded.contains("1,2,'") || decoded.contains("null,2,'");
+                if has_three_cols && let Some(marker) = extract_marker(&decoded) {
+                    return ResponseTemplate::new(200).set_body_string(format!(
+                        "welcome page injected {marker} success different content extra"
+                    ));
+                }
             }
             ResponseTemplate::new(200).set_body_string("welcome normal page id=1 content")
         })

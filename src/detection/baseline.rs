@@ -17,7 +17,9 @@ pub struct Baseline {
 
 impl Baseline {
     #[must_use]
-    pub fn new(samples: Vec<Sample>) -> Self {
+    // Sample counts are small (single-digit baseline probes); usize->f64 precision loss is not reachable.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn new(samples: &[Sample]) -> Self {
         let status_codes = samples.iter().map(|s| s.status).collect();
         let body_hashes = samples.iter().map(|s| Self::hash(&s.body)).collect();
         let body_lengths = samples.iter().map(|s| s.body.len()).collect();
@@ -42,7 +44,7 @@ impl Baseline {
             Vec::new()
         } else {
             // Median by length (robust against outliers), fallback to most common hash
-            let mut sorted = samples.clone();
+            let mut sorted = samples.to_vec();
             sorted.sort_by_key(|s| s.body.len());
             sorted[sorted.len() / 2].body.clone()
         };
@@ -103,5 +105,5 @@ where
     for _ in 0..n {
         samples.push(fetcher().await);
     }
-    Baseline::new(samples)
+    Baseline::new(&samples)
 }

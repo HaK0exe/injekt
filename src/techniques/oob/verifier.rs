@@ -94,9 +94,8 @@ impl OobVerifier for HttpPollVerifier {
         let client = reqwest::Client::builder()
             .timeout(core::time::Duration::from_secs(self.timeout_secs))
             .build();
-        let client = match client {
-            Ok(c) => c,
-            Err(_) => return false,
+        let Ok(client) = client else {
+            return false;
         };
         let resp = tokio::time::timeout(
             core::time::Duration::from_secs(self.timeout_secs + 2),
@@ -138,12 +137,11 @@ impl InMemoryVerifier {
 }
 
 impl OobVerifier for InMemoryVerifier {
+    // Signature fixed by the `OobVerifier` trait shared with the real (I/O-bound) impl.
+    #[allow(clippy::unused_async_trait_impl)]
     async fn verify(&self, token: &str) -> bool {
         let needle = token.to_ascii_lowercase();
-        self.seen
-            .lock()
-            .map(|guard| guard.contains(&needle))
-            .unwrap_or(false)
+        self.seen.lock().is_ok_and(|guard| guard.contains(&needle))
     }
 }
 
@@ -156,6 +154,8 @@ impl OobVerifier for InMemoryVerifier {
 pub struct NoopVerifier;
 
 impl OobVerifier for NoopVerifier {
+    // Signature fixed by the `OobVerifier` trait shared with the real (I/O-bound) impl.
+    #[allow(clippy::unused_async_trait_impl)]
     async fn verify(&self, _token: &str) -> bool {
         false
     }
@@ -210,7 +210,7 @@ mod tests {
             "oobabc123"
         ));
         assert!(poll_body_means_seen(r#"{"seen":true}"#, "oobzzz"));
-        assert!(poll_body_means_seen(r#"{"seen": false, "x":1}"#, "oobzzz") == false);
+        assert!(!poll_body_means_seen(r#"{"seen": false, "x":1}"#, "oobzzz"));
         assert!(poll_body_means_seen(
             r#"{"interactions":[{"id":1}]}"#,
             "oobzzz"

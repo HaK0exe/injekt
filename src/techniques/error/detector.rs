@@ -24,6 +24,8 @@ impl Default for ErrorDetector {
 }
 
 impl ErrorDetector {
+    /// # Panics
+    /// Panics if an internal static regex fails to compile (never happens in practice).
     #[must_use]
     pub fn new() -> Self {
         let patterns = vec![

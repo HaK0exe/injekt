@@ -2,7 +2,7 @@
 
 //! Dual-channel JSON detector: boolean differential + JSON error signatures.
 //!
-//! A JSON injection point answers like classic SQLi when reached through JSON
+//! A JSON injection point answers like classic `SQLi` when reached through JSON
 //! functions, so detection mirrors `boolean` (TRUE≈baseline, FALSE≠baseline,
 //! 3-trial confirmation in the orchestrator) plus an error channel keyed on
 //! per-DBMS JSON error strings verified against vendor docs:
@@ -54,6 +54,8 @@ impl Default for JsonDetector {
 }
 
 impl JsonDetector {
+    /// # Panics
+    /// Panics if an internal static regex fails to compile (never happens in practice).
     #[must_use]
     pub fn new() -> Self {
         let patterns: Vec<(&str, &str, &str)> = vec![

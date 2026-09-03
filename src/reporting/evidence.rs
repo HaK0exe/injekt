@@ -37,7 +37,7 @@ impl Evidence {
             request: scrubber.scrub(&self.request),
             response: scrubber.scrub(&self.response),
             technique: self.technique.clone(),
-            parameter: self.parameter.clone(),
+            parameter: scrubber.scrub(&self.parameter),
             confidence: self.confidence,
         }
     }

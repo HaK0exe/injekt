@@ -42,10 +42,24 @@
 
 ## Installation
 
+### Binaire précompilé (sans Rust)
+
+Chaque release taguée publie des binaires Linux, macOS (x86_64 + arm64) et Windows —
+récupère-les sur [GitHub Releases](https://github.com/HaK0exe/injekt/releases), vérifie
+`SHA256SUMS`, extrais et lance :
+
+```bash
+tar xzf injekt-*-x86_64-unknown-linux-gnu.tar.gz
+cd injekt-*/
+./injekt --no-banner info
+```
+
+### Depuis les sources
+
 **Prérequis :** Rust 1.88+ (`rustup update`)
 
 ```bash
-git clone https://github.com/<you>/injekt
+git clone https://github.com/HaK0exe/injekt
 cd injekt
 cargo build --release
 # binaire dans ./target/release/injekt
@@ -53,6 +67,9 @@ cargo build --release
 # ou installation dans $CARGO_HOME/bin
 cargo install --path .
 ```
+
+La CI (`.github/workflows/ci.yml`) build et teste chaque push/PR sur Linux, macOS et
+Windows — `main` est donc vérifié cross-plateforme en continu.
 
 **Vérifications obligatoires :**
 ```bash

@@ -2,6 +2,7 @@
 
 use rand::Rng as _;
 use regex::Regex;
+use std::fmt::Write as _;
 use std::sync::OnceLock;
 
 /// WAF evasion tamper — applies a single transformation to a payload string.
@@ -144,11 +145,14 @@ impl Tamper {
                 let once = char_encode(payload);
                 char_encode(&once)
             }
-            Self::HexEncode => payload.bytes().map(|b| format!("%{b:02x}")).collect(),
-            Self::UnicodeEncode => payload
-                .chars()
-                .map(|c| format!("%u{:04x}", c as u32))
-                .collect(),
+            Self::HexEncode => payload.bytes().fold(String::new(), |mut acc, b| {
+                let _ = write!(acc, "%{b:02x}");
+                acc
+            }),
+            Self::UnicodeEncode => payload.chars().fold(String::new(), |mut acc, c| {
+                let _ = write!(acc, "%u{:04x}", c as u32);
+                acc
+            }),
             Self::OverlongUtf8 => overlong_encode(payload),
         }
     }
@@ -172,12 +176,9 @@ pub fn parse_tamper_list(input: Option<&str>) -> Vec<Tamper> {
             if name.is_empty() {
                 return None;
             }
-            match Tamper::from_name(name) {
-                Some(t) => Some(t),
-                None => {
-                    tracing::warn!(tamper=%name, available=?Tamper::all_names(), "unknown tamper ignored");
-                    None
-                }
+            if let Some(t) = Tamper::from_name(name) { Some(t) } else {
+                tracing::warn!(tamper=%name, available=?Tamper::all_names(), "unknown tamper ignored");
+                None
             }
         })
         .collect()
@@ -254,7 +255,7 @@ fn char_encode(input: &str) -> String {
         if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '~' {
             out.push(c);
         } else {
-            out.push_str(&format!("%{b:02x}"));
+            let _ = write!(out, "%{b:02x}");
         }
     }
     out
@@ -271,7 +272,7 @@ fn overlong_encode(input: &str) -> String {
             // for ASCII b < 0x80, first byte is always 0xC0, second is 0x80|b
             let b1 = 0xC0u8;
             let b2 = 0x80u8 | b;
-            out.push_str(&format!("%{b1:02x}%{b2:02x}"));
+            let _ = write!(out, "%{b1:02x}%{b2:02x}");
         }
     }
     out
@@ -322,7 +323,7 @@ fn apply_versioned_comment(payload: &str) -> String {
     let re = keyword_regex();
     re.replace_all(payload, |caps: &regex::Captures| {
         let m = &caps[0];
-        format!("/*!50000{}*/", m)
+        format!("/*!50000{m}*/")
     })
     .into_owned()
 }
@@ -347,6 +348,7 @@ fn apply_between_comment(payload: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

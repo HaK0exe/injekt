@@ -4,7 +4,7 @@
 
 > Superior to `sqlmap`/`ghauri` in performance, maintainability and discretion. Everything lives in RAM and is wiped on exit.
 
-[![Rust 1.88](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org) [![Edition 2024](https://img.shields.io/badge/edition-2024-blue)](https://doc.rust-lang.org/edition-guide/) [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE) [![unsafe_code deny](https://img.shields.io/badge/unsafe-deny-success)](https://doc.rust-lang.org/rustc/lints/listing/allowed-by-default.html)
+[![CI](https://github.com/HaK0exe/injekt/actions/workflows/ci.yml/badge.svg)](https://github.com/HaK0exe/injekt/actions/workflows/ci.yml) [![Rust 1.88](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org) [![Edition 2024](https://img.shields.io/badge/edition-2024-blue)](https://doc.rust-lang.org/edition-guide/) [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE) [![unsafe_code deny](https://img.shields.io/badge/unsafe-deny-success)](https://doc.rust-lang.org/rustc/lints/listing/allowed-by-default.html)
 
 [Français](README.fr.md) | [OPSEC](docs/OPSEC.md) | [Research Notes](docs/RESEARCH_NOTES.md)
 
@@ -42,10 +42,24 @@
 
 ## Installation
 
+### Prebuilt binary (no Rust required)
+
+Every tagged release publishes binaries for Linux, macOS (x86_64 + arm64) and Windows —
+grab one from [GitHub Releases](https://github.com/HaK0exe/injekt/releases), verify against
+`SHA256SUMS`, extract, and run:
+
+```bash
+tar xzf injekt-*-x86_64-unknown-linux-gnu.tar.gz
+cd injekt-*/
+./injekt --no-banner info
+```
+
+### From source
+
 **Prerequisites:** Rust 1.88+ (`rustup update`)
 
 ```bash
-git clone https://github.com/<you>/injekt
+git clone https://github.com/HaK0exe/injekt
 cd injekt
 cargo build --release
 # binary at ./target/release/injekt
@@ -53,6 +67,9 @@ cargo build --release
 # or install to $CARGO_HOME/bin
 cargo install --path .
 ```
+
+CI (`.github/workflows/ci.yml`) builds and tests every push/PR on Linux, macOS and
+Windows, so `main` is verified cross-platform at all times.
 
 **Toolchain checks (required):**
 ```bash

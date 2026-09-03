@@ -64,6 +64,20 @@ impl Finding {
             timestamp: Utc::now(),
         }
     }
+
+    /// Scrubbed clone for reports / MCP output. `no_redact=true` is passthrough.
+    #[must_use]
+    pub fn scrubbed(&self, scrubber: &super::scrubber::Scrubber) -> Self {
+        Self {
+            target: scrubber.scrub(&self.target),
+            parameter: scrubber.scrub(&self.parameter),
+            technique: self.technique,
+            confidence: self.confidence,
+            dbms: self.dbms.clone().map(|d| scrubber.scrub(&d)),
+            evidence: scrubber.scrub(&self.evidence),
+            timestamp: self.timestamp,
+        }
+    }
 }
 
 /// Session state — RAM only, zeroized on drop.
@@ -86,6 +100,14 @@ pub struct SessionState {
 
 impl Zeroize for SessionState {
     fn zeroize(&mut self) {
+        for finding in &mut self.findings {
+            finding.target.zeroize();
+            finding.parameter.zeroize();
+            finding.evidence.zeroize();
+            if let Some(dbms) = &mut finding.dbms {
+                dbms.zeroize();
+            }
+        }
         self.findings.clear();
         self.extracted.zeroize();
         self.extracted.clear();
@@ -174,6 +196,14 @@ impl SessionState {
 
     /// Wipe all sensitive data immediately.
     pub fn wipe(&mut self) {
+        for finding in &mut self.findings {
+            finding.target.zeroize();
+            finding.parameter.zeroize();
+            finding.evidence.zeroize();
+            if let Some(dbms) = &mut finding.dbms {
+                dbms.zeroize();
+            }
+        }
         self.findings.clear();
         self.extracted.zeroize();
         self.extracted.clear();

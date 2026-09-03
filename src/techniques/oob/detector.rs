@@ -4,7 +4,7 @@
 //!
 //! OOB is definitive when the collaborator observes the callback, and
 //! inconclusive otherwise: the vulnerable query runs **asynchronously** and
-//! typically leaves the HTTP response unchanged (PortSwigger Academy OOB
+//! typically leaves the HTTP response unchanged (`PortSwigger` Academy OOB
 //! labs). The detector therefore combines:
 //! 1. `callback_seen` from an [`OobVerifier`](crate::techniques::oob::verifier)
 //!    (DNS / HTTP interaction containing the per-probe token) — decisive.
@@ -155,7 +155,6 @@ impl OobDetector {
 /// plus generic SQL syntax errors mentioning those vectors.
 #[must_use]
 pub fn contains_oob_error(body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
     const MARKERS: &[&str] = &[
         "utl_inaddr",
         "utl_http",
@@ -174,6 +173,7 @@ pub fn contains_oob_error(body: &str) -> bool {
         "ora-29273", // UTL_HTTP request failed
         "ora-06512", // PL/SQL call stack (often with UTL_* errors)
     ];
+    let lower = body.to_ascii_lowercase();
     MARKERS.iter().any(|m| lower.contains(m))
         && (lower.contains("error")
             || lower.contains("exception")

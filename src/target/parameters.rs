@@ -67,6 +67,26 @@ pub fn collect_from_body(body: &str) -> Vec<TargetParameter> {
     if body.is_empty() {
         return Vec::new();
     }
+    let trimmed = body.trim();
+    // JSON bodies (`--data '{"a":1}'`): expose top-level keys as body params.
+    // Urlencoded parsing would otherwise yield a single aberrant `{"a":1}` key.
+    if trimmed.starts_with('{')
+        && trimmed.ends_with('}')
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(obj) = value.as_object()
+    {
+        return obj
+            .iter()
+            .map(|(k, v)| {
+                let s = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Null => String::new(),
+                    _ => v.to_string(),
+                };
+                TargetParameter::new(k.clone(), ParameterLocation::Body, s)
+            })
+            .collect();
+    }
     url::form_urlencoded::parse(body.as_bytes())
         .map(|(k, v)| TargetParameter::new(k.into_owned(), ParameterLocation::Body, v.into_owned()))
         .collect()

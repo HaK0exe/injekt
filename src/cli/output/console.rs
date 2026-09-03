@@ -1,4 +1,42 @@
 #![deny(unsafe_code)]
+
+use owo_colors::OwoColorize;
+
+/// Source of truth for the wordmark: `ascii_art.txt` at the repo root, kept
+/// as several `----`-separated art variants. We pull the block-glyph one
+/// (2nd section) straight from the file instead of retyping it, so the
+/// banner can never drift from the actual art.
+const ASCII_ART: &str = include_str!("../../../ascii_art.txt");
+
+fn is_separator(line: &str) -> bool {
+    let line = line.trim();
+    line.len() >= 4 && line.chars().all(|c| c == '-')
+}
+
+fn logo_lines() -> impl Iterator<Item = &'static str> {
+    ASCII_ART
+        .split('\n')
+        .skip_while(|l| !is_separator(l))
+        .skip(1)
+        .take_while(|l| !is_separator(l))
+        .filter(|l| !l.trim().is_empty())
+}
+
+/// Startup banner: colored wordmark + tagline, always written to stderr so
+/// stdout stays pipeable (recon JSON, `--output` reports, MCP JSON-RPC).
 pub fn banner() {
-    println!("injekt — {}", env!("CARGO_PKG_VERSION"));
+    for line in logo_lines() {
+        eprintln!("{}", line.trim_end().bright_cyan());
+    }
+    eprintln!(
+        "{} {} {}",
+        "by s6stem".bright_black(),
+        "·".bright_black(),
+        format!("v{}", env!("CARGO_PKG_VERSION")).bright_magenta()
+    );
+    eprintln!(
+        "{}",
+        "zero persistence · anonymisation by design".bright_black()
+    );
+    eprintln!();
 }

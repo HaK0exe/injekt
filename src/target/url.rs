@@ -26,6 +26,11 @@ impl TargetUrl {
     /// let t = TargetUrl::parse("http://example.com/?id=1", false).unwrap();
     /// assert_eq!(t.as_str(), "http://example.com/?id=1");
     /// ```
+    ///
+    /// # Errors
+    /// Returns an error if `input` fails to parse as a URL, uses a scheme other
+    /// than `http`/`https`, or resolves to a private/loopback host and
+    /// `allow_private` is `false`.
     #[track_caller]
     pub fn parse(input: &str, allow_private: bool) -> Result<Self, UrlError> {
         let url = Url::parse(input).map_err(|e| UrlError::Invalid(e.to_string()))?;
@@ -65,9 +70,8 @@ impl TargetUrl {
 }
 
 fn is_private_host(url: &Url) -> bool {
-    let host = match url.host_str() {
-        Some(h) => h,
-        None => return false,
+    let Some(host) = url.host_str() else {
+        return false;
     };
     // localhost / loopback literals
     if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" {
@@ -103,6 +107,7 @@ impl core::fmt::Display for TargetUrl {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
