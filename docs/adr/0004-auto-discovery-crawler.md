@@ -31,6 +31,10 @@ src/recon/
 - Respect `robots.txt` by default (`--ignore-robots` opt-out)
 - Configurable depth, max pages, same-domain-only vs subdomains
 - Deduplication by normalized URL + parameter set
+- Deduplication by page *template* (path with id-like segments collapsed +
+  sorted query parameter names), capped at `--max-per-template` (default 3)
+  instances per template — guards against pagination/listing/calendar traps
+  burning the whole `--max-pages` budget on redundant instances of one shape
 - Mandatory shared rate limiter and jitter inherited from the HTTP client
 
 ### Parameter Candidate
