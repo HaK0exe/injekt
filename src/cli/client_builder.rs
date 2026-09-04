@@ -14,8 +14,6 @@ use std::{sync::Arc, time::Duration};
 /// Returns an error if `--proxy`, `--headers`, or `--cookies` fail to parse,
 /// or if the underlying client fails to build.
 pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<HttpClient> {
-    let _ = allow_private;
-
     let jitter = {
         let s = cli.effective_jitter();
         let parts: Vec<f64> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -34,7 +32,11 @@ pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<Http
     };
 
     let mut builder = HttpClient::builder().timeout(Duration::from_secs(cli.effective_timeout()));
-    builder = builder.jitter(jitter).rate_limiter(rl).retry_policy(retry);
+    builder = builder
+        .jitter(jitter)
+        .rate_limiter(rl)
+        .retry_policy(retry)
+        .allow_private(allow_private);
 
     if let Some(proxy) = cli.effective_proxy() {
         match crate::http::proxy::ProxyConfig::parse(&proxy) {

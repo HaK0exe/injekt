@@ -15,6 +15,29 @@ use crate::target::bulk::MAX_BULK_TARGETS;
 use crate::target::raw_request::RawRequest;
 use crate::target::url::TargetUrl;
 
+/// Maximum bytes accepted for any ingestion file (`--bulk-file`,
+/// `--openapi-file`, `--sitemap-file`, stdin). Fail fast instead of
+/// loading unbounded input into RAM.
+pub const MAX_INGEST_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Per-file cap for `--raw-dir` Burp/ZAP exports (raw requests are small;
+/// 2 MiB already generous, rejects accidental binary dumps).
+pub const MAX_RAW_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Read a UTF-8 file with a `metadata().len()` pre-check (no unbounded
+/// `read_to_string`). Returns a descriptive error with the faulty path.
+fn read_limited_file(path: &str, max_bytes: u64) -> anyhow::Result<String> {
+    let meta =
+        std::fs::metadata(path).map_err(|e| anyhow::anyhow!("cannot stat file '{path}': {e}"))?;
+    if meta.len() > max_bytes {
+        anyhow::bail!(
+            "file '{path}' too large ({} bytes > {max_bytes} bytes)",
+            meta.len()
+        );
+    }
+    std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read file '{path}': {e}"))
+}
+
 /// Merge every ingestion source from [`crate::cli::args::Cli`] into one
 /// deduplicated target list.
 ///
@@ -36,8 +59,8 @@ pub fn collect_targets(
         if trimmed.is_empty() || !seen.insert(trimmed.clone()) {
             return;
         }
-        if TargetUrl::parse(&trimmed, allow_private).is_err() {
-            tracing::warn!(target = %trimmed, "skipping invalid ingestion target");
+        if let Err(e) = TargetUrl::parse(&trimmed, allow_private) {
+            tracing::warn!(target = %trimmed, error=%e, "skipping invalid ingestion target");
             return;
         }
         out.push(trimmed);
@@ -45,8 +68,10 @@ pub fn collect_targets(
 
     let allow_private = cli.allow_private;
 
-    if let Some(t) = cli.effective_target() {
-        push(t, allow_private);
+    match cli.try_effective_target() {
+        Ok(Some(t)) => push(t, allow_private),
+        Ok(None) => {}
+        Err(e) => anyhow::bail!("{e}"),
     }
     if let Some(t) = extra_target {
         push(t.to_owned(), allow_private);
@@ -56,7 +81,7 @@ pub fn collect_targets(
         let content = if path == "-" {
             read_stdin_all()?
         } else {
-            std::fs::read_to_string(path)
+            read_limited_file(path, MAX_INGEST_FILE_BYTES)
                 .map_err(|e| anyhow::anyhow!("cannot read bulk file '{path}': {e}"))?
         };
         for t in parse_targets_text(&content) {
@@ -70,14 +95,14 @@ pub fn collect_targets(
         }
     }
     if let Some(path) = cli.openapi_file.as_deref() {
-        let content = std::fs::read_to_string(path)
+        let content = read_limited_file(path, MAX_INGEST_FILE_BYTES)
             .map_err(|e| anyhow::anyhow!("cannot read OpenAPI file '{path}': {e}"))?;
         for t in parse_openapi_targets(&content) {
             push(t, allow_private);
         }
     }
     if let Some(path) = cli.sitemap_file.as_deref() {
-        let content = std::fs::read_to_string(path)
+        let content = read_limited_file(path, MAX_INGEST_FILE_BYTES)
             .map_err(|e| anyhow::anyhow!("cannot read sitemap file '{path}': {e}"))?;
         for t in parse_sitemap_targets(&content) {
             push(t, allow_private);
@@ -130,9 +155,12 @@ pub fn parse_targets_text(content: &str) -> Vec<String> {
 /// `in == "query"` to `?name=1` pairs. Only `http(s)` servers are honoured.
 #[must_use]
 pub fn parse_openapi_targets(content: &str) -> Vec<String> {
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(content) else {
-        tracing::warn!("ignoring invalid OpenAPI JSON");
-        return Vec::new();
+    let doc = match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error=%e, "ignoring invalid OpenAPI JSON");
+            return Vec::new();
+        }
     };
     let base = doc
         .get("servers")
@@ -256,10 +284,14 @@ fn replace_path_templates(path: &str) -> String {
 /// Sitemap harvester: extracts `<loc>https://…</loc>` entries (case-insensitive).
 #[must_use]
 pub fn parse_sitemap_targets(content: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let Ok(re) = regex::Regex::new(r"(?i)<loc>\s*(https?://[^<\s]+)\s*</loc>") else {
-        return out;
+    use std::sync::OnceLock;
+    static RE: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"(?i)<loc>\s*(https?://[^<\s]+)\s*</loc>").ok());
+    let Some(re) = re.as_ref() else {
+        tracing::warn!("sitemap regex unavailable, skipping sitemap parse");
+        return Vec::new();
     };
+    let mut out = Vec::new();
     for capture in re.captures_iter(content) {
         if let Some(matched) = capture.get(1) {
             out.push(matched.as_str().trim().to_owned());
@@ -273,6 +305,10 @@ pub fn parse_sitemap_targets(content: &str) -> Vec<String> {
 /// Load every `*.txt`/`*.req` file from `dir` as a Burp/ZAP raw request and
 /// return the reconstructed target URLs (`https` preferred, `http` fallback).
 ///
+/// Only files with a `txt`/`req` extension **and** regular-file type are
+/// considered (`&&`, not `||`); symlinks are rejected via `symlink_metadata`
+/// and each file is capped at [`MAX_RAW_FILE_BYTES`].
+///
 /// # Errors
 /// Returns an error when the directory cannot be listed.
 pub fn load_raw_dir_targets(dir: &str) -> anyhow::Result<Vec<String>> {
@@ -282,21 +318,47 @@ pub fn load_raw_dir_targets(dir: &str) -> anyhow::Result<Vec<String>> {
     for entry in entries {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
-        let is_candidate = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("txt") || e.eq_ignore_ascii_case("req"))
-            || path.is_file();
-        if !is_candidate {
+        // Reject symlinks first (TOCTOU-safe: `symlink_metadata`, not `metadata`).
+        let symlink_meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error=%e, "skipping raw file (stat failed)");
+                continue;
+            }
+        };
+        if symlink_meta.file_type().is_symlink() {
+            tracing::warn!(path = %path.display(), "skipping raw file (symlink rejected)");
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            tracing::warn!(path = %path.display(), "skipping unreadable raw file");
+        // `&&`: extension must match AND entry must be a regular file.
+        let has_valid_ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("txt") || e.eq_ignore_ascii_case("req"));
+        if !(has_valid_ext && symlink_meta.is_file()) {
             continue;
+        }
+        if symlink_meta.len() > MAX_RAW_FILE_BYTES {
+            tracing::warn!(
+                path = %path.display(),
+                len = symlink_meta.len(),
+                "skipping raw file (exceeds 2 MiB cap)"
+            );
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error=%e, "skipping unreadable raw file");
+                continue;
+            }
         };
-        let Ok(req) = RawRequest::parse(&content) else {
-            tracing::warn!(path = %path.display(), "skipping unparseable raw file");
-            continue;
+        let req = match RawRequest::parse(&content) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error=%e, "skipping unparseable raw file");
+                continue;
+            }
         };
         if let Some(url) = req.to_url("https").or_else(|| req.to_url("http")) {
             out.push(url);
@@ -310,9 +372,14 @@ pub fn load_raw_dir_targets(dir: &str) -> anyhow::Result<Vec<String>> {
 fn read_stdin_all() -> anyhow::Result<String> {
     use std::io::Read as _;
     let mut buf = String::new();
-    std::io::stdin()
+    // Cap stdin like files (10 MiB) to avoid unbounded RAM on piped input.
+    let mut limited = std::io::stdin().take(MAX_INGEST_FILE_BYTES + 1);
+    limited
         .read_to_string(&mut buf)
         .map_err(|e| anyhow::anyhow!("cannot read stdin: {e}"))?;
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > MAX_INGEST_FILE_BYTES {
+        anyhow::bail!("stdin exceeds {MAX_INGEST_FILE_BYTES} bytes (cap to avoid OOM)");
+    }
     Ok(buf)
 }
 

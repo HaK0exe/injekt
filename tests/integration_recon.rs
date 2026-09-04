@@ -17,6 +17,7 @@ fn fast_client() -> HttpClient {
         .timeout(Duration::from_secs(2))
         .jitter(Jitter::new(0.0, 0.0))
         .rate_limiter(Arc::new(RateLimiter::new(1_000.0)))
+        .allow_private(true)
         .build()
         .expect("client")
 }

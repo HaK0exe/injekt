@@ -9,6 +9,7 @@ use crate::http::{
     redirects::RedirectPolicy,
     retry::RetryPolicy,
 };
+use crate::target::url::TargetUrl;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use reqwest::{Client, RequestBuilder};
 use std::{sync::Arc, time::Duration};
@@ -31,7 +32,24 @@ pub enum ClientError {
     Timeout(Duration),
     #[error("invalid header: {0}")]
     InvalidHeader(String),
+    #[error("SSRF blocked: private/loopback host rejected: {0}")]
+    PrivateHost(String),
+    #[error("invalid URL: {0}")]
+    InvalidUrl(String),
+    #[error("invalid redirect location: {0}")]
+    InvalidRedirect(String),
+    #[error("too many redirects")]
+    TooManyRedirects,
+    #[error("response body exceeded {0} bytes cap")]
+    BodyTooLarge(usize),
 }
+
+/// Hard cap on a single response body read (`read_body_with_timeout` /
+/// `read_body_string_with_timeout`): a malicious or misconfigured target
+/// streaming an unbounded/huge body must not be allowed to exhaust memory —
+/// the stream is read incrementally and aborted the moment this is exceeded,
+/// so at most one chunk beyond the cap is ever buffered.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 ///Marker types for typestate.
 #[derive(Debug)]
@@ -51,6 +69,7 @@ pub struct ClientBuilder<State> {
     retry: RetryPolicy,
     redirect_policy: RedirectPolicy,
     extra_headers: HeaderMap,
+    allow_private: bool,
     _state: core::marker::PhantomData<State>,
 }
 
@@ -67,6 +86,7 @@ impl ClientBuilder<NeedTimeout> {
             retry: RetryPolicy::default(),
             redirect_policy: RedirectPolicy::default(),
             extra_headers: HeaderMap::new(),
+            allow_private: false,
             _state: core::marker::PhantomData,
         }
     }
@@ -83,6 +103,7 @@ impl ClientBuilder<NeedTimeout> {
             retry: self.retry,
             redirect_policy: self.redirect_policy,
             extra_headers: self.extra_headers,
+            allow_private: self.allow_private,
             _state: core::marker::PhantomData,
         }
     }
@@ -131,6 +152,16 @@ impl<State> ClientBuilder<State> {
         self
     }
 
+    /// Allow private/loopback targets (lab only, `--allow-private`).
+    /// Defaults to `false` (SSRF-safe). Propagated from the CLI; when
+    /// `false`, the initial URL and every redirect hop are re-validated
+    /// lexically + DNS-time, and private hops are rejected.
+    #[must_use]
+    pub fn allow_private(mut self, allow: bool) -> Self {
+        self.allow_private = allow;
+        self
+    }
+
     #[must_use]
     pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.extra_headers.insert(name, value);
@@ -143,10 +174,13 @@ impl ClientBuilder<HasTimeout> {
     /// Returns an error if timeout is missing or the underlying `reqwest` client fails to build.
     pub fn build(self) -> Result<HttpClient, ClientError> {
         let timeout = self.timeout.ok_or(ClientError::MissingTimeout)?;
-        let reqwest_policy = match self.redirect_policy {
-            RedirectPolicy::None => reqwest::redirect::Policy::none(),
-            RedirectPolicy::Limited(n) => reqwest::redirect::Policy::limited(n),
-        };
+        // SSRF: never let reqwest auto-follow. `Limited(n)` is enforced
+        // manually in `send_with_retry` so every `Location` hop is
+        // re-parsed via `TargetUrl` + DNS-checked before any connection.
+        // `Policy::none()` here is intentional, not a behavior change for
+        // callers: `HttpClient::redirect_policy()` still reports the
+        // configured manual limit.
+        let reqwest_policy = reqwest::redirect::Policy::none();
         let mut builder = Client::builder()
             .timeout(timeout)
             .connect_timeout(self.connect_timeout.unwrap_or(Duration::from_secs(10)))
@@ -163,13 +197,8 @@ impl ClientBuilder<HasTimeout> {
 
         let mut default_headers = reqwest::header::HeaderMap::new();
         if let Some(id) = &self.identity {
-            for (k, v) in id.headers() {
-                let hn = HeaderName::from_bytes(k.as_bytes())
-                    .map_err(|e| ClientError::InvalidHeader(format!("{k}: {e}")))?;
-                let hv = HeaderValue::from_str(&v)
-                    .map_err(|e| ClientError::InvalidHeader(format!("{v}: {e}")))?;
-                default_headers.insert(hn, hv);
-            }
+            // Pre-built HeaderMap: no per-build String allocs / re-parsing.
+            default_headers.extend(id.header_map());
         }
         for (k, v) in &self.extra_headers {
             default_headers.insert(k.clone(), v.clone());
@@ -181,13 +210,14 @@ impl ClientBuilder<HasTimeout> {
         Ok(HttpClient {
             inner: Arc::new(inner),
             jitter: self.jitter.unwrap_or_default(),
-            rate_limiter: self
-                .rate_limit
-                .unwrap_or_else(|| Arc::new(RateLimiter::new(5.0))),
+            rate_limiter: self.rate_limit.unwrap_or_else(|| {
+                Arc::new(RateLimiter::new(crate::http::rate_limit::DEFAULT_RPS))
+            }),
             cookies: Arc::new(RwLock::new(CookieJar::new())),
             retry: self.retry,
             timeout,
             redirect_policy: self.redirect_policy,
+            allow_private: self.allow_private,
         })
     }
 }
@@ -209,6 +239,7 @@ pub struct HttpClient {
     retry: RetryPolicy,
     timeout: Duration,
     redirect_policy: RedirectPolicy,
+    allow_private: bool,
 }
 
 impl core::fmt::Debug for HttpClient {
@@ -219,6 +250,7 @@ impl core::fmt::Debug for HttpClient {
             .field("retry", &self.retry)
             .field("timeout", &self.timeout)
             .field("redirect_policy", &self.redirect_policy)
+            .field("allow_private", &self.allow_private)
             .finish_non_exhaustive()
     }
 }
@@ -230,7 +262,7 @@ pub struct RequestSpec {
     pub method: Method,
     pub url: String,
     pub headers: HeaderMap,
-    pub body: Option<Vec<u8>>,
+    pub body: Option<bytes::Bytes>,
 }
 
 impl RequestSpec {
@@ -257,7 +289,7 @@ impl RequestSpec {
 
     #[must_use]
     pub fn with_body(mut self, body: Vec<u8>) -> Self {
-        self.body = Some(body);
+        self.body = Some(bytes::Bytes::from(body));
         self
     }
 }
@@ -283,31 +315,95 @@ impl HttpClient {
         self.redirect_policy
     }
 
+    /// Whether private/loopback targets are allowed (lab only).
+    #[must_use]
+    pub const fn allow_private(&self) -> bool {
+        self.allow_private
+    }
+
     /// Generic send with jitter, rate-limit, retry, timeout and cancellation.
     ///
+    /// SSRF hardening (OWASP): the initial URL and **every** redirect hop are
+    /// re-validated lexically + DNS-time via [`TargetUrl`] before connecting.
+    /// `reqwest` auto-follow is disabled at build time; this method follows
+    /// `Location` manually up to `redirect_policy`. The manual [`CookieJar`]
+    /// is scoped per URL (never forwarded cross-host) and per-request headers
+    /// are dropped on cross-host hops.
+    ///
     /// # Errors
-    /// Returns an error if the request is cancelled, times out, or fails after retries.
+    /// Returns an error if the request is cancelled, times out, targets a
+    /// private host without `allow_private`, exceeds the redirect limit, or
+    /// fails after retries.
     pub async fn send_with_retry(
         &self,
         spec: RequestSpec,
         cancel: &CancellationToken,
     ) -> Result<reqwest::Response, ClientError> {
-        // cancellable jitter + rate-limit per 2026 tokio best practice
-        tokio::select! {
-            () = cancel.cancelled() => return Err(ClientError::Cancelled),
-            () = self.rate_limiter.acquire() => {},
+        TargetUrl::validate_redirect_location(&spec.url, self.allow_private)
+            .await
+            .map_err(|e| map_url_error(&spec.url, &e))?;
+        // Cancellable jitter + rate-limit: internal sleeps are themselves
+        // wrapped in `select!` so Ctrl+C aborts promptly (official tokio pattern).
+        if !self.rate_limiter.acquire_cancellable(cancel).await {
+            return Err(ClientError::Cancelled);
         }
-        tokio::select! {
-            () = cancel.cancelled() => return Err(ClientError::Cancelled),
-            () = self.jitter.sleep() => {},
+        if !self.jitter.sleep_cancellable(cancel).await {
+            return Err(ClientError::Cancelled);
         }
 
+        let mut current = spec;
+        let mut hops = 0_usize;
+        loop {
+            let resp = self.send_single_with_retry(&current, cancel).await?;
+            let status = resp.status();
+            if !is_redirect_status(status) {
+                return Ok(resp);
+            }
+            let Some(max) = self.redirect_policy.max_hops() else {
+                // `RedirectPolicy::None`: return 3xx as-is, do not follow.
+                return Ok(resp);
+            };
+            if hops >= max {
+                return Err(ClientError::TooManyRedirects);
+            }
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(ToOwned::to_owned);
+            let Some(location) = location else {
+                return Ok(resp);
+            };
+            // Resolve relative `Location` against the current URL; validate
+            // the next hop BEFORE any connection (fail-closed).
+            let next_url = resolve_redirect_url(&current.url, &location)?;
+            TargetUrl::validate_redirect_location(&next_url, self.allow_private)
+                .await
+                .map_err(|e| map_url_error(&next_url, &e))?;
+            if cancel.is_cancelled() {
+                return Err(ClientError::Cancelled);
+            }
+            // Bound redirect-chasing rate: one token per hop.
+            if !self.rate_limiter.acquire_cancellable(cancel).await {
+                return Err(ClientError::Cancelled);
+            }
+            current = follow_spec(&current, status, next_url);
+            hops += 1;
+        }
+    }
+
+    /// Single-hop send with retry (no redirect following).
+    async fn send_single_with_retry(
+        &self,
+        spec: &RequestSpec,
+        cancel: &CancellationToken,
+    ) -> Result<reqwest::Response, ClientError> {
         let mut attempt = 0usize;
         loop {
             if cancel.is_cancelled() {
                 return Err(ClientError::Cancelled);
             }
-            let req = self.build_request(&spec).await;
+            let req = self.build_request(spec).await;
 
             // per-request timeout covers send() only; jitter/rate-limit already done
             let send_fut = req.send();
@@ -339,7 +435,11 @@ impl HttpClient {
                         .should_retry(attempt, Some(resp.status().as_u16()))
                     {
                         attempt += 1;
-                        let delay = self.retry.delay_for(attempt);
+                        let retry_after = resp
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok());
+                        let delay = self.retry.delay_for_retry_after(attempt, retry_after);
                         tokio::select! {
                             () = cancel.cancelled() => return Err(ClientError::Cancelled),
                             () = tokio::time::sleep(delay) => {},
@@ -392,7 +492,7 @@ impl HttpClient {
                         .contains("chunked")
                 });
             if is_chunked {
-                let body = bytes::Bytes::copy_from_slice(b);
+                let body = b.clone();
                 let len = body.len();
                 let stream = futures::stream::iter(
                     (0..len)
@@ -417,31 +517,85 @@ impl HttpClient {
         req
     }
 
-    /// Legacy GET with jitter/rate-limit/retry — delegates to `send_with_retry` with no cancellation.
+    /// Cancellable GET with jitter/rate-limit/retry.
+    ///
+    /// # Errors
+    /// Returns an error if the request is cancelled, times out, or fails after retries.
+    pub async fn get_with_retry_cancellable(
+        &self,
+        url: String,
+        cancel: &CancellationToken,
+    ) -> Result<reqwest::Response, ClientError> {
+        let spec = RequestSpec::get(url);
+        self.send_with_retry(spec, cancel).await
+    }
+
+    /// Legacy GET with jitter/rate-limit/retry — delegates to
+    /// [`Self::get_with_retry_cancellable`] with a detached token.
     ///
     /// # Errors
     /// Returns an error if the request times out or fails after retries.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `get_with_retry_cancellable(url, cancel)` so Ctrl+C aborts the wait"
+    )]
     pub async fn get_with_retry(&self, url: String) -> Result<reqwest::Response, ClientError> {
-        let spec = RequestSpec::get(url);
-        // Use a detached token that never cancels for backwards compat
         let cancel = CancellationToken::new();
-        self.send_with_retry(spec, &cancel).await
+        self.get_with_retry_cancellable(url, &cancel).await
     }
 
     /// Read response body with timeout to prevent hanging on slow/incomplete responses.
     ///
+    /// `ClientError::Timeout` (or any other error) must never be scored as an
+    /// empty body — callers must skip scoring (`continue`/negative trial) so a
+    /// transport failure cannot become a finding. `Timeout` is retryable in
+    /// `send_with_retry`; body-read timeouts are surfaced here for the same
+    /// treatment (retry/skip, never a finding).
+    ///
     /// # Errors
     /// Returns an error if reading the body times out or the underlying stream fails.
+    ///
+    /// # Errors
+    /// Also returns [`ClientError::BodyTooLarge`] once the accumulated body
+    /// exceeds [`MAX_RESPONSE_BODY_BYTES`] — the stream is dropped
+    /// immediately rather than being drained to completion.
     pub async fn read_body_with_timeout(
         &self,
         resp: reqwest::Response,
     ) -> Result<Vec<u8>, ClientError> {
+        use futures::StreamExt as _;
         let timeout = self.timeout;
-        tokio::time::timeout(timeout, resp.bytes())
+        let fut = async {
+            let mut buf = Vec::new();
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                buf.extend_from_slice(&chunk);
+                if buf.len() > MAX_RESPONSE_BODY_BYTES {
+                    return Err(ClientError::BodyTooLarge(MAX_RESPONSE_BODY_BYTES));
+                }
+            }
+            Ok(buf)
+        };
+        tokio::time::timeout(timeout, fut)
             .await
             .map_err(|_| ClientError::Timeout(timeout))?
-            .map(|b| b.to_vec())
-            .map_err(std::convert::Into::into)
+    }
+
+    /// Bounded `String` body read: `read_body_with_timeout` + lossy UTF-8.
+    ///
+    /// Use this instead of `resp.text().await` everywhere — `text()` has no
+    /// bound and `unwrap_or_default()` turns transport errors into `""`,
+    /// which scores as similarity ~0 / confidence 0.75 (false positive).
+    ///
+    /// # Errors
+    /// Returns an error if reading the body times out or the stream fails.
+    pub async fn read_body_string_with_timeout(
+        &self,
+        resp: reqwest::Response,
+    ) -> Result<String, ClientError> {
+        let bytes = self.read_body_with_timeout(resp).await?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     #[must_use]
@@ -453,4 +607,103 @@ impl HttpClient {
     pub fn rate_limiter(&self) -> Arc<RateLimiter> {
         Arc::clone(&self.rate_limiter)
     }
+}
+
+fn map_url_error(url: &str, e: &crate::target::url::UrlError) -> ClientError {
+    use crate::target::url::UrlError;
+    match e {
+        UrlError::PrivateIp => ClientError::PrivateHost(url.to_owned()),
+        UrlError::Invalid(reason) => ClientError::InvalidUrl(reason.clone()),
+        UrlError::Scheme(scheme) => {
+            ClientError::InvalidUrl(format!("unsupported scheme: {scheme}"))
+        }
+        UrlError::Dns { host, reason } => {
+            ClientError::InvalidUrl(format!("DNS resolution failed for '{host}': {reason}"))
+        }
+    }
+}
+
+fn is_redirect_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
+/// Resolve a `Location` value (absolute or relative) against the current URL.
+fn resolve_redirect_url(current_url: &str, location: &str) -> Result<String, ClientError> {
+    if location.is_empty() {
+        return Err(ClientError::InvalidRedirect(
+            "empty Location header".to_owned(),
+        ));
+    }
+    // Absolute URL: use as-is (validated by caller).
+    if let Ok(parsed) = url::Url::parse(location) {
+        if matches!(parsed.scheme(), "http" | "https") {
+            return Ok(parsed.to_string());
+        }
+        return Err(ClientError::InvalidRedirect(format!(
+            "unsupported scheme in redirect: {}",
+            parsed.scheme()
+        )));
+    }
+    // Relative: join against the current URL.
+    let base = url::Url::parse(current_url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    base.join(location)
+        .map(|u| u.to_string())
+        .map_err(|e| ClientError::InvalidRedirect(e.to_string()))
+}
+
+/// Build the follow-up spec for a redirect hop: rewrite method/body per RFC
+/// and drop per-request headers cross-host to avoid credential leaks.
+/// (`CookieJar` is already scoped per URL in `build_request`; `reqwest`
+/// `default_headers` such as `--headers` are client-wide by design.)
+fn follow_spec(
+    current: &RequestSpec,
+    status: reqwest::StatusCode,
+    next_url: String,
+) -> RequestSpec {
+    let next_method = redirect_method(&current.method, status);
+    let method_changed = next_method != current.method;
+    let same_host = is_same_host(&current.url, &next_url);
+    let mut headers = if same_host {
+        current.headers.clone()
+    } else {
+        // Cross-host: do not forward per-request headers (auth/cookies).
+        HeaderMap::new()
+    };
+    if method_changed {
+        // GET must not carry a body; strip body-framing headers with it.
+        headers.remove(http::header::CONTENT_LENGTH);
+        headers.remove(http::header::CONTENT_TYPE);
+        headers.remove(http::header::TRANSFER_ENCODING);
+    }
+    let body = if method_changed {
+        None
+    } else {
+        current.body.clone()
+    };
+    RequestSpec {
+        method: next_method,
+        url: next_url,
+        headers,
+        body,
+    }
+}
+
+fn redirect_method(current: &Method, status: reqwest::StatusCode) -> Method {
+    match status.as_u16() {
+        // `303 See Other`: always GET (except HEAD, which we never send).
+        303 => Method::GET,
+        // Historic compatibility: `301/302` rewrite POST to GET.
+        301 | 302 if *current == Method::POST => Method::GET,
+        // `307/308`: strict method + body preservation.
+        _ => current.clone(),
+    }
+}
+
+fn is_same_host(a: &str, b: &str) -> bool {
+    let (Ok(ua), Ok(ub)) = (url::Url::parse(a), url::Url::parse(b)) else {
+        return false;
+    };
+    ua.host_str() == ub.host_str()
+        && ua.port_or_known_default() == ub.port_or_known_default()
+        && ua.scheme() == ub.scheme()
 }

@@ -11,9 +11,7 @@ use crate::{
     },
 };
 use http::{HeaderName, HeaderValue};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::{io::Write as _, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 /// Result of a recon crawl operation.
@@ -98,12 +96,13 @@ pub async fn run_scan(
 /// Parse import file without network access (offline path for `--test=false`).
 ///
 /// # Errors
-/// Returns an error if the file cannot be read or its contents fail to parse.
+/// Returns an error if the file cannot be read, exceeds 10 MiB, or its
+/// contents fail to parse.
 pub fn run_import_offline(
     args: &crate::cli::args::ReconImportArgs,
     no_redact: bool,
 ) -> anyhow::Result<Vec<ParameterCandidate>> {
-    let content = std::fs::read_to_string(&args.file)?;
+    let content = read_limited_import(&args.file)?;
     let candidates = parse_candidates(&content)?;
     let scrubber = crate::session::scrubber::Scrubber::new(no_redact);
     Ok(candidates
@@ -132,7 +131,7 @@ pub async fn run_import(
         anyhow::bail!("{e}");
     }
     let client = build_client(cli)?;
-    let content = std::fs::read_to_string(&args.file)?;
+    let content = read_limited_import(&args.file)?;
     let candidates = parse_candidates(&content)?;
     let discovery = scan_candidates(
         candidates,
@@ -143,6 +142,20 @@ pub async fn run_import(
     .await;
     let scrubber = crate::session::scrubber::Scrubber::new(cli.no_redact);
     Ok(discovery.scrubbed(&scrubber))
+}
+
+fn read_limited_import(path: &str) -> anyhow::Result<String> {
+    const MAX_IMPORT_BYTES: u64 = 10 * 1024 * 1024;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("cannot stat import file '{path}': {e}"))?;
+    if meta.len() > MAX_IMPORT_BYTES {
+        anyhow::bail!(
+            "import file '{path}' too large ({} bytes > {MAX_IMPORT_BYTES} bytes)",
+            meta.len()
+        );
+    }
+    std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("cannot read import file '{path}': {e}"))
 }
 
 /// Original CLI entry point — prints to stdout/stderr.
@@ -184,20 +197,20 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
     match command {
         ReconCommands::Crawl(args) => {
             let result = run_crawl(&cli, cancel, args).await?;
-            emit_json(&result.report, cli.output.as_deref())?;
+            emit_json(&result.report, cli.output.as_deref(), cli.no_redact)?;
         }
         ReconCommands::Scan(args) => {
             let result = run_scan(&cli, cancel, args).await?;
-            emit_json(&result, cli.output.as_deref())?;
+            emit_json(&result, cli.output.as_deref(), cli.no_redact)?;
         }
         ReconCommands::Import(args) => {
             if args.test {
                 let result = run_import(&cli, cancel, args).await?;
-                emit_json(&result, cli.output.as_deref())?;
+                emit_json(&result, cli.output.as_deref(), cli.no_redact)?;
             } else {
                 // Offline: list candidates without sending any probes (OPSEC).
                 let candidates = run_import_offline(args, cli.no_redact)?;
-                emit_json(&candidates, cli.output.as_deref())?;
+                emit_json(&candidates, cli.output.as_deref(), cli.no_redact)?;
             }
         }
     }
@@ -321,10 +334,17 @@ fn build_client(cli: &Cli) -> anyhow::Result<HttpClient> {
         }
     };
     let limiter = Arc::new(RateLimiter::new(cli.effective_rate_limit()));
+    let retry = crate::http::retry::RetryPolicy {
+        max_retries: cli.effective_retries(),
+        base_delay: Duration::from_millis(cli.effective_delay()),
+        max_delay: Duration::from_secs(5),
+    };
     let mut builder = HttpClient::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(cli.effective_timeout()))
         .jitter(jitter)
-        .rate_limiter(limiter);
+        .rate_limiter(limiter)
+        .retry_policy(retry)
+        .allow_private(cli.allow_private);
     if let Some(proxy) = cli.effective_proxy() {
         builder = builder.proxy(crate::http::proxy::ProxyConfig::parse(&proxy)?);
     }
@@ -349,17 +369,16 @@ fn build_client(cli: &Cli) -> anyhow::Result<HttpClient> {
         .map_err(|error| anyhow::anyhow!("client build: {error}"))
 }
 
-fn emit_json<T: serde::Serialize>(value: &T, path: Option<&str>) -> anyhow::Result<()> {
+fn emit_json<T: serde::Serialize>(
+    value: &T,
+    path: Option<&str>,
+    no_redact: bool,
+) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(value)?;
     if let Some(path) = path {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(path)?;
-        file.write_all(json.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
+        let scrubber = crate::session::scrubber::Scrubber::new(no_redact);
+        let scrubbed_path = scrubber.scrub(path);
+        crate::cli::output::file::write_output_file_sync(path, &json, false, &scrubbed_path)?;
     } else {
         println!("{json}");
     }

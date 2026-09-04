@@ -167,13 +167,21 @@ impl Crawler {
             if !is_html {
                 continue;
             }
-            let body = match response.text().await {
-                Ok(body) => body,
-                Err(error) => {
-                    tracing::warn!("{page_url}: body read failed: {error}");
-                    warnings.push(format!("{page_url}: body read failed: {error}"));
+            // Bounded body read with cancellation: unbounded `text()` can hang
+            // on slow/incomplete responses and Ctrl+C must abort the wait.
+            let body = tokio::select! {
+                () = cancel.cancelled() => {
+                    tracing::debug!("{page_url}: crawl cancelled during body read");
                     continue;
                 }
+                body = self.client.read_body_string_with_timeout(response) => match body {
+                    Ok(body) => body,
+                    Err(error) => {
+                        tracing::warn!("{page_url}: body read failed: {error}");
+                        warnings.push(format!("{page_url}: body read failed: {error}"));
+                        continue;
+                    }
+                },
             };
             let extracted = extract_document(&page_url, &body);
             let mut found_here = 0usize;
@@ -252,10 +260,15 @@ impl Crawler {
         robots_url.set_fragment(None);
         let request = RequestSpec::get(robots_url.to_string());
         match self.client.send_with_retry(request, cancel).await {
-            Ok(response) if response.status().is_success() => response
-                .text()
-                .await
-                .map_or_else(|_| RobotsRules::default(), |body| RobotsRules::parse(&body)),
+            Ok(response) if response.status().is_success() => {
+                // Bounded + cancellable like page bodies; failure falls back
+                // to default (no restrictions), never an error.
+                let body = tokio::select! {
+                    () = cancel.cancelled() => return RobotsRules::default(),
+                    body = self.client.read_body_string_with_timeout(response) => body.ok(),
+                };
+                body.map_or_else(RobotsRules::default, |b| RobotsRules::parse(&b))
+            }
             _ => RobotsRules::default(),
         }
     }

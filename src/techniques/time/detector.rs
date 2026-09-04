@@ -31,6 +31,12 @@ impl TimeDetector {
         }
     }
 
+    /// Build a detector calibrated from a request-timing baseline.
+    #[must_use]
+    pub fn from_baseline(baseline: &crate::detection::baseline::Baseline) -> Self {
+        Self::new(baseline.mean_ms, baseline.stddev_ms)
+    }
+
     #[must_use]
     pub fn threshold(&self) -> f64 {
         self.baseline_mean_ms + SIGMA_MULTIPLIER * self.baseline_stddev_ms.max(STDDEV_FLOOR_MS)
@@ -55,6 +61,26 @@ impl TimeDetector {
             confidence,
             measured_ms,
             expected_ms: expected,
+        }
+    }
+
+    /// Evaluate two independent measurements of the same payload and require
+    /// both to look vulnerable (anti-flake: a single jitter spike never
+    /// reports on its own). Confidence is the lower of the two.
+    #[must_use]
+    pub fn evaluate_confirmed(
+        &self,
+        measured_ms_1: f64,
+        measured_ms_2: f64,
+        expected_sleep_secs: f64,
+    ) -> TimeResult {
+        let first = self.evaluate(measured_ms_1, expected_sleep_secs);
+        let second = self.evaluate(measured_ms_2, expected_sleep_secs);
+        TimeResult {
+            is_vulnerable: first.is_vulnerable && second.is_vulnerable,
+            confidence: first.confidence.min(second.confidence),
+            measured_ms: measured_ms_2,
+            expected_ms: first.expected_ms,
         }
     }
 }

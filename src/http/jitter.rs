@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 use rand_distr::{Distribution, Normal};
+use tokio_util::sync::CancellationToken;
 
 /// Human-like jitter between requests: normal distribution, never negative.
 #[derive(Debug, Clone, Copy)]
@@ -61,6 +62,15 @@ impl Jitter {
 
     pub async fn sleep(&self) {
         tokio::time::sleep(self.next_delay()).await;
+    }
+
+    /// Cancellable jitter sleep: returns `false` when `cancel` fires first,
+    /// `true` once the delay fully elapsed.
+    pub async fn sleep_cancellable(&self, cancel: &CancellationToken) -> bool {
+        tokio::select! {
+            () = cancel.cancelled() => false,
+            () = tokio::time::sleep(self.next_delay()) => true,
+        }
     }
 }
 

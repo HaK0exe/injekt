@@ -1,12 +1,10 @@
 #![deny(unsafe_code)]
 
 use futures::StreamExt;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 /// Config for bounded concurrency scanning.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ScanConfig {
     pub concurrency: usize,
@@ -37,20 +35,27 @@ pub struct ScanResult {
 }
 
 /// Bounded-concurrency engine.
+///
+/// Concurrency is bounded once, by `buffer_unordered` below. (A previous
+/// revision also held a `Semaphore` permit per task — redundant double
+/// bound, now removed.)
 #[derive(Debug)]
 pub struct ScanEngine {
     config: ScanConfig,
-    semaphore: Arc<Semaphore>,
     cancel: CancellationToken,
 }
 
 impl ScanEngine {
     #[must_use]
     pub fn new(config: ScanConfig, cancel: CancellationToken) -> Self {
-        let sem = Arc::new(Semaphore::new(config.concurrency.max(1)));
+        // Clamp once and store: `buffer_unordered(0)` stalls forever, and an
+        // unbounded value would spawn without bound. Stored clamped 1..=32.
+        let clamped = ScanConfig {
+            concurrency: config.concurrency.clamp(1, 32),
+            timeout_secs: config.timeout_secs,
+        };
         Self {
-            config,
-            semaphore: sem,
+            config: clamped,
             cancel,
         }
     }
@@ -62,11 +67,9 @@ impl ScanEngine {
     {
         let stream = futures::stream::iter(tasks)
             .map({
-                let sem = Arc::clone(&self.semaphore);
                 let cancel = self.cancel.clone();
                 let cfg_timeout = self.config.timeout_secs;
                 move |t| {
-                    let sem = Arc::clone(&sem);
                     let cancel = cancel.clone();
                     let f = f.clone();
                     async move {
@@ -77,29 +80,34 @@ impl ScanEngine {
                                 confidence: 0.0,
                             };
                         }
-                        let Ok(_permit) = sem.acquire().await else {
-                            return ScanResult {
-                                task: t,
+                        // One clone is unavoidable: `t` moves into `f`'s
+                        // future, but the timeout arm still needs it when
+                        // that future is dropped on timeout. Timeouts are
+                        // rare, success reuses the moved value via `r`.
+                        let t_for_timeout = t.clone();
+                        let fut = f(t);
+                        tokio::select! {
+                            () = cancel.cancelled() => ScanResult {
+                                task: t_for_timeout,
                                 success: false,
                                 confidence: 0.0,
-                            };
-                        };
-                        // enforce per-task timeout
-                        let fut = f(t.clone());
-                        match tokio::time::timeout(std::time::Duration::from_secs(cfg_timeout), fut)
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(_) => ScanResult {
-                                task: t,
-                                success: false,
-                                confidence: 0.0,
+                            },
+                            r = tokio::time::timeout(
+                                std::time::Duration::from_secs(cfg_timeout),
+                                fut,
+                            ) => match r {
+                                Ok(r) => r,
+                                Err(_) => ScanResult {
+                                    task: t_for_timeout,
+                                    success: false,
+                                    confidence: 0.0,
+                                },
                             },
                         }
                     }
                 }
             })
-            .buffer_unordered(self.config.concurrency);
+            .buffer_unordered(self.config.concurrency.clamp(1, 32));
 
         stream.collect::<Vec<_>>().await
     }

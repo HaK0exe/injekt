@@ -38,6 +38,15 @@ pub enum Tamper {
     UnicodeEncode,
     /// UTF-8 overlong (`/` → `%c0%af`)
     OverlongUtf8,
+    /// `" "` → `--<random-digits>%0A` (MSSQL/SQLite dash comment + newline)
+    Space2Dash,
+    /// Insert `/**/` at a random position inside each SQL keyword (vs.
+    /// [`Self::BetweenComment`]'s every-letter split)
+    RandomComments,
+    /// `=` → ` LIKE ` (bypasses naive `=` filters)
+    EqualToLike,
+    /// Base64-encode the whole payload
+    Base64,
 }
 
 impl Tamper {
@@ -57,6 +66,10 @@ impl Tamper {
             Self::HexEncode => "hexencode",
             Self::UnicodeEncode => "unicodeencode",
             Self::OverlongUtf8 => "overlongutf8",
+            Self::Space2Dash => "space2dash",
+            Self::RandomComments => "randomcomments",
+            Self::EqualToLike => "equaltolike",
+            Self::Base64 => "base64encode",
         }
     }
 
@@ -76,6 +89,10 @@ impl Tamper {
             "hexencode" | "hex" => Some(Self::HexEncode),
             "unicodeencode" | "unicode" | "utf8unicode" => Some(Self::UnicodeEncode),
             "overlongutf8" | "overlong" | "utf8overlong" => Some(Self::OverlongUtf8),
+            "space2dash" | "dash" => Some(Self::Space2Dash),
+            "randomcomments" | "randomcomment" => Some(Self::RandomComments),
+            "equaltolike" | "eqtolike" => Some(Self::EqualToLike),
+            "base64encode" | "base64" => Some(Self::Base64),
             _ => None,
         }
     }
@@ -96,6 +113,10 @@ impl Tamper {
             "hexencode",
             "unicodeencode",
             "overlongutf8",
+            "space2dash",
+            "randomcomments",
+            "equaltolike",
+            "base64encode",
         ]
     }
 
@@ -154,6 +175,15 @@ impl Tamper {
                 acc
             }),
             Self::OverlongUtf8 => overlong_encode(payload),
+            Self::Space2Dash => apply_space2dash(payload),
+            Self::RandomComments => apply_random_comments(payload),
+            Self::EqualToLike => equal_to_like_regex()
+                .replace_all(payload, " LIKE ")
+                .into_owned(),
+            Self::Base64 => {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                STANDARD.encode(payload)
+            }
         }
     }
 }
@@ -246,6 +276,33 @@ pub fn tamper_transformation_sets(tampers: &[Tamper]) -> Vec<Vec<Tamper>> {
     sets
 }
 
+/// Like [`tamper_transformation_sets`], but restricted to tampers that keep
+/// the payload structurally comparable between the TRUE/FALSE branches.
+///
+/// Opaque/encoding transforms (`CharEncode`, `DoubleEncode`, `HexEncode`,
+/// `UnicodeEncode`, `OverlongUtf8`) rewrite the whole payload into a form the
+/// target may decode identically regardless of the TRUE/FALSE distinguishing
+/// character, which would make a boolean differential unreliable. Whitespace
+/// and case tricks are kept since they never touch the distinguishing digit.
+#[must_use]
+pub fn boolean_safe_transformation_sets(tampers: &[Tamper]) -> Vec<Vec<Tamper>> {
+    let safe: Vec<Tamper> = tampers
+        .iter()
+        .filter(|t| {
+            !matches!(
+                t,
+                Tamper::CharEncode
+                    | Tamper::DoubleEncode
+                    | Tamper::HexEncode
+                    | Tamper::UnicodeEncode
+                    | Tamper::OverlongUtf8
+            )
+        })
+        .cloned()
+        .collect();
+    tamper_transformation_sets(&safe)
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────
 
 fn char_encode(input: &str) -> String {
@@ -326,6 +383,54 @@ fn apply_versioned_comment(payload: &str) -> String {
         format!("/*!50000{m}*/")
     })
     .into_owned()
+}
+
+/// `sqlmap`'s `space2dash`: each space becomes `--<random-digits>%0A`, a
+/// single-line dash comment terminated by a (URL-encoded) newline so the
+/// rest of the statement resumes on the next line — works against MSSQL and
+/// SQLite, which honour `--` as an end-of-line comment.
+fn apply_space2dash(payload: &str) -> String {
+    let mut rng = rand::rng();
+    let random_digits: u32 = rng.random_range(1_000_000..10_000_000);
+    let mut out = String::with_capacity(payload.len() * 2);
+    for ch in payload.chars() {
+        if ch == ' ' {
+            let _ = write!(out, "--{random_digits}%0A");
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Like [`apply_between_comment`] but inserts a single `/**/` at one random
+/// position inside each SQL keyword instead of splitting every letter —
+/// less signature-obvious than [`Tamper::BetweenComment`].
+fn apply_random_comments(payload: &str) -> String {
+    let re = keyword_regex();
+    re.replace_all(payload, |caps: &regex::Captures| {
+        let word = &caps[0];
+        let chars: Vec<char> = word.chars().collect();
+        if chars.len() <= 2 {
+            return word.to_owned();
+        }
+        let mut rng = rand::rng();
+        let pos = rng.random_range(1..chars.len());
+        let mut out = String::with_capacity(word.len() + 4);
+        out.extend(&chars[..pos]);
+        out.push_str("/**/");
+        out.extend(&chars[pos..]);
+        out
+    })
+    .into_owned()
+}
+
+fn equal_to_like_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        #[allow(clippy::expect_used)]
+        Regex::new(r"\s*=\s*").expect("static equal-to-like regex")
+    })
 }
 
 fn apply_between_comment(payload: &str) -> String {
@@ -464,6 +569,63 @@ mod tests {
         let out2 = Tamper::OverlongUtf8.apply("a/b");
         assert!(out2.contains("%c0%af"), "got {out2}");
         assert!(out2.starts_with('a'));
+    }
+
+    #[test]
+    fn space2dash_replaces_spaces_with_dash_comment() {
+        let out = Tamper::Space2Dash.apply("' OR 1=1");
+        assert!(!out.contains(' '), "got {out}");
+        assert!(out.contains("--"), "got {out}");
+        assert!(out.contains("%0A"), "got {out}");
+        assert!(out.starts_with('\''));
+        assert!(out.ends_with('1'));
+    }
+
+    #[test]
+    fn randomcomments_splits_keyword_once() {
+        let out = Tamper::RandomComments.apply("SELECT");
+        assert_eq!(out.matches("/**/").count(), 1, "got {out}");
+        assert_eq!(out.replace("/**/", ""), "SELECT");
+        // short words (<=2 chars) are left untouched
+        let out2 = Tamper::RandomComments.apply("BY");
+        assert_eq!(out2, "BY");
+    }
+
+    #[test]
+    fn equaltolike_replaces_equals() {
+        assert_eq!(Tamper::EqualToLike.apply("1=1"), "1 LIKE 1");
+        assert_eq!(Tamper::EqualToLike.apply("id = 5"), "id LIKE 5");
+    }
+
+    #[test]
+    fn base64_roundtrips() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let out = Tamper::Base64.apply("' OR 1=1 -- -");
+        assert_eq!(
+            STANDARD
+                .decode(&out)
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+            Ok("' OR 1=1 -- -".to_owned())
+        );
+    }
+
+    #[test]
+    fn new_tampers_registered_in_from_name_and_all_names() {
+        for name in [
+            "space2dash",
+            "randomcomments",
+            "equaltolike",
+            "base64encode",
+        ] {
+            assert!(
+                Tamper::all_names().contains(&name),
+                "{name} missing from all_names"
+            );
+            assert!(
+                Tamper::from_name(name).is_some(),
+                "{name} missing from from_name"
+            );
+        }
     }
 
     #[test]

@@ -24,6 +24,7 @@ async fn http_client_get_with_retry_and_cookies() {
 
     let client = HttpClient::builder()
         .timeout(Duration::from_secs(5))
+        .allow_private(true)
         .build()
         .expect("build");
     let cancel = CancellationToken::new();
@@ -82,6 +83,57 @@ async fn baseline_waf_detection() {
     let bl = Baseline::new(&samples);
     assert!(bl.is_waf_blocked());
     assert!(!bl.representative_body.is_empty());
+}
+
+#[tokio::test]
+async fn read_body_with_timeout_caps_oversized_response() {
+    use injekt::http::client::ClientError;
+    let server = MockServer::start().await;
+    let oversized = "a".repeat(injekt::http::client::MAX_RESPONSE_BODY_BYTES + 1024);
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(oversized))
+        .mount(&server)
+        .await;
+
+    let client = HttpClient::builder()
+        .timeout(Duration::from_secs(5))
+        .allow_private(true)
+        .build()
+        .expect("build");
+    let cancel = CancellationToken::new();
+    let spec = RequestSpec::new(Method::GET, format!("{}/", server.uri()));
+    let resp = client.send_with_retry(spec, &cancel).await.expect("resp");
+    let err = client
+        .read_body_with_timeout(resp)
+        .await
+        .expect_err("oversized body must be rejected");
+    assert!(
+        matches!(err, ClientError::BodyTooLarge(cap) if cap == injekt::http::client::MAX_RESPONSE_BODY_BYTES),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn read_body_with_timeout_allows_normal_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("hello world"))
+        .mount(&server)
+        .await;
+
+    let client = HttpClient::builder()
+        .timeout(Duration::from_secs(5))
+        .allow_private(true)
+        .build()
+        .expect("build");
+    let cancel = CancellationToken::new();
+    let spec = RequestSpec::new(Method::GET, format!("{}/", server.uri()));
+    let resp = client.send_with_retry(spec, &cancel).await.expect("resp");
+    let body = client
+        .read_body_string_with_timeout(resp)
+        .await
+        .expect("body");
+    assert_eq!(body, "hello world");
 }
 
 #[tokio::test]

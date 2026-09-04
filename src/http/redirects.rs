@@ -21,4 +21,14 @@ impl RedirectPolicy {
             Self::Limited(max) => count < *max,
         }
     }
+
+    /// Maximum number of redirect hops to follow, or `None` if redirects
+    /// must not be followed at all.
+    #[must_use]
+    pub fn max_hops(&self) -> Option<usize> {
+        match self {
+            Self::None => None,
+            Self::Limited(max) => Some(*max),
+        }
+    }
 }

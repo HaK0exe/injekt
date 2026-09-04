@@ -40,6 +40,11 @@ struct EncryptedBlob {
 #[derive(Debug, Serialize, Deserialize)]
 struct Snapshot {
     findings: Vec<crate::session::state::Finding>,
+    /// Extracted DB data (banner, tables, dump rows, …) — the whole point of
+    /// `--export-encrypted`; previously dropped on export, silently losing
+    /// every `--dump`/`--banner`/`--current-user` result once the process exited.
+    #[serde(default)]
+    extracted: Vec<String>,
     request_count: u64,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -62,6 +67,7 @@ impl EncryptedExport {
     ) -> Result<(), ExportError> {
         let snapshot = Snapshot {
             findings: state.findings().to_vec(),
+            extracted: state.extracted_exposed(),
             request_count: state.request_count(),
             started_at: state.started_at(),
         };
@@ -240,6 +246,19 @@ mod tests {
         // We verify the file can be decrypted
         assert!(json_str.contains("findings"));
         assert!(json_str.contains("request_count"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extracted_data_survives_roundtrip() {
+        let state = test_state();
+        let passphrase = SecretString::from("passphrase123456");
+        let path = temp_path();
+
+        EncryptedExport::encrypt_to_file(&state, &passphrase, &path).unwrap();
+        let json_bytes = EncryptedExport::decrypt_from_file(&passphrase, &path).unwrap();
+        let snapshot: Snapshot = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(snapshot.extracted, vec!["extracted secret data".to_owned()]);
         let _ = fs::remove_file(&path);
     }
 
