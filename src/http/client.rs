@@ -406,9 +406,11 @@ impl HttpClient {
         }
         {
             let jar = self.cookies.read().await;
+            // Scoped lookup only: never fall back to unscoped `header_value()`.
+            // The fallback used to send ALL cookies (including Secure/Domain-mismatched
+            // ones) when zero cookies passed the RFC6265 filter — a cross-origin
+            // and http-downgrade leak. Absence of in-scope cookies means no header.
             if let Some(cv) = jar.header_value_for_url(Some(&spec.url)) {
-                req = req.header(reqwest::header::COOKIE, cv);
-            } else if let Some(cv) = jar.header_value() {
                 req = req.header(reqwest::header::COOKIE, cv);
             }
         }

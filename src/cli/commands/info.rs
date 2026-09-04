@@ -4,10 +4,12 @@ use serde::{Deserialize, Serialize};
 
 /// Structured info about injekt capabilities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct InfoResult {
     pub version: String,
     pub techniques: Vec<String>,
     pub tampers: Vec<String>,
+    pub profiles: Vec<String>,
     pub oob: String,
     pub request_tampers: String,
     pub dbms: Vec<String>,
@@ -29,6 +31,10 @@ pub fn info() -> InfoResult {
             "json".to_string(),
         ],
         tampers: crate::techniques::tamper::Tamper::all_names()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
+        profiles: crate::cli::profile::Profile::all_names()
             .iter()
             .map(std::string::ToString::to_string)
             .collect(),
@@ -63,6 +69,7 @@ pub fn run() {
     };
     row("Techniques", &info.techniques.join(", "));
     row("Tampers", &info.tampers.join(", "));
+    row("Profiles", &info.profiles.join(", "));
     row("OOB", &info.oob);
     row("Request tampers", &info.request_tampers);
     row("DBMS", &info.dbms.join(", "));

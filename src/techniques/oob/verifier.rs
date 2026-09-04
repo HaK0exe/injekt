@@ -12,7 +12,7 @@
 //! own traffic; the DB-side egress itself cannot be proxied by injekt.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Async verifier: returns `true` when the collaborator observed `token`.
 pub trait OobVerifier: Send + Sync + core::fmt::Debug {
@@ -76,6 +76,10 @@ pub struct HttpPollVerifier {
     pub poll_url: String,
     /// Per-request timeout in seconds.
     pub timeout_secs: u64,
+    /// Reused across polls (connection pool); lazily built on first `verify`.
+    /// Polls the collaborator, not the target, so target rate-limit/jitter
+    /// intentionally do not apply here.
+    cached_client: OnceLock<reqwest::Client>,
 }
 
 impl HttpPollVerifier {
@@ -84,17 +88,27 @@ impl HttpPollVerifier {
         Self {
             poll_url: poll_url.into(),
             timeout_secs: timeout_secs.clamp(1, 60),
+            cached_client: OnceLock::new(),
         }
+    }
+
+    /// Shared client for all polls, or `None` when it cannot be built.
+    fn client(&self) -> Option<&reqwest::Client> {
+        if let Some(c) = self.cached_client.get() {
+            return Some(c);
+        }
+        let built = reqwest::Client::builder()
+            .timeout(core::time::Duration::from_secs(self.timeout_secs))
+            .build()
+            .ok()?;
+        Some(self.cached_client.get_or_init(|| built))
     }
 }
 
 impl OobVerifier for HttpPollVerifier {
     async fn verify(&self, token: &str) -> bool {
         let url = expand_poll_url(&self.poll_url, token);
-        let client = reqwest::Client::builder()
-            .timeout(core::time::Duration::from_secs(self.timeout_secs))
-            .build();
-        let Ok(client) = client else {
+        let Some(client) = self.client() else {
             return false;
         };
         let resp = tokio::time::timeout(

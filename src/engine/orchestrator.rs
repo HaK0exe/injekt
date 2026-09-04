@@ -350,6 +350,13 @@ impl Engine {
         let mut current = EngineState::Parse;
         info!(target=%self.scrubber.scrub(target_str), state=?current, "engine start");
 
+        // `--confirm` strict second-pass replay is not implemented yet: flag it
+        // instead of silently ignoring it. In-detection 3-trial confirmation
+        // (boolean/JSON channels) still applies regardless of this flag.
+        if self.config.confirm {
+            warn!("--confirm has no effect yet (second-pass replay not implemented)");
+        }
+
         // Parse
         let target = TargetUrl::parse(target_str, self.config.allow_private)
             .map_err(|e| crate::error::InjektError::Other(Box::new(e)))?;
@@ -465,10 +472,12 @@ impl Engine {
             warn!("--raw-file and --data both set — raw request wins, --data ignored");
         }
         cli_raw_request.or_else(|| {
-            self.config
-                .post_data
-                .as_deref()
-                .and_then(synthetic_raw_from_data)
+            let data = self.config.post_data.as_deref()?;
+            let raw = synthetic_raw_from_data(data);
+            if raw.is_none() && !data.is_empty() {
+                warn!("--data is blank — scanning without a body");
+            }
+            raw
         })
     }
 
@@ -835,8 +844,11 @@ impl Engine {
         let f = st.findings().first().cloned();
         drop(st);
         if let Some(finding) = f {
-            // Recover param from finding.parameter "name@location" (e.g., "id@query", "user@body", "X-Header@header:X-Header")
-            let (name, loc_str) = match finding.parameter.split_once('@') {
+            // Recover param from finding.parameter "name@location" (e.g., "id@query", "user@body", "X-Header@header:X-Header").
+            // Split at the LAST '@': parameter names may contain '@' (e.g. email-like
+            // query keys) while locations (`query`/`body`/`cookie`/`header:<name>`)
+            // never do — HTTP header names (RFC 9110 `token`) exclude '@' and ':'.
+            let (name, loc_str) = match finding.parameter.rsplit_once('@') {
                 Some((n, l)) => (n.to_owned(), l.to_owned()),
                 None => (finding.parameter.clone(), "query".to_owned()),
             };

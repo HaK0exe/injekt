@@ -50,6 +50,10 @@ pub async fn run_crawl(
     cancel: CancellationToken,
     args: &crate::cli::args::ReconCrawlArgs,
 ) -> anyhow::Result<ReconCrawlResult> {
+    if let Err(e) = cli.validate_explicit_config() {
+        anyhow::bail!("{e}");
+    }
+    tracing::info!(resolution=%cli.resolution_summary(), "recon config resolved");
     let client = build_client(cli)?;
     let report = crawl(cli, client, args, &cancel).await?;
     let scrubber = crate::session::scrubber::Scrubber::new(cli.no_redact);
@@ -68,6 +72,10 @@ pub async fn run_scan(
     cancel: CancellationToken,
     args: &crate::cli::args::ReconScanArgs,
 ) -> anyhow::Result<ReconScanResult> {
+    if let Err(e) = cli.validate_explicit_config() {
+        anyhow::bail!("{e}");
+    }
+    tracing::info!(resolution=%cli.resolution_summary(), "recon config resolved");
     let client = build_client(cli)?;
     let crawl_report = crawl(cli, client.clone(), &args.crawl, &cancel).await?;
     let engine_config = engine_config(cli, args.auto_enumerate);
@@ -120,6 +128,9 @@ pub async fn run_import(
             "run_import performs active scanning; use run_import_offline when --test is false"
         );
     }
+    if let Err(e) = cli.validate_explicit_config() {
+        anyhow::bail!("{e}");
+    }
     let client = build_client(cli)?;
     let content = std::fs::read_to_string(&args.file)?;
     let candidates = parse_candidates(&content)?;
@@ -139,6 +150,33 @@ pub async fn run_import(
 /// # Errors
 /// Returns an error if no recon subcommand is given or the underlying operation fails.
 pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
+    if cli.dry_run {
+        println!("dry-run: recon plan (no request sent)");
+        println!("  resolution: {}", cli.resolution_summary());
+        if let Some(Commands::Recon(args)) = &cli.command {
+            match &args.command {
+                ReconCommands::Crawl(a) => {
+                    println!(
+                        "  mode: crawl target={} depth={} max-pages={}",
+                        a.target, a.depth, a.max_pages
+                    );
+                }
+                ReconCommands::Scan(a) => {
+                    println!(
+                        "  mode: scan target={} depth={} max-pages={} auto-enumerate={}",
+                        a.crawl.target, a.crawl.depth, a.crawl.max_pages, a.auto_enumerate
+                    );
+                }
+                ReconCommands::Import(a) => {
+                    println!(
+                        "  mode: import file={} test={} enumerate={}",
+                        a.file, a.test, a.enumerate
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
     let command = match &cli.command {
         Some(Commands::Recon(args)) => &args.command,
         _ => anyhow::bail!("recon command required"),
@@ -221,27 +259,33 @@ fn engine_config(cli: &Cli, enumerate: bool) -> EngineConfig {
         );
     }
     EngineConfig {
-        threads: cli.threads,
-        techniques: if cli.techniques.is_empty() {
+        threads: cli.effective_threads(),
+        techniques: if !cli.techniques.is_empty() {
+            cli.techniques.clone()
+        } else if cli
+            .fetch_using
+            .as_deref()
+            .is_some_and(|v| v == "boolean" || v == "time")
+        {
             match cli.fetch_using.as_deref() {
                 Some("boolean") => vec!["boolean".to_owned()],
                 Some("time") => vec!["time".to_owned()],
-                _ => vec!["all".to_owned()],
+                _ => cli.effective_techniques(),
             }
         } else {
-            cli.techniques.clone()
+            cli.effective_techniques()
         },
         test_params: cli.params.clone(),
         post_data: cli.data.clone(),
         payload_opts: cli.payload_opts(),
         matcher: cli.matcher_config(),
         tampers,
-        level: cli.level.unwrap_or(1).clamp(1, 5),
+        level: cli.effective_level(),
         confirm: cli.confirm,
         ignore_codes: cli.ignore_codes.clone(),
         oob_domain: cli.oob_domain.clone(),
         oob_poll_url: cli.oob_poll_url.clone(),
-        oob_wait_secs: cli.oob_wait_secs,
+        oob_wait_secs: cli.effective_oob_wait_secs(),
         hpp: cli.hpp,
         chunked: cli.chunked,
         allow_private: cli.allow_private,
@@ -265,27 +309,24 @@ fn engine_config(cli: &Cli, enumerate: bool) -> EngineConfig {
 }
 
 fn build_client(cli: &Cli) -> anyhow::Result<HttpClient> {
-    let jitter = cli
-        .jitter
-        .as_deref()
-        .map(|value| {
-            let parts: Vec<f64> = value
-                .split(',')
-                .filter_map(|part| part.parse().ok())
-                .collect();
-            match parts.as_slice() {
-                [mean, standard_deviation] => Jitter::new(*mean, *standard_deviation),
-                _ => Jitter::default(),
-            }
-        })
-        .unwrap_or_default();
-    let limiter = Arc::new(RateLimiter::new(cli.rate_limit.unwrap_or(10.0)));
+    let jitter = {
+        let value = cli.effective_jitter();
+        let parts: Vec<f64> = value
+            .split(',')
+            .filter_map(|part| part.trim().parse().ok())
+            .collect();
+        match parts.as_slice() {
+            [mean, standard_deviation] => Jitter::new(*mean, *standard_deviation),
+            _ => Jitter::default(),
+        }
+    };
+    let limiter = Arc::new(RateLimiter::new(cli.effective_rate_limit()));
     let mut builder = HttpClient::builder()
         .timeout(Duration::from_secs(15))
         .jitter(jitter)
         .rate_limiter(limiter);
-    if let Some(proxy) = &cli.proxy {
-        builder = builder.proxy(crate::http::proxy::ProxyConfig::parse(proxy)?);
+    if let Some(proxy) = cli.effective_proxy() {
+        builder = builder.proxy(crate::http::proxy::ProxyConfig::parse(&proxy)?);
     }
     for header in &cli.headers {
         let Some((name, value)) = header.split_once(':') else {

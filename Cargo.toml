@@ -37,6 +37,8 @@ scraper = "0.24"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+clap_mangen = "0.2"
 owo-colors = "4"
 indicatif = "0.17"
 tabled = "0.15"

@@ -96,16 +96,18 @@ impl InjektServer {
     fn base_cli() -> Cli {
         Cli {
             command: None,
+            profile: None,
+            config: None,
             target: None,
             bulk_file: None,
             method: None,
             headers: Vec::new(),
             cookies: None,
             proxy: None,
-            threads: 5,
-            timeout: 30,
-            retries: 3,
-            delay: 500,
+            threads: None,
+            timeout: None,
+            retries: None,
+            delay: None,
             techniques: Vec::new(),
             params: Vec::new(),
             data: None,
@@ -140,7 +142,7 @@ impl InjektServer {
             marker: None,
             oob_domain: None,
             oob_poll_url: None,
-            oob_wait_secs: 5,
+            oob_wait_secs: None,
             tamper: Vec::new(),
             hpp: false,
             chunked: false,
@@ -149,6 +151,11 @@ impl InjektServer {
             no_redact: false,
             allow_private: false,
             raw_file: None,
+            raw_dir: None,
+            stdin: false,
+            openapi_file: None,
+            sitemap_file: None,
+            dry_run: false,
             verbose: false,
             level: Some(1),
             confirm: false,
@@ -163,7 +170,7 @@ impl InjektServer {
             target: Some(params.target),
         }));
         if let Some(v) = params.threads {
-            cli.threads = v;
+            cli.threads = Some(v);
         }
         if let Some(v) = params.techniques {
             cli.techniques = v;
@@ -187,6 +194,9 @@ impl InjektServer {
         cli.proxy = params.proxy;
         cli.rate_limit = params.rate_limit;
         cli.jitter = params.jitter;
+        cli.timeout = params.timeout;
+        cli.retries = params.retries;
+        cli.delay = params.delay;
         if let Some(v) = params.headers {
             cli.headers = v;
         }
@@ -211,7 +221,7 @@ impl InjektServer {
         cli.oob_domain = params.oob_domain;
         cli.oob_poll_url = params.oob_poll_url;
         if let Some(v) = params.oob_wait_secs {
-            cli.oob_wait_secs = v;
+            cli.oob_wait_secs = Some(v);
         }
         cli.hpp = params.hpp.unwrap_or(false);
         cli.chunked = params.chunked.unwrap_or(false);
@@ -253,8 +263,11 @@ impl InjektServer {
             command: ReconCommands::Crawl(args.clone()),
         }));
         if let Some(v) = params.threads {
-            cli.threads = v;
+            cli.threads = Some(v);
         }
+        cli.timeout = params.timeout;
+        cli.retries = params.retries;
+        cli.delay = params.delay;
         Self::apply_common_network_opts(
             &mut cli,
             params.proxy,
@@ -284,7 +297,7 @@ impl InjektServer {
             command: ReconCommands::Scan(args.clone()),
         }));
         if let Some(v) = params.threads {
-            cli.threads = v;
+            cli.threads = Some(v);
         }
         if let Some(v) = params.techniques {
             cli.techniques = v;
@@ -325,11 +338,14 @@ impl InjektServer {
         cli.oob_domain = params.oob_domain;
         cli.oob_poll_url = params.oob_poll_url;
         if let Some(v) = params.oob_wait_secs {
-            cli.oob_wait_secs = v;
+            cli.oob_wait_secs = Some(v);
         }
         cli.hpp = params.hpp.unwrap_or(false);
         cli.chunked = params.chunked.unwrap_or(false);
         cli.no_redact = params.no_redact.unwrap_or(false);
+        cli.timeout = params.timeout;
+        cli.retries = params.retries;
+        cli.delay = params.delay;
         Self::apply_common_network_opts(
             &mut cli,
             params.proxy,

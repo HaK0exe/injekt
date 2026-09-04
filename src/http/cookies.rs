@@ -61,6 +61,12 @@ impl CookieJar {
             return None;
         }
         let now = Utc::now();
+        // Parse the request URL once. A malformed URL must never degrade to
+        // "send everything": fail closed and emit no Cookie header.
+        let parsed_url = url.map(url::Url::parse);
+        if url.is_some() && parsed_url.as_ref().is_none_or(Result::is_err) {
+            return None;
+        }
         let mut parts: Vec<String> = Vec::new();
         for (k, meta) in &self.cookies {
             if let Some(exp) = meta.expires
@@ -68,9 +74,7 @@ impl CookieJar {
             {
                 continue;
             }
-            if let Some(raw_url) = url
-                && let Ok(parsed) = url::Url::parse(raw_url)
-            {
+            if let Some(Ok(parsed)) = parsed_url.as_ref() {
                 let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
                 if let Some(d) = &meta.domain
                     && !(host == d.as_str() || host.ends_with(&format!(".{d}")))
@@ -78,7 +82,7 @@ impl CookieJar {
                     continue;
                 }
                 let path = parsed.path();
-                if !path.starts_with(&meta.path) {
+                if !path_matches(path, &meta.path) {
                     continue;
                 }
                 if meta.secure && parsed.scheme() != "https" {
@@ -178,6 +182,19 @@ fn default_path(url: &url::Url) -> String {
     }
 }
 
+/// RFC6265 §5.1.4 path-match: exact match, or cookie-path is a prefix ending
+/// in `/`, or prefix where the first non-matching char is `/`.
+/// Prevents `Path=/admin` leaking to `/administrator`.
+fn path_matches(request_path: &str, cookie_path: &str) -> bool {
+    if request_path == cookie_path {
+        return true;
+    }
+    if let Some(rest) = request_path.strip_prefix(cookie_path) {
+        return cookie_path.ends_with('/') || rest.starts_with('/');
+    }
+    false
+}
+
 impl Zeroize for CookieJar {
     fn zeroize(&mut self) {
         for meta in self.cookies.values_mut() {
@@ -193,3 +210,43 @@ impl Drop for CookieJar {
     }
 }
 impl ZeroizeOnDrop for CookieJar {}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_match_rejects_sibling_prefix() {
+        assert!(path_matches("/admin", "/admin"));
+        assert!(path_matches("/admin/", "/admin"));
+        assert!(path_matches("/admin/users", "/admin"));
+        assert!(path_matches("/admin/users", "/admin/"));
+        assert!(!path_matches("/administrator", "/admin"));
+        assert!(!path_matches("/admin2", "/admin"));
+    }
+
+    #[test]
+    fn malformed_url_sends_no_cookies_fail_closed() {
+        let mut jar = CookieJar::new();
+        jar.set_raw("sess", "secret");
+        assert!(jar.header_value_for_url(Some("http://%zz")).is_none());
+    }
+
+    #[test]
+    fn secure_cookie_not_sent_over_http() {
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie_with_url(
+            "sess=secret; Secure",
+            Some(&url::Url::parse("https://victime.com/admin").unwrap()),
+        );
+        assert!(
+            jar.header_value_for_url(Some("http://victime.com/admin"))
+                .is_none()
+        );
+        assert!(
+            jar.header_value_for_url(Some("https://victime.com/admin"))
+                .is_some()
+        );
+    }
+}

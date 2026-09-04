@@ -26,35 +26,44 @@ pub struct ScanResult {
 }
 
 /// Build engine config from CLI detection/enumeration options.
-fn engine_config(cli: &Cli) -> EngineConfig {
+/// Resolution honours `--profile` / config file / `INJEKT_*` via `Cli::effective_*`:
+/// explicit flags always win, presets only fill gaps (non-breaking).
+pub(crate) fn engine_config(cli: &Cli) -> EngineConfig {
     let tampers = if cli.tamper.is_empty() {
         Vec::new()
     } else {
         crate::techniques::tamper::parse_tamper_list(Some(&cli.tamper.join(",")))
     };
     EngineConfig {
-        threads: cli.threads,
-        techniques: if cli.techniques.is_empty() {
-            // --fetch-using narrows the default technique set (explicit --techniques wins)
+        threads: cli.effective_threads(),
+        techniques: if !cli.techniques.is_empty() {
+            cli.techniques.clone()
+        } else if cli
+            .fetch_using
+            .as_deref()
+            .is_some_and(|v| v == "boolean" || v == "time")
+        {
+            // --fetch-using narrows the default technique set (explicit --techniques wins,
+            // otherwise explicit --fetch-using wins over config file / profile defaults).
             match cli.fetch_using.as_deref() {
                 Some("boolean") => vec!["boolean".to_owned()],
                 Some("time") => vec!["time".to_owned()],
-                _ => vec!["all".to_owned()],
+                _ => cli.effective_techniques(),
             }
         } else {
-            cli.techniques.clone()
+            cli.effective_techniques()
         },
         test_params: cli.params.clone(),
         post_data: cli.data.clone(),
         payload_opts: cli.payload_opts(),
         matcher: cli.matcher_config(),
         tampers,
-        level: cli.level.unwrap_or(1),
+        level: cli.effective_level(),
         confirm: cli.confirm,
         ignore_codes: cli.ignore_codes.clone(),
         oob_domain: cli.oob_domain.clone(),
         oob_poll_url: cli.oob_poll_url.clone(),
-        oob_wait_secs: cli.oob_wait_secs,
+        oob_wait_secs: cli.effective_oob_wait_secs(),
         hpp: cli.hpp,
         chunked: cli.chunked,
         allow_private: cli.allow_private,
@@ -84,6 +93,10 @@ fn engine_config(cli: &Cli) -> EngineConfig {
 /// Returns an error if no target is given, the HTTP client fails to build,
 /// or the scan engine fails.
 pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult> {
+    if let Err(e) = cli.validate_explicit_config() {
+        return Err(crate::error::InjektError::Other(e.into()).into());
+    }
+    info!(resolution=%cli.resolution_summary(), "scan config resolved");
     let target = cli
         .effective_target()
         .ok_or_else(|| crate::error::InjektError::Other("target required".into()))?;
@@ -113,14 +126,10 @@ pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult
     })
 }
 
-/// Bulk CLI entry point (`-m/--bulk-file`): sequential multi-target scan.
+/// Bulk CLI entry point (`-m/--bulk-file` + `--stdin` / `--openapi-file` /
+/// `--sitemap-file` / `--raw-dir`): sequential multi-target scan.
 async fn run_bulk_cli(cli: &Cli, cancel: CancellationToken) -> Result<()> {
-    let bulk_path = cli.bulk_file.as_deref().ok_or_else(|| {
-        anyhow::Error::from(crate::error::InjektError::Other(
-            "--bulk-file required".into(),
-        ))
-    })?;
-    if cli.effective_target().is_some() {
+    if cli.bulk_file.is_some() && cli.effective_target().is_some() {
         return Err(crate::error::InjektError::Other(
             "--bulk-file conflicts with --target/--raw-file (one mode at a time)".into(),
         )
@@ -141,7 +150,7 @@ async fn run_bulk_cli(cli: &Cli, cancel: CancellationToken) -> Result<()> {
     }) {
         warn!("Authorization header combined with --bulk-file is replayed on every target");
     }
-    let targets = crate::target::bulk::load_targets(bulk_path, cli.allow_private)?;
+    let targets = crate::target::ingest::collect_targets(cli, None)?;
     // Fail fast on broken network config; per-target rebuilds stay fresh
     // (CookieJar/RateLimiter isolation).
     build_client(cli, cli.allow_private)?;
@@ -176,13 +185,58 @@ async fn run_bulk_cli(cli: &Cli, cancel: CancellationToken) -> Result<()> {
     Ok(())
 }
 
+/// `true` when any multi-target ingestion source is set.
+#[must_use]
+pub fn has_ingestion_sources(cli: &Cli) -> bool {
+    cli.bulk_file.is_some()
+        || cli.stdin
+        || cli.openapi_file.is_some()
+        || cli.sitemap_file.is_some()
+        || cli.raw_dir.is_some()
+}
+
+/// Print the execution plan without sending any request.
+fn dry_run(cli: &Cli) {
+    let scrubber = Scrubber::new(cli.no_redact);
+    println!("dry-run: scan plan (no request sent)");
+    println!("  resolution: {}", cli.resolution_summary());
+    let targets = crate::target::ingest::collect_targets(cli, None)
+        .unwrap_or_else(|_| cli.effective_target().map(|t| vec![t]).unwrap_or_default());
+    if targets.is_empty() {
+        println!("  targets: 0 (no valid target)");
+    } else {
+        println!("  targets: {}", targets.len());
+        for target in targets.iter().take(20) {
+            println!("    - {}", scrubber.scrub(target));
+        }
+        if targets.len() > 20 {
+            println!("    … ({} more)", targets.len() - 20);
+        }
+    }
+    let cfg = engine_config(cli);
+    println!(
+        "  techniques: {} level={} threads={}",
+        if cfg.techniques.is_empty() {
+            "all".to_owned()
+        } else {
+            cfg.techniques.join(",")
+        },
+        cfg.level,
+        cfg.threads
+    );
+}
+
 /// Original CLI entry point — prints to stdout/stderr.
 ///
 /// # Errors
 /// Returns an error if the scan (or bulk scan) fails, or the output report
 /// can't be written to disk.
 pub async fn run(cli: Cli, cancel: CancellationToken) -> Result<()> {
-    if cli.bulk_file.is_some() {
+    if cli.dry_run {
+        dry_run(&cli);
+        return Ok(());
+    }
+    if has_ingestion_sources(&cli) {
         return run_bulk_cli(&cli, cancel).await;
     }
     let result = run_scan(&cli, cancel).await?;

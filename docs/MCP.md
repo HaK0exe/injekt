@@ -11,15 +11,19 @@ JSON-RPC channel and is never polluted.
 
 | Tool | Description |
 |------|-------------|
-| `scan` | Scan a target URL for SQL injection. Full CLI flag mapping (techniques, tampers, proxy, rate-limit, jitter, headers, cookies, dbms, extract, dbs/tables/columns/dump, banner/current-user/current-db/hostname, db/table/column/start/stop/count, output, oob, hpp, chunked, allow-private, no-redact). |
+| `scan` | Scan a target URL for SQL injection. Near-full CLI flag mapping (techniques, fetch-using, payload prefix/suffix/encoding opts, matchers, tampers, proxy, rate-limit, jitter (**ms**, `"750,250"`), headers, cookies, dbms, extract, dbs/tables/columns/dump, banner/current-user/current-db/hostname, db/table/column/start/stop/count, output, oob, hpp, chunked, allow-private, no-redact). See [CLI ↔ MCP parity](../DOCUMENTATION.md#mcp-vs-cli-parity-verified-against-srcmcptoolsrs) for the gaps. |
 | `recon_crawl` | Crawl a target, return discovered parameters (no testing). |
 | `recon_scan` | Crawl + test each discovered parameter. |
 | `info` | Capabilities, techniques, tampers, supported DBMS. |
 
 `replay` is intentionally **not** exposed yet. `raw_file` (Burp/ZAP raw
-bodies), `marker` (`*`/`§` modes), `method` override and `import` are also
-CLI-only on purpose: they need local file access or ad-hoc request shaping
-that does not map cleanly to a stdio tool surface. Use the CLI for those.
+bodies), `marker` (`*`/`§` modes), `method` override, `import`, `bulk_file`
+and `export_encrypted` are also CLI-only on purpose: they need local file
+access, a TTY passphrase, or ad-hoc request shaping that does not map cleanly
+to a stdio tool surface. `--level` / `--confirm` / `--ignore-code` are not in
+the tool schema either — MCP runs at level 1 with no second-pass confirm.
+Use the CLI for those. `timeout` / `retries` / `delay` are accepted in the
+`scan` schema but currently run with compiled defaults (30s / 3 / 500ms).
 
 ## Output redaction
 

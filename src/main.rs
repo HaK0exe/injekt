@@ -47,6 +47,18 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Scan(_)) => {
             commands::scan::run(cli, cancel).await?;
         }
+        Some(Commands::Auto(args)) => {
+            commands::auto::run(&cli, args, cancel).await?;
+        }
+        Some(Commands::Init(args)) => {
+            commands::scaffold::run_init(args)?;
+        }
+        Some(Commands::Completions(args)) => {
+            commands::scaffold::run_completions(&cli, args)?;
+        }
+        Some(Commands::Man(_)) => {
+            commands::scaffold::run_man();
+        }
         Some(Commands::Recon(_)) => {
             commands::recon::run(cli, cancel).await?;
         }
@@ -63,7 +75,14 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
         None => {
-            if cli.bulk_file.is_some() || cli.effective_target().is_some() {
+            if cli.bulk_file.is_some()
+                || cli.effective_target().is_some()
+                || cli.stdin
+                || cli.openapi_file.is_some()
+                || cli.sitemap_file.is_some()
+                || cli.raw_dir.is_some()
+                || cli.dry_run
+            {
                 commands::scan::run(cli, cancel).await?;
             } else {
                 eprintln!("No target provided. Use --target <URL> or `injekt scan --target <URL>`");

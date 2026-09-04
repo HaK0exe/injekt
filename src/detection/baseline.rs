@@ -3,6 +3,11 @@
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
+/// Statuses counted as WAF blocks for [`Baseline::is_waf_blocked`].
+const WAF_BLOCK_STATUSES: [u16; 2] = [403, 406];
+/// Minimum block count across baseline samples before calling it a WAF.
+const MIN_WAF_BLOCKS: usize = 2;
+
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Baseline {
@@ -81,9 +86,9 @@ impl Baseline {
         let blocked = self
             .status_codes
             .iter()
-            .filter(|c| **c == 403 || **c == 406)
+            .filter(|c| WAF_BLOCK_STATUSES.contains(c))
             .count();
-        blocked >= 2
+        blocked >= MIN_WAF_BLOCKS
     }
 }
 

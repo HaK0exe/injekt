@@ -100,19 +100,24 @@ fn scrub_patterns(input: &str) -> String {
     let bearer_re = BEARER_RE.get_or_init(|| {
         #[allow(clippy::expect_used)]
         {
-            Regex::new(r"(?i)bearer\s+[A-Za-z0-9._\-]+").expect("bearer regex")
+            // Tokens are base64url/base64: must include `+/=` or trailing chunks leak.
+            Regex::new(r"(?i)bearer\s+[A-Za-z0-9._\-~+/=]+").expect("bearer regex")
         }
     });
     let aws_re = AWS_RE.get_or_init(|| {
         #[allow(clippy::expect_used)]
         {
-            Regex::new(r"AKIA[0-9A-Z]{16}").expect("aws regex")
+            // AKIA (long-term) + ASIA (temporary STS) + ABIA/ACCA variants.
+            Regex::new(r"A(KIA|SIA|BIA|CCA)[0-9A-Z]{16}").expect("aws regex")
         }
     });
     let pem_re = PEM_RE.get_or_init(|| {
         #[allow(clippy::expect_used)]
         {
-            Regex::new(r"-----BEGIN [A-Z ]+-----").expect("pem regex")
+            // Redact the full PEM block (header + body + footer), not just the
+            // BEGIN line — otherwise the base64 body stays reconstructible.
+            Regex::new(r"-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+-----")
+                .expect("pem regex")
         }
     });
 
@@ -144,5 +149,32 @@ mod tests {
     #[test]
     fn hash_truncated_len() {
         assert_eq!(Scrubber::hash_truncated("secret").len(), 16);
+    }
+
+    #[test]
+    fn scrubs_bearer_with_base64_padding() {
+        let sc = Scrubber::new(false);
+        let out = sc.scrub("Authorization: Bearer abc");
+        assert!(out.contains("[REDACTED]"), "{out}");
+        // `+/=` are valid base64 token chars — no trailing leakage.
+        let out = sc.scrub("token Bearer abc+def/ghi==");
+        assert!(!out.contains("+def/ghi=="), "{out}");
+        assert!(out.contains("Bearer [REDACTED]"), "{out}");
+    }
+
+    #[test]
+    fn scrubs_temporary_aws_keys() {
+        let sc = Scrubber::new(false);
+        let out = sc.scrub("key ASIAIOSFODNN7EXAMPLE");
+        assert!(!out.contains("ASIAIOSFODNN7EXAMPLE"), "{out}");
+    }
+
+    #[test]
+    fn scrubs_full_pem_block() {
+        let sc = Scrubber::new(false);
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBg==\n-----END PRIVATE KEY-----";
+        let out = sc.scrub(pem);
+        assert!(!out.contains("MIIEvgIBADANBg"), "{out}");
+        assert!(!out.contains("END PRIVATE KEY"), "{out}");
     }
 }

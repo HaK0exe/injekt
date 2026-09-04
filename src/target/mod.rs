@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 pub mod bulk;
+pub mod ingest;
 pub mod markers;
 pub mod parameters;
 pub mod raw_request;

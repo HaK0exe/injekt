@@ -61,7 +61,13 @@ fn truncate(s: &str) -> &str {
     if s.len() <= MAX_LEVENSHTEIN_LEN {
         s
     } else {
-        &s[..MAX_LEVENSHTEIN_LEN]
+        // Byte slicing can split a multi-byte char (emoji/CJK/accents) and
+        // panic. Walk back to the previous char boundary instead.
+        let mut end = MAX_LEVENSHTEIN_LEN;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
     }
 }
 
@@ -137,5 +143,19 @@ mod tests {
     #[allow(clippy::float_cmp)]
     fn jaccard_empty() {
         assert_eq!(jaccard("", ""), 1.0);
+    }
+    #[test]
+    fn truncate_never_splits_char_boundary() {
+        // `🌍` is 4 bytes: pad so the 4096-byte cut lands mid-char.
+        let s = format!("{}{}", "a".repeat(4095), "🌍".repeat(8));
+        assert!(s.len() > MAX_LEVENSHTEIN_LEN);
+        let t = truncate(&s);
+        assert!(t.len() <= MAX_LEVENSHTEIN_LEN);
+        assert!(s.starts_with(t));
+        // Must not panic and must stay valid UTF-8 (len check is enough:
+        // `&s[..end]` would have panicked above on a split boundary).
+        assert!(t.is_char_boundary(t.len()));
+        // Similarity over such bodies must not panic either.
+        let _ = levenshtein_similarity(&s, &s);
     }
 }

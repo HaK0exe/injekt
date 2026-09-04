@@ -16,34 +16,28 @@ use std::{sync::Arc, time::Duration};
 pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<HttpClient> {
     let _ = allow_private;
 
-    let jitter = cli
-        .jitter
-        .as_deref()
-        .map(|s| {
-            let parts: Vec<f64> = s.split(',').filter_map(|x| x.parse().ok()).collect();
-            match parts.as_slice() {
-                [mean, std] => Jitter::new(*mean, *std),
-                _ => Jitter::default(),
-            }
-        })
-        .unwrap_or_default();
+    let jitter = {
+        let s = cli.effective_jitter();
+        let parts: Vec<f64> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        match parts.as_slice() {
+            [mean, std] => Jitter::new(*mean, *std),
+            _ => Jitter::default(),
+        }
+    };
 
-    let rl = cli
-        .rate_limit
-        .map(RateLimiter::new)
-        .map_or_else(|| Arc::new(RateLimiter::new(10.0)), Arc::new);
+    let rl = Arc::new(RateLimiter::new(cli.effective_rate_limit()));
 
     let retry = crate::http::retry::RetryPolicy {
-        max_retries: cli.retries,
-        base_delay: Duration::from_millis(cli.delay),
+        max_retries: cli.effective_retries(),
+        base_delay: Duration::from_millis(cli.effective_delay()),
         max_delay: Duration::from_secs(5),
     };
 
-    let mut builder = HttpClient::builder().timeout(Duration::from_secs(cli.timeout));
+    let mut builder = HttpClient::builder().timeout(Duration::from_secs(cli.effective_timeout()));
     builder = builder.jitter(jitter).rate_limiter(rl).retry_policy(retry);
 
-    if let Some(proxy) = &cli.proxy {
-        match crate::http::proxy::ProxyConfig::parse(proxy) {
+    if let Some(proxy) = cli.effective_proxy() {
+        match crate::http::proxy::ProxyConfig::parse(&proxy) {
             Ok(p) => builder = builder.proxy(p),
             Err(e) => {
                 return Err(InjektError::Http(format!("invalid proxy '{proxy}': {e}")));

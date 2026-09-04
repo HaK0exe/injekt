@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/HaK0exe/injekt/actions/workflows/ci.yml/badge.svg)](https://github.com/HaK0exe/injekt/actions/workflows/ci.yml) [![Rust 1.88](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org) [![Edition 2024](https://img.shields.io/badge/edition-2024-blue)](https://doc.rust-lang.org/edition-guide/) [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE) [![unsafe_code deny](https://img.shields.io/badge/unsafe-deny-success)](https://doc.rust-lang.org/rustc/lints/listing/allowed-by-default.html)
 
-[Français](README.fr.md) | [OPSEC](docs/OPSEC.md) | [Research Notes](docs/RESEARCH_NOTES.md)
+[Français](README.fr.md) | [OPSEC](docs/OPSEC.md) | [Research Notes](docs/RESEARCH_NOTES.md) | [Full Documentation](DOCUMENTATION.md)
 
 ---
 
@@ -99,6 +99,16 @@ cargo deny check   # advisories + licenses (install cargo-deny)
 # Basic scan (boolean/time/error, 5 threads)
 injekt --target "https://example.com/search?q=1" --threads 5
 
+# Presets: quick / balanced / stealth / aggressive (explicit flags always win)
+injekt --target "https://example.com/?id=1" --profile quick
+injekt --target "https://example.com/?id=1" --profile stealth \
+  --proxy socks5h://127.0.0.1:9050
+injekt --target "https://example.com/?id=1" --profile aggressive --level 3
+
+# Config file + env (precedence: CLI > env > file > profile > defaults)
+injekt --config ./injekt.toml --target "https://example.com/?id=1"
+INJEKT_PROFILE=stealth INJEKT_THREADS=2 injekt --target "https://example.com/?id=1"
+
 # Scan subcommand (equivalent)
 injekt scan --target "https://example.com/?id=1"
 
@@ -139,20 +149,26 @@ injekt --import ./session.enc --target "https://example.com/?id=1"  # resume
 injekt replay --file ./session.enc
 injekt info
 
+# MCP Server (for AI assistants)
+injekt mcp  # See [MCP Documentation](docs/MCP.md) for client setup
+
 # Output
 injekt --target "https://example.com/?id=1" --output report.json
 cat report.json | jq .
 ```
 
-**Raw request (Burp):**
+**Raw request (Burp/ZAP):**
 ```bash
-# Save Burp request to req.txt then:
-# (parser at src/target/raw_request.rs supports multipart, Content-Type auto)
+# Save the Burp/ZAP request (headers + body) to req.txt, then:
+injekt --raw-file req.txt --threads 5
+# --raw-file takes priority over --target; parser supports multipart + auto Content-Type.
 ```
 
 ---
 
 ## CLI Reference
+
+See [Full Documentation](DOCUMENTATION.md#cli-reference) for complete option tables and examples.
 
 ```
 injekt [OPTIONS] [COMMAND]
@@ -162,54 +178,110 @@ Commands:
   recon   Crawl targets, discover parameters, scan candidates, import candidate JSON
   replay  Replay encrypted session
   info    Show version / techniques / DBMS
+  mcp     MCP server over stdio (Claude Code, Codex, OpenCode, Cursor, VS Code)
 
 Options:
-  -u, --target <URL>              Target URL
+  -u, --target <URL>              Target URL (--raw-file takes priority if both given)
+  -m, --bulk-file <PATH>          Bulk scan: one target/line, `#` comments skipped, max 1000
+                                  (conflicts with --target/--raw-file/--export-encrypted)
+      --profile <NAME>            Preset: quick|balanced|stealth|aggressive (explicit flags win)
+      --config <PATH>             TOML config file (default: ./injekt.toml, ~/.config/injekt/config.toml)
+      --raw-file <PATH>           Burp/ZAP raw request file (alternative to --target)
       --method <METHOD>           HTTP method (default GET)
       --headers <H1,H2>           Extra headers (comma-separated)
       --cookies <STR>             Cookies (SecretString, redacted in logs)
+      --data <STR>                POST body to test (alternative to --raw-file)
+  -p, --params <LIST>             Test only these params (e.g. -p id, -p body:user,cookie:PHPSESSID)
       --proxy <URL>               http(s):// or socks5h:// (socks5:// rejected - DNS leak)
       --threads <N>               Concurrency [default: 5]
+      --timeout <SEC>             Request timeout [default: 30]
+      --retries <N>               Max retries [default: 3]
+      --delay <MS>                Base retry delay, exponential backoff [default: 500]
+      --rate-limit <RPS>          Token-bucket req/s [default: 10]
+      --jitter <MEAN,STD>         Milliseconds, e.g. "750,250" [default: 750,250 — on even without the flag]
       --techniques <LIST>         boolean,time,error,union,stacked,oob,json,all [default: all]
+      --fetch-using <MODE>        Force oracle: direct, boolean or time (narrows techniques)
       --tamper <LIST>             WAF tampers: space2comment,space2plus,space2tab,space2newline,space2randomblank,randomcase,versionedcomment,betweencomment,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8 [default: none, auto space2comment on WAF 403/406]
       --hpp                       HTTP Parameter Pollution: duplicate ?id=1&id=PAYLOAD (Query/Body)
       --chunked                   Chunked transfer: streamed Transfer-Encoding: chunked body (Body only)
+      --prefix/--suffix <STR>     Payload prefix/suffix applied after tampers
+      --safe-chars <STR>          Extra chars exempted from percent-encoding
+      --skip-urlencode            Send payloads without URL-encoding (use with care)
+      --string/--not-string <STR> Response must (not) contain substring, else veto finding
+      --code <N>                  Response status must equal N, else veto finding
+      --text-only                 Strip HTML tags/entities before matching
+      --level <1-5>               Aggressiveness [default: 1]
+      --confirm                   Strict second-pass confirmation (~2x requests, OOB skipped)
+      --ignore-code <LIST>        Status codes treated as negative probes (e.g. 429,503)
       --oob-domain <DOMAIN>       Collaborator base domain (enables OOB probes, OPT-IN)
       --oob-poll-url <URL>        Poll URL with {token} placeholder (auto-confirm callbacks)
       --oob-wait-secs <N>         Wait before polling collaborator [default: 5]
-      --dbms <KIND>               mysql|postgres|mssql|oracle
+      --dbms <KIND>               mysql|postgres|mssql|oracle (default: auto-fingerprint)
       --extract                   Enable data extraction (opt-in, SecretString)
-      --output <PATH>             JSON report path
-      --rate-limit <RPS>          Token-bucket req/s
-      --jitter <MEAN,STD>         e.g. "750,250" ms
+      --dbs/--tables/--columns/--dump  Enumeration (needs --extract or recon --auto-enumerate)
+  -b, --banner, --current-user, --current-db, --hostname  Identity enumeration
+      --db/--table/--column <NAME>  Enumeration scope; --start/--stop/--count for dumps
       --marker <STR>              Injection marker (*, §, {{}})
+      --output <PATH>             JSON report path (0o600 on Unix)
       --export-encrypted <PATH>   Encrypted snapshot (XChaCha20-Poly1305/Argon2id)
       --import <PATH>             Import encrypted snapshot
       --no-redact                 Disable scrubbing (local only!)
-      --allow-private             Allow loopback/private IPs (anti-SSRF bypass)
+      --allow-private             Allow loopback/private IPs (anti-SSRF bypass, lab only)
+      --no-banner                 Suppress startup banner (stderr; stdout stays clean)
   -v, --verbose                   Debug logs (tracing)
   -h, --help
   -V, --version
 ```
 
-Recon subcommands:
+Recon subcommands (note: recon takes `--target`, not `-u`):
 
 ```bash
-injekt recon crawl --target <HOST|URL> [--depth N] [--max-pages N] [--include-subdomains] [--ignore-robots]
+injekt recon crawl --target <HOST|URL> [--depth N] [--max-pages N] [--max-per-template N] [--include-subdomains] [--ignore-robots]
 injekt recon scan --target <HOST|URL> [--depth N] [--max-pages N] [--auto-enumerate]
 injekt recon import --file discovered.json [--test] [--enumerate]
 ```
+
+### Presets & config (non-breaking)
+
+| Preset | Threads | Rate | Jitter (ms) | Level | Techniques |
+|---|---|---|---|---|---|
+| `quick` | 10 | 20/s | 200,100 | 1 | boolean,error |
+| `balanced` | 5 | 10/s | 750,250 | 1 | all (= historical defaults) |
+| `stealth` | 2 | 3/s | 1200,400 | 1 | boolean,error |
+| `aggressive` | 8 | 10/s | 500,200 | 3 | all |
+
+Precedence: explicit CLI flag > `INJEKT_*` env > config file > `--profile` > built-in defaults.
+No preset ever sets a proxy or enables extraction — those stay explicit opt-in.
+
+```toml
+# injekt.toml (or --config <PATH>, or ~/.config/injekt/config.toml)
+profile = "stealth"
+threads = 2
+rate_limit = 3.0
+jitter = "1200,400"
+timeout = 30
+retries = 3
+delay = 800
+level = 1
+techniques = ["boolean", "error"]
+proxy = "socks5h://127.0.0.1:9050"
+```
+
+Env: `INJEKT_PROFILE`, `INJEKT_CONFIG`, `INJEKT_THREADS`, `INJEKT_TIMEOUT`,
+`INJEKT_RETRIES`, `INJEKT_DELAY`, `INJEKT_RATE_LIMIT`, `INJEKT_JITTER`,
+`INJEKT_TECHNIQUES`, `INJEKT_LEVEL`, `INJEKT_PROXY`, `INJEKT_DBMS`, `INJEKT_TAMPER`.
 
 ---
 
 ## OPSEC
 
-See [`docs/OPSEC.md`](docs/OPSEC.md) — summary:
+See [`docs/OPSEC.md`](docs/OPSEC.md) and [Full Documentation](DOCUMENTATION.md#opsec-features) — summary:
 
 - **No disk writes** unless `--export-encrypted`; `SessionState` is `Arc<RwLock<…>>` and `ZeroizeOnDrop`.
 - **Scrubber** (`src/session/scrubber.rs`): `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, JWT `eyJ…`, `AKIA[0-9A-Z]{16}`, PEM → `[REDACTED]` or 8-hex hash.
 - **Identity** (`src/http/identity.rs`): realistic UA pool (Chrome 126 / Firefox 128 / Safari 17.5) with matching `Sec-CH-UA`.
-- **Jitter** (`src/http/jitter.rs`): `rand_distr::Normal`, never regular cadence.
+- **Jitter** (`src/http/jitter.rs`): `rand_distr::Normal` in **milliseconds**, never regular cadence (default 750±250ms, floor 200ms — active even without `--jitter`).
+- **Rate limit**: token bucket, default **10 req/s** unless `--rate-limit` is set.
 - **Proxy** (`src/http/proxy.rs`): `socks5h://` enforces remote DNS; `socks5://` without `h` is rejected.
 - **TLS**: `rustls` (stable JA3 fingerprinted — documented limitation; use external proxy for JA3 randomization).
 - **NEVER** `--no-redact` on shared reports.
@@ -218,10 +290,12 @@ See [`docs/OPSEC.md`](docs/OPSEC.md) — summary:
 
 ## Architecture
 
+See [Full Documentation](DOCUMENTATION.md#architecture) for detailed module structure and design patterns.
+
 ```
 src/
 ├── main.rs / lib.rs
-├── cli/{args,commands/{scan,recon,replay,info},output/{console,json,format}}
+├── cli/{args,profile,file_config,commands/{scan,recon,replay,info},output/{console,json,format}}
 ├── target/{url,raw_request,parameters,markers}
 ├── http/{client,identity,proxy,cookies,redirects,retry,jitter,rate_limit}
 ├── detection/{baseline,response_diff,confirmation,scanner/{engine,scheduler}}
@@ -259,6 +333,8 @@ pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
 ```
+
+See [Full Documentation](DOCUMENTATION.md#development-workflow) for detailed workflow.
 
 ---
 

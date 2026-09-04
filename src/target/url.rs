@@ -70,19 +70,29 @@ impl TargetUrl {
 }
 
 fn is_private_host(url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    // localhost / loopback literals
-    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" {
-        return true;
+    use url::Host;
+    match url.host() {
+        None => false,
+        // `Host::Ipv4/Ipv6` already strips brackets — the old `host_str()`
+        // string comparison missed `[::1]` (brackets included) and every
+        // IPv6 literal. Matching on the parsed host fixes that class.
+        Some(Host::Ipv4(v4)) => is_private_ip(std::net::IpAddr::V4(v4)),
+        Some(Host::Ipv6(v6)) => is_private_ip(std::net::IpAddr::V6(v6)),
+        Some(Host::Domain(domain)) => {
+            // Normalize case + trailing dot (`LOCALHOST.` resolves to loopback).
+            let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+            if normalized == "localhost" {
+                return true;
+            }
+            // Defense in depth: a domain that parses as IP (non-canonical
+            // decimal/octal/hex forms like `2130706433` stay `Domain` here
+            // and still need DNS-time enforcement — see issues).
+            if let Ok(ip) = normalized.parse::<std::net::IpAddr>() {
+                return is_private_ip(ip);
+            }
+            false
+        }
     }
-    // Check IP literal
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return is_private_ip(ip);
-    }
-    // Hostname "private" heuristics: if it ends with .local etc, not blocked here.
-    false
 }
 
 fn is_private_ip(ip: std::net::IpAddr) -> bool {
@@ -91,13 +101,33 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
             v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                // CGNAT 100.64.0.0/10, IETF 192.0.0.0/24, TEST-NET etc. are not
+                // covered by `is_private()` on all toolchains — check explicitly.
                 || v4.octets()[0] == 10
                 || (v4.octets()[0] == 192 && v4.octets()[1] == 168)
                 || (v4.octets()[0] == 172 && (16..=31).contains(&v4.octets()[1]))
                 || v4.octets()[0] == 169 && v4.octets()[1] == 254
+                || v4.octets()[0] == 0
+                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
+                || (v4.octets()[0] == 192 && v4.octets()[1] == 0 && v4.octets()[2] == 0)
         }
-        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                // IPv4-mapped loopback/link-local (`::ffff:127.0.0.1`) bypassed the
+                // old check because `is_loopback()` is false for mapped addrs.
+                || v6.to_ipv4_mapped().is_some_and(is_private_ipv4_mapped)
+        }
     }
+}
+
+/// Private check for the v4 behind an IPv6 `::ffff:a.b.c.d` mapping.
+fn is_private_ipv4_mapped(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
 }
 
 impl core::fmt::Display for TargetUrl {
@@ -132,5 +162,20 @@ mod tests {
     #[test]
     fn rejects_scheme() {
         assert!(TargetUrl::parse("ftp://example.com/", true).is_err());
+    }
+
+    #[test]
+    fn rejects_loopback_variants_and_mapped() {
+        // Trailing dot + case variants resolve to loopback.
+        assert!(TargetUrl::parse("http://localhost./", false).is_err());
+        assert!(TargetUrl::parse("http://LOCALHOST/", false).is_err());
+        // IPv4-mapped IPv6 loopback/link-local bypassed the old check.
+        assert!(TargetUrl::parse("http://[::ffff:127.0.0.1]/", false).is_err());
+        assert!(TargetUrl::parse("http://[::ffff:169.254.169.254]/", false).is_err());
+        // CGNAT + 0/8 + ULA + link-local.
+        assert!(TargetUrl::parse("http://100.64.0.1/", false).is_err());
+        assert!(TargetUrl::parse("http://0.1.2.3/", false).is_err());
+        assert!(TargetUrl::parse("http://[fc00::1]/", false).is_err());
+        assert!(TargetUrl::parse("http://[fe80::1]/", false).is_err());
     }
 }
