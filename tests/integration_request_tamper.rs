@@ -16,6 +16,7 @@ fn test_client() -> HttpClient {
         .timeout(Duration::from_secs(5))
         .jitter(Jitter::new(1.0, 0.5).with_min(0))
         .rate_limiter(std::sync::Arc::new(RateLimiter::disabled()))
+        .allow_private(true)
         .build()
         .expect("client build")
 }

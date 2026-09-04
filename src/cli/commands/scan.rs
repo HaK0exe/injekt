@@ -3,14 +3,13 @@
 use crate::{
     cli::args::Cli,
     cli::client_builder::build_client,
+    cli::output::file::write_output_file_async,
     engine::orchestrator::{Engine, EngineConfig},
     reporting::{console, json::JsonReport},
     session::scrubber::Scrubber,
 };
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::fs;
-use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
@@ -111,11 +110,13 @@ pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult
     let handle = engine.state_handle();
     let s = handle.read().await;
     let findings = s.findings().to_vec();
+    let extracted = s.extracted_exposed();
     let count = s.request_count();
     drop(s);
 
     let scrubber = Scrubber::new(cfg.no_redact);
-    let report = JsonReport::new(target.clone(), findings, vec![], count).scrubbed(&scrubber);
+    let report =
+        JsonReport::new(target.clone(), findings, vec![], extracted, count).scrubbed(&scrubber);
 
     Ok(ScanResult {
         report,
@@ -172,15 +173,9 @@ async fn run_bulk_cli(cli: &Cli, cancel: CancellationToken) -> Result<()> {
     report.print_summary(&scrubber);
     if let Some(out) = &cli.output {
         let json = serde_json::to_string_pretty(&report.to_json(&scrubber))?;
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let mut file = opts.open(out).await?;
-        file.write_all(json.as_bytes()).await?;
-        file.write_all(b"\n").await?;
-        file.sync_all().await?;
-        info!(path=%scrubber.scrub(out), "bulk json report written (0o600)");
+        let scrubbed_path = scrubber.scrub(out);
+        write_output_file_async(out, &json, false, &scrubbed_path).await?;
+        info!(path=%scrubbed_path, "bulk json report written (0o600)");
     }
     Ok(())
 }
@@ -249,18 +244,13 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> Result<()> {
     );
 
     console::print_findings(&result.report.findings, &scrubber);
+    console::print_extracted(&result.report.extracted);
 
     if let Some(out) = &cli.output {
         let json = result.report.to_json(&scrubber);
-        // Write with 0o600 perms on Unix (sensitive report)
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let mut file = opts.open(out).await?;
-        file.write_all(json.as_bytes()).await?;
-        file.sync_all().await?;
-        info!(path=%scrubber.scrub(out), "json report written (0o600)");
+        let scrubbed_path = scrubber.scrub(out);
+        write_output_file_async(out, &json, false, &scrubbed_path).await?;
+        info!(path=%scrubbed_path, "json report written (0o600)");
     }
 
     if let Some(path) = &cli.export_encrypted {

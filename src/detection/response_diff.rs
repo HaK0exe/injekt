@@ -107,11 +107,24 @@ pub fn diff_against_baseline(
     candidate_ms: f64,
     sigma: f64,
 ) -> DiffResult {
+    let time_delta = candidate_ms - baseline_ms;
+    let length_delta = candidate_body.len() as i64 - baseline_body.len() as i64;
+    // An empty candidate must never score as a finding: a transport/body
+    // error surfacing as `""` yields similarity ~0 and would otherwise map
+    // to confidence 0.75 (false positive). Callers must skip scoring on
+    // `Err`/status 0; this guard is the last line of defence.
+    if candidate_body.is_empty() {
+        return DiffResult {
+            similarity: 0.0,
+            time_delta_ms: time_delta,
+            length_delta,
+            confidence: 0.0,
+            technique: None,
+        };
+    }
     let similarity = adaptive_similarity(baseline_body, candidate_body);
     let j = jaccard(baseline_body, candidate_body);
     let combined_sim = (similarity * 0.7 + j * 0.3).clamp(0.0, 1.0);
-    let time_delta = candidate_ms - baseline_ms;
-    let length_delta = candidate_body.len() as i64 - baseline_body.len() as i64;
     let time_significant = time_delta > sigma * 2.0;
     let confidence = if time_significant && combined_sim < 0.9 {
         0.85
@@ -143,6 +156,14 @@ mod tests {
     #[allow(clippy::float_cmp)]
     fn jaccard_empty() {
         assert_eq!(jaccard("", ""), 1.0);
+    }
+    #[test]
+    fn empty_candidate_never_significant() {
+        // A transport/body error surfacing as `""` must not map to the
+        // `combined_sim < 0.5 => 0.75` false positive.
+        let diff = diff_against_baseline("hello world baseline body", "", 100.0, 110.0, 100.0);
+        assert!(!diff.is_significant());
+        assert!(diff.confidence < 0.4);
     }
     #[test]
     fn truncate_never_splits_char_boundary() {

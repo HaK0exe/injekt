@@ -11,7 +11,7 @@ fmt-check:
     cargo fmt --all -- --check
 
 clippy:
-    cargo clippy --all-targets
+    cargo clippy --all-targets -- -D warnings
 
 check: fmt-check clippy
     cargo check --all-targets
@@ -21,9 +21,6 @@ test:
 
 doc-test:
     cargo test --doc
-
-snap:
-    cargo insta review
 
 completions SHELL="bash":
     cargo run -q -- --no-banner completions {{SHELL}}

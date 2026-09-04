@@ -49,6 +49,20 @@ impl RetryPolicy {
         Duration::from_millis(ms)
     }
 
+    /// Delay honoring a server `Retry-After` header (seconds, or an HTTP
+    /// date) when present and sane; falls back to [`Self::delay_for`]
+    /// otherwise. Always capped at `max_delay` so a hostile/misconfigured
+    /// server cannot stall a scan indefinitely.
+    #[must_use]
+    pub fn delay_for_retry_after(&self, attempt: usize, retry_after: Option<&str>) -> Duration {
+        if let Some(raw) = retry_after
+            && let Ok(secs) = raw.trim().parse::<u64>()
+        {
+            return Duration::from_secs(secs).min(self.max_delay);
+        }
+        self.delay_for(attempt)
+    }
+
     #[must_use]
     pub fn should_retry(&self, attempt: usize, status: Option<u16>) -> bool {
         if attempt >= self.max_retries {

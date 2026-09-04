@@ -346,14 +346,14 @@ pub struct ScanArgs {
     pub target: Option<String>,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[non_exhaustive]
 pub struct ReplayArgs {
     #[arg(long)]
     pub file: String,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[non_exhaustive]
 pub struct InfoArgs {}
 
@@ -406,7 +406,7 @@ pub struct CompletionsArgs {
 #[non_exhaustive]
 pub struct ManArgs {}
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[non_exhaustive]
 pub struct McpArgs {}
 
@@ -688,6 +688,31 @@ impl Cli {
             Some(Commands::Scan(a)) => a.target.clone(),
             _ => None,
         })
+    }
+
+    /// Same resolution as [`Self::effective_target`], but propagates raw-file
+    /// read/parse failures as errors instead of silently returning `None`
+    /// (prevents a malformed `--raw` file from being mistaken for "no
+    /// target").
+    ///
+    /// # Errors
+    /// Returns an error if `--raw` is set but the file cannot be read,
+    /// fails to parse as a raw HTTP request, or lacks a usable Host header.
+    pub fn try_effective_target(&self) -> anyhow::Result<Option<String>> {
+        if let Some(raw) = &self.raw_file {
+            let content = std::fs::read_to_string(raw)
+                .map_err(|e| anyhow::anyhow!("failed to read raw file '{raw}': {e}"))?;
+            let req = crate::target::raw_request::RawRequest::parse(&content)
+                .map_err(|e| anyhow::anyhow!("failed to parse raw file '{raw}': {e}"))?;
+            if let Some(url) = req.to_url("https").or_else(|| req.to_url("http")) {
+                return Ok(Some(url));
+            }
+            anyhow::bail!("raw request in '{raw}' missing Host header or invalid path");
+        }
+        Ok(self.target.clone().or_else(|| match &self.command {
+            Some(Commands::Scan(a)) => a.target.clone(),
+            _ => None,
+        }))
     }
 
     #[must_use]

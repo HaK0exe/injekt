@@ -62,6 +62,23 @@ impl Identity {
         }
         h
     }
+
+    /// Same headers as [`Self::headers`], pre-built as a `HeaderMap` so
+    /// callers can `extend` a request's default headers without a per-build
+    /// String-to-HeaderName/Value re-parse.
+    #[must_use]
+    pub fn header_map(&self) -> reqwest::header::HeaderMap {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (k, v) in self.headers() {
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                reqwest::header::HeaderValue::from_str(&v),
+            ) {
+                map.insert(name, value);
+            }
+        }
+        map
+    }
 }
 
 impl Default for Identity {

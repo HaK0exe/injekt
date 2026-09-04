@@ -16,6 +16,8 @@ pub enum UrlError {
     PrivateIp,
     #[error("unsupported scheme: {0}")]
     Scheme(String),
+    #[error("DNS resolution failed for host '{host}': {reason}")]
+    Dns { host: String, reason: String },
 }
 
 impl TargetUrl {
@@ -66,6 +68,83 @@ impl TargetUrl {
     #[must_use]
     pub fn normalized(&self) -> String {
         self.0.to_string()
+    }
+
+    /// DNS-time SSRF check (anti DNS-rebinding): resolves `host` and rejects
+    /// if any resolved IP is private/loopback/link-local/etc.
+    ///
+    /// IP literals are checked directly without DNS. Bare hostnames are
+    /// resolved via [`tokio::net::lookup_host`] (port 80; only the IPs
+    /// matter). `allow_private=true` skips the check (lab only).
+    ///
+    /// # Errors
+    /// Returns [`UrlError::PrivateIp`] if the host is `localhost` or resolves
+    /// to a private IP, [`UrlError::Dns`] if resolution yields nothing,
+    /// [`UrlError::Invalid`] if the host is empty.
+    pub async fn resolve_and_check(host: &str, allow_private: bool) -> Result<(), UrlError> {
+        if allow_private {
+            return Ok(());
+        }
+        let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+        if normalized.is_empty() {
+            return Err(UrlError::Invalid("empty host".to_owned()));
+        }
+        if normalized == "localhost" {
+            return Err(UrlError::PrivateIp);
+        }
+        // Fast path: IP literal (covers `127.0.0.1`, `::1` without brackets
+        // since `host_str()` strips them, `::ffff:127.0.0.1`, etc.).
+        if let Ok(ip) = normalized.parse::<std::net::IpAddr>() {
+            if is_private_ip(ip) {
+                return Err(UrlError::PrivateIp);
+            }
+            return Ok(());
+        }
+        // DNS-time: a lexically public domain may still resolve to a private
+        // IP (DNS rebinding / libc-parsed forms like `0x7f.0.0.1` that
+        // `getaddrinfo` maps to loopback). Reject if ANY record is private.
+        let addrs = tokio::net::lookup_host((normalized.as_str(), 80))
+            .await
+            .map_err(|e| UrlError::Dns {
+                host: host.to_owned(),
+                reason: e.to_string(),
+            })?;
+        let mut saw_any = false;
+        for addr in addrs {
+            saw_any = true;
+            if is_private_ip(addr.ip()) {
+                return Err(UrlError::PrivateIp);
+            }
+        }
+        if saw_any {
+            Ok(())
+        } else {
+            Err(UrlError::Dns {
+                host: host.to_owned(),
+                reason: "no addresses returned".to_owned(),
+            })
+        }
+    }
+
+    /// Full per-hop redirect validation (OWASP: re-validate every hop):
+    /// lexical parse + scheme check + lexical private check, then DNS-time
+    /// [`Self::resolve_and_check`].
+    ///
+    /// # Errors
+    /// Returns an error if `url_str` fails to parse, uses a non-http(s)
+    /// scheme, is lexically private, or DNS-resolves to a private IP while
+    /// `allow_private` is `false`.
+    pub async fn validate_redirect_location(
+        url_str: &str,
+        allow_private: bool,
+    ) -> Result<Self, UrlError> {
+        let parsed = Self::parse(url_str, allow_private)?;
+        if !allow_private && let Some(host) = parsed.inner().host_str() {
+            // `host_str()` strips IPv6 brackets; `resolve_and_check`
+            // handles both IP literals and domain names.
+            Self::resolve_and_check(host, false).await?;
+        }
+        Ok(parsed)
     }
 }
 
@@ -126,8 +205,10 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
 }
 
 /// Private check for the v4 behind an IPv6 `::ffff:a.b.c.d` mapping.
+/// Unified with [`is_private_ip`] so CGNAT (`100.64/10`), `192.0.0.0/24`,
+/// `0/8` and the other ranges covered there are not missed here.
 fn is_private_ipv4_mapped(v4: std::net::Ipv4Addr) -> bool {
-    v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+    is_private_ip(std::net::IpAddr::V4(v4))
 }
 
 impl core::fmt::Display for TargetUrl {
@@ -177,5 +258,52 @@ mod tests {
         assert!(TargetUrl::parse("http://0.1.2.3/", false).is_err());
         assert!(TargetUrl::parse("http://[fc00::1]/", false).is_err());
         assert!(TargetUrl::parse("http://[fe80::1]/", false).is_err());
+        // Unified mapped check: CGNAT / 0/8 / IETF behind `::ffff:` block too.
+        assert!(TargetUrl::parse("http://[::ffff:100.64.0.1]/", false).is_err());
+        assert!(TargetUrl::parse("http://[::ffff:0.1.2.3]/", false).is_err());
+        assert!(TargetUrl::parse("http://[::ffff:192.0.0.1]/", false).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_and_check_rejects_localhost_and_loopback() {
+        assert!(
+            TargetUrl::resolve_and_check("localhost", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            TargetUrl::resolve_and_check("127.0.0.1", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            TargetUrl::resolve_and_check("169.254.169.254", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            TargetUrl::resolve_and_check("127.0.0.1", true)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_redirect_location_blocks_private() {
+        assert!(
+            TargetUrl::validate_redirect_location("http://169.254.169.254/", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            TargetUrl::validate_redirect_location("http://127.0.0.1/", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            TargetUrl::validate_redirect_location("http://127.0.0.1/", true)
+                .await
+                .is_ok()
+        );
     }
 }

@@ -23,13 +23,16 @@ needless_return = "warn"
 manual_div_ceil = "warn"
 
 [dependencies]
-# Async
-tokio = { version = "1", features = ["full"] }
+# Async (minimal set: `full` pulled parking_lot + unused net/process/signal drivers)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "fs", "io-util", "net", "process"] }
+# `net`: DNS `lookup_host` anti-SSRF (`target/url.rs`); `process`: `tests/mcp_stdio.rs` only
+# (kept here by unification so test builds see the same set).
 tokio-util = "0.7"
 futures = "0.3"
 
-# HTTP
-reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "brotli", "socks", "cookies", "rustls-tls", "stream"] }
+# HTTP (`json` removed: no `Response::json`/`.json()` use — serde_json only;
+# `cookies` kept: `ClientBuilder::cookie_store` is gated behind it)
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "brotli", "socks", "cookies", "rustls-tls", "stream"] }
 url = { version = "2", features = ["serde"] }
 http = "1"
 bytes = "1"
@@ -78,6 +81,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 wiremock = "0.6"
-insta = "1"
 proptest = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "fs", "io-util", "net", "process"] }

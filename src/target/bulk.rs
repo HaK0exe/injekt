@@ -9,23 +9,53 @@ use crate::target::url::TargetUrl;
 /// Maximum number of targets accepted from a bulk file.
 pub const MAX_BULK_TARGETS: usize = 1000;
 
+/// Maximum bulk file size (10 MiB pre-check via `metadata().len()`).
+pub const MAX_BULK_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Load and validate bulk targets from a text file (one URL per line).
 ///
-/// Blank lines and comment lines (`#`, `//`) are skipped, duplicates are
-/// removed, and lines that fail [`TargetUrl::parse`] are skipped with a
-/// warning instead of failing the whole file.
+/// Streamed via `BufReader` lines (no unbounded `read_to_string`); file size
+/// is pre-checked at 10 MiB. Blank lines and comment lines (`#`, `//`) are
+/// skipped, duplicates are removed, and lines that fail [`TargetUrl::parse`]
+/// are skipped with a warning instead of failing the whole file.
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be read, if more than
-/// [`MAX_BULK_TARGETS`] valid targets are found, or if no valid target
+/// Returns an error if the file cannot be read, exceeds the size cap, if more
+/// than [`MAX_BULK_TARGETS`] valid targets are found, or if no valid target
 /// remains after filtering.
 pub fn load_targets(path: &str, allow_private: bool) -> anyhow::Result<Vec<String>> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("cannot read bulk file '{path}'"))?;
-    let targets = collect_valid_targets(&content, allow_private);
-    if targets.len() > MAX_BULK_TARGETS {
-        anyhow::bail!("bulk file exceeds {MAX_BULK_TARGETS} targets: '{path}'");
+    use std::io::BufRead as _;
+    let meta =
+        std::fs::metadata(path).with_context(|| format!("cannot stat bulk file '{path}'"))?;
+    if meta.len() > MAX_BULK_FILE_BYTES {
+        anyhow::bail!(
+            "bulk file '{path}' too large ({} bytes > {MAX_BULK_FILE_BYTES} bytes)",
+            meta.len()
+        );
+    }
+    let file =
+        std::fs::File::open(path).with_context(|| format!("cannot read bulk file '{path}'"))?;
+    let reader = std::io::BufReader::new(file);
+    let mut seen = HashSet::<String>::new();
+    let mut targets = Vec::new();
+    for line_res in reader.lines() {
+        let line = line_res.with_context(|| format!("cannot read bulk file '{path}'"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        if !seen.insert(trimmed.to_owned()) {
+            continue;
+        }
+        if let Err(e) = TargetUrl::parse(trimmed, allow_private) {
+            tracing::warn!(line=%trimmed, error=%e, "skipping invalid bulk target");
+            continue;
+        }
+        targets.push(trimmed.to_owned());
+        if targets.len() > MAX_BULK_TARGETS {
+            anyhow::bail!("bulk file exceeds {MAX_BULK_TARGETS} targets: '{path}'");
+        }
     }
     if targets.is_empty() {
         anyhow::bail!("no valid targets in bulk file '{path}'");
@@ -57,8 +87,8 @@ fn collect_valid_targets(content: &str, allow_private: bool) -> Vec<String> {
         if !seen.insert(trimmed.to_owned()) {
             continue;
         }
-        if TargetUrl::parse(trimmed, allow_private).is_err() {
-            tracing::warn!(line=%trimmed, "skipping invalid bulk target");
+        if let Err(e) = TargetUrl::parse(trimmed, allow_private) {
+            tracing::warn!(line=%trimmed, error=%e, "skipping invalid bulk target");
             continue;
         }
         targets.push(trimmed.to_owned());

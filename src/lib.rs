@@ -34,6 +34,8 @@ pub mod error {
         Extraction(String),
         #[error("session error: {0}")]
         Session(String),
+        #[error("cancelled")]
+        Cancelled,
         #[error("io error: {0}")]
         Io(String),
         #[error(transparent)]
