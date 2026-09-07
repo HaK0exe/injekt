@@ -280,7 +280,7 @@ Outputs:
 ```
 modern SQLi detection — zero persistence, OPSEC by design
   Techniques      boolean, time, error, union, stacked, oob, json
-  Tampers         space2comment, randomcase, versionedcomment, charencode, doubleurlencode, hexencode, unicodeencode, overlongutf8, space2tab, space2newline, space2randomblank, betweencomment, space2dash, randomcomments, equaltolike, base64encode
+  Tampers         space2comment, space2plus, space2tab, space2newline, space2randomblank, randomcase, versionedcomment, betweencomment, charencode, doubleurlencode, hexencode, unicodeencode, overlongutf8, space2dash, space2mssqlblank, randomcomments, equaltolike, versionedmorekeywords, base64encode
   OOB             opt-in via --oob-domain <collaborator> [--oob-poll-url <url> with {token}]
   Request tampers --hpp (duplicate ?id=1&id=PAYLOAD), --chunked (Transfer-Encoding: chunked body)
   DBMS            mysql, postgres, mssql, oracle
@@ -485,7 +485,7 @@ src/
 │   ├── matcher.rs                   # MatcherConfig (--string/--not-string/--code/--text-only)
 │   └── scanner/                     # engine + scheduler
 ├── techniques/
-│   ├── tamper.rs                    # 17 WAF evasion tampers
+│   ├── tamper.rs                    # 19 WAF evasion tampers
 │   ├── request_tamper.rs            # HPP + chunked
 │   ├── payload_opts.rs              # PayloadOpts (prefix/suffix/encoding/fetch-using)
 │   ├── boolean/ time/ error/        # Classic detectors + payloads
