@@ -63,32 +63,19 @@ impl Identity {
         h
     }
 
-    /// Pre-built [`http::HeaderMap`] for [`HttpClient`] default headers.
-    /// Avoids per-build `String` allocs + `HeaderName`/`HeaderValue` parsing
-    /// of [`headers`](Self::headers). Invalid values are skipped (pool
-    /// strings are statically valid).
+    /// Same headers as [`Self::headers`], pre-built as a `HeaderMap` so
+    /// callers can `extend` a request's default headers without a per-build
+    /// String-to-HeaderName/Value re-parse.
     #[must_use]
-    pub fn header_map(&self) -> http::HeaderMap {
-        use http::header::{ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
-        let mut map = http::HeaderMap::with_capacity(6);
-        if let Ok(v) = http::HeaderValue::from_str(&self.user_agent) {
-            map.insert(USER_AGENT, v);
-        }
-        if let Ok(v) = http::HeaderValue::from_str(&self.accept) {
-            map.insert(ACCEPT, v);
-        }
-        if let Ok(v) = http::HeaderValue::from_str(&self.accept_language) {
-            map.insert(ACCEPT_LANGUAGE, v);
-        }
-        if self.sec_ch_ua.contains("Chromium") || self.sec_ch_ua.contains("Chrome") {
-            if let Ok(v) = http::HeaderValue::from_str(&self.sec_ch_ua) {
-                map.insert("sec-ch-ua", v);
+    pub fn header_map(&self) -> reqwest::header::HeaderMap {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (k, v) in self.headers() {
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                reqwest::header::HeaderValue::from_str(&v),
+            ) {
+                map.insert(name, value);
             }
-            map.insert("sec-ch-ua-mobile", http::HeaderValue::from_static("?0"));
-            map.insert(
-                "sec-ch-ua-platform",
-                http::HeaderValue::from_static("\"Windows\""),
-            );
         }
         map
     }

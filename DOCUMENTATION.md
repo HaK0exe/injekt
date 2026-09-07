@@ -129,7 +129,7 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--oob-wait-secs <N>` | Seconds to wait for async DB-side OOB query before polling | `5` |
 | `--dbms <KIND>` | Force DBMS: `mysql`, `postgres`, `mssql`, `oracle` | auto-fingerprint |
 | `--extract` | Enable data extraction (opt-in, uses `SecretString`) | `false` |
-| `--output <PATH>` | Write JSON report to file (0o600 on Unix) | stdout |
+| `--output <PATH>` | Write JSON report to file (0o600 on Unix, relative path, never overwrites an existing file) | stdout |
 | `--rate-limit <RPS>` | Token-bucket requests/second | `10` (always enforced; there is no "unlimited" mode via CLI) |
 | `--jitter <MEAN,STD>` | **Milliseconds**, e.g. `"750,250"` (750±250ms, floor 200ms) | `750,250` (human jitter is **on by default**, even without the flag) |
 | `--marker <STR>` | Injection marker: `*`, `§`, `{{}}` | auto-detect |
@@ -195,9 +195,12 @@ available to single-payload techniques as explicit opt-in).
 | `space2tab` | ` ` → `%09` | Whitespace filters |
 | `space2newline` | ` ` → `%0a` | Whitespace filters |
 | `space2randomblank` | ` ` → random of `%09 %0a %0c %0d %a0 +` | Signature rotation |
+| `space2dash` | ` ` → `--<random-digits>%0A` | MSSQL/SQLite (`--` end-of-line comment) |
 | `randomcase` | `SELECT` → `SeLeCt` | Case-sensitive signatures |
 | `versionedcomment` | `SELECT` → `/*!50000SELECT*/` | **MySQL only** |
 | `betweencomment` | `SELECT` → `S/**/E/**/L…` | Keyword-splitting filters |
+| `randomcomments` | `SELECT` → one random `/**/` split inside the keyword | Less signature-obvious than `betweencomment` |
+| `equaltolike` | `=` → ` LIKE ` | Naive `=` filters |
 | `charencode` | Percent-encode non-alnum | Encoding filters |
 | `doubleurlencode` | `%` → `%25` | Double-decoding WAFs |
 | `hexencode` | Hex `%xx` per byte | Encoding filters |
@@ -277,7 +280,7 @@ Outputs:
 ```
 modern SQLi detection — zero persistence, OPSEC by design
   Techniques      boolean, time, error, union, stacked, oob, json
-  Tampers         space2comment, randomcase, versionedcomment, charencode, doubleurlencode, hexencode, unicodeencode, overlongutf8, space2tab, space2newline, space2randomblank, betweencomment
+  Tampers         space2comment, randomcase, versionedcomment, charencode, doubleurlencode, hexencode, unicodeencode, overlongutf8, space2tab, space2newline, space2randomblank, betweencomment, space2dash, randomcomments, equaltolike, base64encode
   OOB             opt-in via --oob-domain <collaborator> [--oob-poll-url <url> with {token}]
   Request tampers --hpp (duplicate ?id=1&id=PAYLOAD), --chunked (Transfer-Encoding: chunked body)
   DBMS            mysql, postgres, mssql, oracle
@@ -482,7 +485,7 @@ src/
 │   ├── matcher.rs                   # MatcherConfig (--string/--not-string/--code/--text-only)
 │   └── scanner/                     # engine + scheduler
 ├── techniques/
-│   ├── tamper.rs                    # 13 WAF evasion tampers
+│   ├── tamper.rs                    # 17 WAF evasion tampers
 │   ├── request_tamper.rs            # HPP + chunked
 │   ├── payload_opts.rs              # PayloadOpts (prefix/suffix/encoding/fetch-using)
 │   ├── boolean/ time/ error/        # Classic detectors + payloads
@@ -808,12 +811,14 @@ are replayed on every target (a warning is logged).
   "target": "https://example.com/?id=1",   // scrubbed unless --no-redact
   "findings": [ /* Finding: parameter, technique, dbms, confidence, evidence */ ],
   "evidences": [ /* scrubbed proof snippets */ ],
+  "extracted": [ /* strings pulled via --dbs/--tables/--columns/--dump/--banner/etc, NOT scrubbed */ ],
   "request_count": 123
 }
 ```
 Bulk mode wraps this per target (`BulkReport`: `targets_ok`, `targets_failed`,
-`request_count_total`, `per_target[]`). All output passes through `Scrubber` —
-never use `--no-redact` on a shared report.
+`request_count_total`, `per_target[]`) — `per_target[]` does not currently carry
+`extracted` (single-target and `auto` reports do). All other fields pass through
+`Scrubber` — never use `--no-redact` on a shared report.
 
 ---
 

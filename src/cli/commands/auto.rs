@@ -147,6 +147,7 @@ async fn run_auto_direct(
 ) -> anyhow::Result<()> {
     let scrubber = Scrubber::new(cli.no_redact);
     let mut all_findings = Vec::new();
+    let mut all_extracted = Vec::new();
     let mut total_requests: u64 = 0;
     let mut per_target: Vec<(String, usize, u64)> = Vec::new();
 
@@ -155,7 +156,9 @@ async fn run_auto_direct(
             tracing::warn!("auto cancelled");
             break;
         }
-        let (findings, requests) = scan_with_escalation(cli, args, target, cancel).await?;
+        let (findings, extracted, requests) =
+            scan_with_escalation(cli, args, target, cancel).await?;
+        all_extracted.extend(extracted);
         tracing::info!(
             target = %scrubber.scrub(target),
             findings = findings.len(),
@@ -179,16 +182,23 @@ async fn run_auto_direct(
         );
     }
     console::print_findings(&all_findings, &scrubber);
+    console::print_extracted(&all_extracted);
 
     if let Some(out) = cli.output.as_deref() {
         let report = JsonReport::new(
             targets.first().cloned().unwrap_or_default(),
             all_findings,
             vec![],
+            all_extracted,
             total_requests,
         );
-        write_output_file_async(out, &report.to_json(&scrubber), cli.force, &scrubber.scrub(out))
-            .await?;
+        write_json(
+            out,
+            &report.to_json(&scrubber),
+            cli.force,
+            &scrubber.scrub(out),
+        )
+        .await?;
         tracing::info!(path = %scrubber.scrub(out), "auto json report written (0o600, no overwrite unless --force)");
     }
     Ok(())
@@ -199,7 +209,7 @@ async fn scan_with_escalation(
     args: &AutoArgs,
     target: &str,
     cancel: &CancellationToken,
-) -> anyhow::Result<(Vec<crate::session::state::Finding>, u64)> {
+) -> anyhow::Result<(Vec<crate::session::state::Finding>, Vec<String>, u64)> {
     let mut base = super::scan::engine_config(cli);
     if args.auto_enumerate {
         base.extract = true;
@@ -218,11 +228,12 @@ async fn scan_with_escalation(
                 let handle = engine.state_handle();
                 let state = handle.read().await;
                 let findings = state.findings().to_vec();
+                let extracted = state.extracted_exposed();
                 let requests = state.request_count();
                 drop(state);
                 total_requests = total_requests.saturating_add(requests);
                 if !findings.is_empty() {
-                    return Ok((findings, total_requests));
+                    return Ok((findings, extracted, total_requests));
                 }
                 tracing::info!(step = step.label, "no finding, escalating");
             }
@@ -233,7 +244,7 @@ async fn scan_with_escalation(
             }
         }
     }
-    Ok((Vec::new(), total_requests))
+    Ok((Vec::new(), Vec::new(), total_requests))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -309,7 +320,7 @@ async fn run_auto_recon(
     if let Some(out) = cli.output.as_deref() {
         let scrubbed = report.scrubbed(&scrubber);
         let json = serde_json::to_string_pretty(&scrubbed)?;
-        write_output_file_async(out, &json, cli.force, &scrubber.scrub(out)).await?;
+        write_json(out, &json, cli.force, &scrubber.scrub(out)).await?;
     }
     Ok(())
 }
@@ -323,7 +334,12 @@ fn scrub_candidate(
     c
 }
 
-async fn write_json(path: &str, json: &str, force: bool, scrubbed_for_log: &str) -> anyhow::Result<()> {
+async fn write_json(
+    path: &str,
+    json: &str,
+    force: bool,
+    scrubbed_for_log: &str,
+) -> anyhow::Result<()> {
     write_output_file_async(path, json, force, scrubbed_for_log).await
 }
 

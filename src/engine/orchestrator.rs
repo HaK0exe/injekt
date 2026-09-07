@@ -342,6 +342,7 @@ impl Engine {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_internal(
         &self,
         target_str: &str,
@@ -1147,10 +1148,7 @@ impl Engine {
                     },
                     Err(e) => {
                         // Cancelled must abort, never be scored or retried as transport noise.
-                        if matches!(
-                            e,
-                            crate::http::client::ClientError::Cancelled
-                        ) {
+                        if matches!(e, crate::http::client::ClientError::Cancelled) {
                             return Ok(());
                         }
                         warn!(error=%e, len_guess, "extraction probe failed, skipping trial");
@@ -1313,9 +1311,7 @@ impl Engine {
                 )))
             }
         };
-        let extracted = engine
-            .extract(inferred_len, oracle, &cancel_clone)
-            .await?;
+        let extracted = engine.extract(inferred_len, oracle, &cancel_clone).await?;
         let exposed = {
             use secrecy::ExposeSecret;
             extracted.expose_secret().to_owned()
@@ -1578,119 +1574,6 @@ impl Engine {
             }
         }
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    async fn test_boolean(
-        &self,
-        target: &TargetUrl,
-        param: &TargetParameter,
-        baseline: &baseline::Baseline,
-    ) {
-        let payloads = boolean_payloads_for(None);
-        let detector = BooleanDetector::new();
-        for p in payloads.iter().take(2) {
-            if self.cancel.is_cancelled() {
-                break;
-            }
-            // craft urls with payloads
-            let true_url = inject_param(target, param, &p.true_payload, &[], false);
-            let false_url = inject_param(target, param, &p.false_payload, &[], false);
-
-            let (true_opt, true_ms) =
-                fetch_body_and_time(&self.client, &true_url, &self.state).await;
-            let (false_opt, false_ms) =
-                fetch_body_and_time(&self.client, &false_url, &self.state).await;
-            // Transport/body error (`None`) is never scored as `""` — skip.
-            let (Some(true_body), Some(false_body)) = (true_opt, false_opt) else {
-                continue;
-            };
-
-            let baseline_body = baseline.representative_body_str();
-            let res = detector.evaluate(
-                &baseline_body,
-                &true_body,
-                &false_body,
-                baseline.mean_ms,
-                true_ms,
-                false_ms,
-            );
-            if res.is_vulnerable && res.confidence > 0.6 {
-                let evidence = format!(
-                    "boolean true_sim={:.2} false_sim={:.2}",
-                    res.true_similarity, res.false_similarity
-                );
-                let mut finding = Finding::new(
-                    target.as_str(),
-                    param.key(),
-                    TechniqueKind::Boolean,
-                    res.confidence,
-                    evidence,
-                );
-                finding.dbms = None;
-                self.state.write().await.push_finding(finding);
-                break;
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    async fn test_error(&self, target: &TargetUrl, param: &TargetParameter) {
-        let detector = ErrorDetector::new();
-        let payloads = crate::techniques::error::payloads::error_payloads_for(None);
-        for p in payloads.iter().take(2) {
-            if self.cancel.is_cancelled() {
-                break;
-            }
-            let url = inject_param(target, param, &p.payload, &[], false);
-            let (body_opt, _ms) = fetch_body_and_time(&self.client, &url, &self.state).await;
-            let Some(body) = body_opt else {
-                continue;
-            };
-            let r = detector.evaluate(&body);
-            if r.is_vulnerable {
-                let mut finding = Finding::new(
-                    target.as_str(),
-                    param.key(),
-                    TechniqueKind::Error,
-                    r.confidence,
-                    format!("error pattern {:?}", r.matched_pattern),
-                );
-                finding.dbms = Some(p.dbms.clone());
-                self.state.write().await.push_finding(finding);
-                break;
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    async fn test_time(
-        &self,
-        target: &TargetUrl,
-        param: &TargetParameter,
-        baseline: &baseline::Baseline,
-    ) {
-        let detector = TimeDetector::from_baseline(baseline);
-        let payload = crate::techniques::time::payloads::time_payload_for(None, 3);
-        let url = inject_param(target, param, &payload.payload, &[], false);
-        let (_body, ms) = fetch_body_and_time(&self.client, &url, &self.state).await;
-        // sleep_secs is a small time-based delay (seconds); cast is always lossless.
-        #[allow(clippy::cast_precision_loss)]
-        let r = detector.evaluate(ms, payload.sleep_secs as f64);
-        if r.is_vulnerable {
-            let finding = Finding::new(
-                target.as_str(),
-                param.key(),
-                TechniqueKind::Time,
-                r.confidence,
-                format!(
-                    "time delay {:.0}ms > threshold {:.0}ms",
-                    r.measured_ms,
-                    detector.threshold()
-                ),
-            );
-            self.state.write().await.push_finding(finding);
-        }
     }
 }
 
@@ -2123,31 +2006,6 @@ async fn fetch_for_payload(
 }
 
 #[allow(dead_code)]
-async fn fetch_body_and_time(
-    client: &HttpClient,
-    url: &str,
-    state: &Arc<RwLock<SessionState>>,
-) -> (Option<String>, f64) {
-    let start = Instant::now();
-    let resp = client.get_with_retry(url.to_owned()).await;
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    state.write().await.increment_requests();
-    match resp {
-        Ok(r) => match client.read_body_string_with_timeout(r).await {
-            Ok(body) => (Some(body), elapsed_ms),
-            Err(e) => {
-                warn!(error=%e, "body read failed, skipping score");
-                (None, elapsed_ms)
-            }
-        },
-        Err(e) => {
-            warn!(error=%e, "request failed, skipping score");
-            (None, elapsed_ms)
-        }
-    }
-}
-
-#[allow(dead_code)]
 async fn fetch_body_and_time_spec(
     client: &HttpClient,
     url: String,
@@ -2429,7 +2287,7 @@ async fn test_error_bounded(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn test_time_bounded(
     client: &HttpClient,
     state: &Arc<RwLock<SessionState>>,

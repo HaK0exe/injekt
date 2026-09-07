@@ -33,7 +33,9 @@ impl InjektServer {
 
     /// Validate an MCP `output` path: relative-only, no parent traversal.
     /// MCP agents must not overwrite arbitrary files; absolute paths and
-    /// `..` are rejected with `invalid_params`. Writes use 0o600 on Unix.
+    /// `..` are rejected with `invalid_params`. Writes use 0o600 on Unix
+    /// with `create_new` (no overwrite, same model as `EncryptedExport`).
+    /// The parent is canonicalized so symlink escapes fail fast.
     fn validate_output_path(path: &str) -> Result<std::path::PathBuf, ErrorData> {
         use std::path::Component;
         let p = std::path::Path::new(path);
@@ -52,26 +54,56 @@ impl InjektServer {
                 None,
             ));
         }
-        Ok(p.to_path_buf())
+        let Some(file_name) = p.file_name() else {
+            return Err(ErrorData::invalid_params(
+                "output path has no file name",
+                None,
+            ));
+        };
+        let parent = p.parent().unwrap_or_else(|| std::path::Path::new(""));
+        let canonical_parent = if parent.as_os_str().is_empty() {
+            std::fs::canonicalize(".").map_err(|e| {
+                ErrorData::internal_error(format!("cannot canonicalize current dir: {e}"), None)
+            })?
+        } else {
+            std::fs::canonicalize(parent).map_err(|e| {
+                ErrorData::internal_error(
+                    format!("cannot canonicalize parent '{}': {e}", parent.display()),
+                    None,
+                )
+            })?
+        };
+        Ok(canonical_parent.join(file_name))
     }
 
     /// Opt-in disk write for MCP `output` param (already-scrubbed JSON).
+    /// Uses `create_new` + `0o600` (no overwrite for OPSEC, like `EncryptedExport`).
     fn write_output_file(path: &std::path::Path, json: &str) -> Result<(), ErrorData> {
         use std::io::Write as _;
+        if json.len() > crate::cli::output::file::MAX_OUTPUT_BYTES {
+            return Err(ErrorData::invalid_params("output report too large", None));
+        }
         tracing::warn!(
             path=%path.display(),
-            "MCP output requested — opt-in disk write (sensitive report, 0o600)"
+            "MCP output requested — opt-in disk write (sensitive report, 0o600, no overwrite)"
         );
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             opts.mode(0o600);
         }
-        let mut file = opts
-            .open(path)
-            .map_err(|e| ErrorData::internal_error(format!("output write failed: {e}"), None))?;
+        let mut file = opts.open(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                ErrorData::invalid_params(
+                    "output file already exists (no overwrite for OPSEC; choose another path)",
+                    None,
+                )
+            } else {
+                ErrorData::internal_error(format!("output write failed: {e}"), None)
+            }
+        })?;
         file.write_all(json.as_bytes())
             .map_err(|e| ErrorData::internal_error(format!("output write failed: {e}"), None))?;
         file.write_all(b"\n")

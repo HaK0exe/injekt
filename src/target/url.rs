@@ -74,13 +74,13 @@ impl TargetUrl {
     /// if any resolved IP is private/loopback/link-local/etc.
     ///
     /// IP literals are checked directly without DNS. Bare hostnames are
-    /// resolved via [`tokio::net::lookup_host`] (port 80, only the IPs
+    /// resolved via [`tokio::net::lookup_host`] (port 80; only the IPs
     /// matter). `allow_private=true` skips the check (lab only).
     ///
     /// # Errors
     /// Returns [`UrlError::PrivateIp`] if the host is `localhost` or resolves
-    /// to a private IP, [`UrlError::Dns`] if resolution fails with no
-    /// addresses, [`UrlError::Invalid`] if the host is empty.
+    /// to a private IP, [`UrlError::Dns`] if resolution yields nothing,
+    /// [`UrlError::Invalid`] if the host is empty.
     pub async fn resolve_and_check(host: &str, allow_private: bool) -> Result<(), UrlError> {
         if allow_private {
             return Ok(());
@@ -92,17 +92,17 @@ impl TargetUrl {
         if normalized == "localhost" {
             return Err(UrlError::PrivateIp);
         }
-        // Fast path: IP literal (covers `127.0.0.1`, `[::1]` without brackets
-        // here since `host_str()` strips them, `::ffff:127.0.0.1`, etc.).
+        // Fast path: IP literal (covers `127.0.0.1`, `::1` without brackets
+        // since `host_str()` strips them, `::ffff:127.0.0.1`, etc.).
         if let Ok(ip) = normalized.parse::<std::net::IpAddr>() {
             if is_private_ip(ip) {
                 return Err(UrlError::PrivateIp);
             }
             return Ok(());
         }
-        // DNS-time: a domain that is lexically public may still resolve to a
-        // private IP (DNS rebinding / `0x7f.0.0.1` style names that
-        // `getaddrinfo` resolves to loopback). Reject if ANY record is private.
+        // DNS-time: a lexically public domain may still resolve to a private
+        // IP (DNS rebinding / libc-parsed forms like `0x7f.0.0.1` that
+        // `getaddrinfo` maps to loopback). Reject if ANY record is private.
         let addrs = tokio::net::lookup_host((normalized.as_str(), 80))
             .await
             .map_err(|e| UrlError::Dns {
@@ -206,7 +206,7 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
 
 /// Private check for the v4 behind an IPv6 `::ffff:a.b.c.d` mapping.
 /// Unified with [`is_private_ip`] so CGNAT (`100.64/10`), `192.0.0.0/24`,
-/// `0/8` and other ranges covered there are not missed here.
+/// `0/8` and the other ranges covered there are not missed here.
 fn is_private_ipv4_mapped(v4: std::net::Ipv4Addr) -> bool {
     is_private_ip(std::net::IpAddr::V4(v4))
 }
@@ -258,7 +258,7 @@ mod tests {
         assert!(TargetUrl::parse("http://0.1.2.3/", false).is_err());
         assert!(TargetUrl::parse("http://[fc00::1]/", false).is_err());
         assert!(TargetUrl::parse("http://[fe80::1]/", false).is_err());
-        // Unified mapped check: CGNAT / 0/8 behind `::ffff:` must also block.
+        // Unified mapped check: CGNAT / 0/8 / IETF behind `::ffff:` block too.
         assert!(TargetUrl::parse("http://[::ffff:100.64.0.1]/", false).is_err());
         assert!(TargetUrl::parse("http://[::ffff:0.1.2.3]/", false).is_err());
         assert!(TargetUrl::parse("http://[::ffff:192.0.0.1]/", false).is_err());

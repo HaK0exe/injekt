@@ -691,6 +691,57 @@ mod tests {
     }
 
     #[test]
+    fn space2dash_replaces_spaces_with_dash_comment() {
+        let out = Tamper::Space2Dash.apply("' OR 1=1");
+        assert!(!out.contains(' '), "got {out}");
+        assert!(out.contains("--"), "got {out}");
+        assert!(out.contains("%0A"), "got {out}");
+        assert!(out.starts_with('\''));
+        assert!(out.ends_with('1'));
+    }
+
+    #[test]
+    fn randomcomments_replaces_spaces_with_comment_variants() {
+        let out = Tamper::RandomComments.apply("' OR 1=1");
+        assert!(!out.contains(' '), "got {out}");
+        assert!(out.starts_with('\''));
+        assert!(out.ends_with('1'));
+        // every gap is either /**/ or /**/**/, nothing else was inserted
+        assert_eq!(out.replace("/**/**/", "").replace("/**/", ""), "'OR1=1");
+    }
+
+    #[test]
+    fn base64_roundtrips() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let out = Tamper::Base64Encode.apply("' OR 1=1 -- -");
+        assert_eq!(
+            STANDARD
+                .decode(&out)
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+            Ok("' OR 1=1 -- -".to_owned())
+        );
+    }
+
+    #[test]
+    fn new_tampers_registered_in_from_name_and_all_names() {
+        for name in [
+            "space2dash",
+            "randomcomments",
+            "equaltolike",
+            "base64encode",
+        ] {
+            assert!(
+                Tamper::all_names().contains(&name),
+                "{name} missing from all_names"
+            );
+            assert!(
+                Tamper::from_name(name).is_some(),
+                "{name} missing from from_name"
+            );
+        }
+    }
+
+    #[test]
     fn apply_tampers_chain_order() {
         let payload = "a b";
         let tampers = vec![Tamper::Space2Comment, Tamper::RandomCase];

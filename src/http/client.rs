@@ -40,7 +40,16 @@ pub enum ClientError {
     InvalidRedirect(String),
     #[error("too many redirects")]
     TooManyRedirects,
+    #[error("response body exceeded {0} bytes cap")]
+    BodyTooLarge(usize),
 }
+
+/// Hard cap on a single response body read (`read_body_with_timeout` /
+/// `read_body_string_with_timeout`): a malicious or misconfigured target
+/// streaming an unbounded/huge body must not be allowed to exhaust memory —
+/// the stream is read incrementally and aborted the moment this is exceeded,
+/// so at most one chunk beyond the cap is ever buffered.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 ///Marker types for typestate.
 #[derive(Debug)]
@@ -545,16 +554,32 @@ impl HttpClient {
     ///
     /// # Errors
     /// Returns an error if reading the body times out or the underlying stream fails.
+    ///
+    /// # Errors
+    /// Also returns [`ClientError::BodyTooLarge`] once the accumulated body
+    /// exceeds [`MAX_RESPONSE_BODY_BYTES`] — the stream is dropped
+    /// immediately rather than being drained to completion.
     pub async fn read_body_with_timeout(
         &self,
         resp: reqwest::Response,
     ) -> Result<Vec<u8>, ClientError> {
+        use futures::StreamExt as _;
         let timeout = self.timeout;
-        tokio::time::timeout(timeout, resp.bytes())
+        let fut = async {
+            let mut buf = Vec::new();
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                buf.extend_from_slice(&chunk);
+                if buf.len() > MAX_RESPONSE_BODY_BYTES {
+                    return Err(ClientError::BodyTooLarge(MAX_RESPONSE_BODY_BYTES));
+                }
+            }
+            Ok(buf)
+        };
+        tokio::time::timeout(timeout, fut)
             .await
             .map_err(|_| ClientError::Timeout(timeout))?
-            .map(|b| b.to_vec())
-            .map_err(std::convert::Into::into)
     }
 
     /// Bounded `String` body read: `read_body_with_timeout` + lossy UTF-8.

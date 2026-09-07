@@ -110,11 +110,13 @@ pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult
     let handle = engine.state_handle();
     let s = handle.read().await;
     let findings = s.findings().to_vec();
+    let extracted = s.extracted_exposed();
     let count = s.request_count();
     drop(s);
 
     let scrubber = Scrubber::new(cfg.no_redact);
-    let report = JsonReport::new(target.clone(), findings, vec![], count).scrubbed(&scrubber);
+    let report =
+        JsonReport::new(target.clone(), findings, vec![], extracted, count).scrubbed(&scrubber);
 
     Ok(ScanResult {
         report,
@@ -241,6 +243,7 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> Result<()> {
     );
 
     console::print_findings(&result.report.findings, &scrubber);
+    console::print_extracted(&result.report.extracted);
 
     if let Some(out) = &cli.output {
         let json = result.report.to_json(&scrubber);

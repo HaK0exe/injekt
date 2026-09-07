@@ -4,7 +4,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 /// Config for bounded concurrency scanning.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ScanConfig {
     pub concurrency: usize,
