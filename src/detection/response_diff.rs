@@ -18,15 +18,31 @@ impl DiffResult {
     }
 }
 
-const MAX_LEVENSHTEIN_LEN: usize = 4096;
+const MAX_LEVENSHTEIN_LEN: usize = 1024;
 
-/// Normalized Levenshtein similarity 0..1. Truncates inputs to 4096 chars.
+/// Similarities below this threshold all take the same detection branch
+/// (`combined_sim < 0.5` in [`diff_against_baseline`]), so the DP result
+/// is interchangeable with `0.0` there — the early-exit below exploits this.
+const EARLY_EXIT_SIM: f64 = 0.5;
+
+/// Normalized Levenshtein similarity 0..1. Truncates inputs to 1024 chars
+/// and skips the O(n·m) DP when the length difference alone guarantees a
+/// similarity below [`EARLY_EXIT_SIM`].
 #[must_use]
-// Inputs are truncated to MAX_LEVENSHTEIN_LEN (4096); casts are always lossless.
+// Inputs are truncated to MAX_LEVENSHTEIN_LEN (1024); casts are always lossless.
 #[allow(clippy::cast_precision_loss)]
 pub fn levenshtein_similarity(a: &str, b: &str) -> f64 {
     let a_trunc = truncate(a);
     let b_trunc = truncate(b);
+    // Early-exit: edit distance >= |n-m|, so similarity <= 1 - |n-m|/max.
+    // Char counts are O(n); the DP they skip is O(n*m).
+    let n_chars = a_trunc.chars().count();
+    let m_chars = b_trunc.chars().count();
+    let max_len = n_chars.max(m_chars).max(1);
+    let len_diff = n_chars.abs_diff(m_chars);
+    if 1.0 - (len_diff as f64 / max_len as f64) < EARLY_EXIT_SIM {
+        return 0.0;
+    }
     let dist = levenshtein_distance(a_trunc, b_trunc);
     let max_len = a_trunc.len().max(b_trunc.len()).max(1) as f64;
     1.0 - (dist as f64 / max_len)

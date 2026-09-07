@@ -11,11 +11,12 @@ pub struct RetryPolicy {
     pub max_delay: Duration,
 }
 
-/// Check if a reqwest error is retryable (timeout, connect, body, decode).
-/// Does not retry builder errors, redirect errors, or status errors.
+/// Check if a reqwest error is retryable (timeout, connect, body).
+/// `is_decode` is deliberately excluded: decode failures are deterministic
+/// (bad body framing) and retrying them just burns requests.
 #[must_use]
 pub fn is_retryable_error(e: &reqwest::Error) -> bool {
-    e.is_timeout() || e.is_connect() || e.is_body() || e.is_decode()
+    e.is_timeout() || e.is_connect() || e.is_body()
 }
 
 impl Default for RetryPolicy {
@@ -49,20 +50,6 @@ impl RetryPolicy {
         Duration::from_millis(ms)
     }
 
-    /// Delay honoring a server `Retry-After` header (seconds, or an HTTP
-    /// date) when present and sane; falls back to [`Self::delay_for`]
-    /// otherwise. Always capped at `max_delay` so a hostile/misconfigured
-    /// server cannot stall a scan indefinitely.
-    #[must_use]
-    pub fn delay_for_retry_after(&self, attempt: usize, retry_after: Option<&str>) -> Duration {
-        if let Some(raw) = retry_after
-            && let Ok(secs) = raw.trim().parse::<u64>()
-        {
-            return Duration::from_secs(secs).min(self.max_delay);
-        }
-        self.delay_for(attempt)
-    }
-
     #[must_use]
     pub fn should_retry(&self, attempt: usize, status: Option<u16>) -> bool {
         if attempt >= self.max_retries {
@@ -70,9 +57,40 @@ impl RetryPolicy {
         }
         #[allow(clippy::match_same_arms)]
         match status {
-            Some(429 | 500 | 502 | 503 | 504) => true,
+            Some(408 | 425 | 429 | 500 | 502 | 503 | 504) => true,
             None => true, // network error
             _ => false,
         }
     }
+
+    /// Delay for `attempt`, honoring an optional `Retry-After` header value
+    /// (delta-seconds). The header value is capped at `max_delay` so a
+    /// malicious server cannot park the scanner.
+    #[must_use]
+    pub fn delay_for_retry_after(&self, attempt: usize, retry_after: Option<&str>) -> Duration {
+        let base = self.delay_for(attempt);
+        let Some(raw) = retry_after else {
+            return base;
+        };
+        if let Some(secs) = parse_retry_after_secs(raw) {
+            return base.max(secs).min(self.max_delay);
+        }
+        base
+    }
+}
+
+/// Parse `Retry-After` delta-seconds into a capped `Duration`.
+/// HTTP-date form is ignored (`None`) — delta-seconds covers the common
+/// `429`/`503` case without a new date-parsing dependency.
+/// Returns `None` when unparseable.
+#[must_use]
+pub fn parse_retry_after_secs(raw: &str) -> Option<Duration> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(Duration::from_secs(secs.min(60)));
+    }
+    None
 }

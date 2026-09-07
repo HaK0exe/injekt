@@ -6,6 +6,7 @@ use injekt::{
     http::{client::HttpClient, jitter::Jitter, rate_limit::RateLimiter},
     recon::parameter::{CandidateMethod, ParamType, ParameterCandidate},
     target::parameters::ParameterLocation,
+    techniques::tamper::Tamper,
 };
 use std::{collections::BTreeMap, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -230,6 +231,108 @@ async fn without_chunked_content_length_waf_blocks_body() {
     assert!(
         findings.is_empty(),
         "without --chunked the content-length body is blocked, got {findings:?}"
+    );
+}
+
+/// Combined WAF mock: naive first-value inspection (HPP bypass) PLUS
+/// `=`-comparison stripping (only `LIKE` injections evaluate, rendered by
+/// `form_urlencoded` as `1+like+1` / `1+like+2`). Requires BOTH evasions.
+fn hpp_like_waf_responder(req: &wiremock::Request) -> ResponseTemplate {
+    let baseline = baseline_body();
+    let query = req.url.query().unwrap_or_default().to_ascii_lowercase();
+    let ids: Vec<&str> = query
+        .split('&')
+        .filter_map(|pair| {
+            pair.split_once('=')
+                .filter(|(k, _)| *k == "id")
+                .map(|(_, v)| v)
+        })
+        .collect();
+    if ids.is_empty() {
+        return ResponseTemplate::new(200).set_body_string(baseline);
+    }
+    let Some(first) = ids.first() else {
+        return ResponseTemplate::new(200).set_body_string(baseline);
+    };
+    if first.contains("or") || first.contains("%27") {
+        // WAF block: true and false look identical.
+        return ResponseTemplate::new(200).set_body_string(baseline);
+    }
+    let last = ids.last().unwrap_or(first);
+    if !last.contains("like") {
+        return ResponseTemplate::new(200).set_body_string(baseline);
+    }
+    if last.contains("1+like+2") {
+        return ResponseTemplate::new(200).set_body_string(different_body());
+    }
+    ResponseTemplate::new(200).set_body_string(baseline)
+}
+
+#[tokio::test]
+async fn hpp_plus_equaltolike_combined_bypass() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(hpp_like_waf_responder)
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.threads = 1;
+    cfg.techniques = vec!["boolean".to_owned()];
+    cfg.hpp = true;
+    cfg.tampers = vec![Tamper::EqualToLike];
+    cfg.allow_private = true;
+    cfg.no_redact = true;
+    let cancel = CancellationToken::new();
+    let engine = Engine::new(cfg, client, cancel);
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        !findings.is_empty(),
+        "with --hpp + equaltolike the combined WAF should be bypassed"
+    );
+    let bf = findings
+        .iter()
+        .find(|f| f.technique == injekt::session::state::TechniqueKind::Boolean)
+        .expect("boolean finding");
+    assert!(
+        bf.evidence.contains("hpp=true"),
+        "evidence should trace hpp, got {}",
+        bf.evidence
+    );
+    assert!(
+        bf.evidence.contains("equaltolike"),
+        "evidence should trace tamper, got {}",
+        bf.evidence
+    );
+}
+
+#[tokio::test]
+async fn hpp_alone_insufficient_against_like_only_backend() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(hpp_like_waf_responder)
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.threads = 1;
+    cfg.techniques = vec!["boolean".to_owned()];
+    cfg.hpp = true;
+    cfg.tampers = Vec::new();
+    cfg.allow_private = true;
+    cfg.no_redact = true;
+    let cancel = CancellationToken::new();
+    let engine = Engine::new(cfg, client, cancel);
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        findings.is_empty(),
+        "hpp alone cannot satisfy the LIKE requirement, got {findings:?}"
     );
 }
 

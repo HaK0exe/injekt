@@ -13,6 +13,7 @@ use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    sync::OnceLock,
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -94,7 +95,7 @@ impl Crawler {
         cancel: &CancellationToken,
     ) -> anyhow::Result<CrawlReport> {
         let started = std::time::Instant::now();
-        let root = parse_target(target, self.config.allow_private)?;
+        let root = parse_target(target, self.config.allow_private).await?;
         tracing::info!(
             "starting crawl at '{root}' (depth: {}, max pages: {})",
             self.config.depth,
@@ -274,13 +275,17 @@ impl Crawler {
     }
 }
 
-fn parse_target(target: &str, allow_private: bool) -> anyhow::Result<Url> {
+async fn parse_target(target: &str, allow_private: bool) -> anyhow::Result<Url> {
     let with_scheme = if target.contains("://") {
         target.to_owned()
     } else {
         format!("https://{target}")
     };
-    let parsed = TargetUrl::parse(&with_scheme, allow_private)
+    // Lexical + DNS-time SSRF check (anti DNS-rebinding); per-link filtering
+    // in the crawl loop stays lexical-only for speed, enforcement happens
+    // per-fetch inside `HttpClient::send_with_retry`.
+    let parsed = TargetUrl::validate_redirect_location(&with_scheme, allow_private)
+        .await
         .map_err(|error| anyhow::anyhow!("invalid recon target: {error}"))?;
     Ok(parsed.inner().clone())
 }
@@ -361,9 +366,7 @@ fn extract_document(base: &Url, body: &str) -> ExtractedDocument {
         }
     }
 
-    if let Ok(js_endpoint) = Regex::new(
-        r#"[\"']((?:https?://[^\"']+|/[^\"']+)[?&][A-Za-z_][A-Za-z0-9_.-]*=[^\"']*)[\"']"#,
-    ) {
+    if let Some(js_endpoint) = js_endpoint_regex() {
         for captures in js_endpoint.captures_iter(body) {
             if let Some(raw) = captures.get(1)
                 && let Ok(url) = base.join(raw.as_str())
@@ -393,6 +396,18 @@ fn add_link_candidates(out: &mut ExtractedDocument, mut url: Url, param_type: Pa
 
 fn selector(value: &str) -> Selector {
     Selector::parse(value).unwrap_or_else(|_| unreachable!("static selector is valid"))
+}
+
+/// JS endpoint pattern compiled once (was `Regex::new` per crawled page).
+fn js_endpoint_regex() -> Option<&'static Regex> {
+    static CELL: OnceLock<Option<Regex>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        Regex::new(
+            r#"[\"']((?:https?://[^\"']+|/[^\"']+)[?&][A-Za-z_][A-Za-z0-9_.-]*=[^\"']*)[\"']"#,
+        )
+        .ok()
+    })
+    .as_ref()
 }
 
 fn resolve_attr(base: &Url, element: &ElementRef<'_>, attr: &str) -> Option<Url> {

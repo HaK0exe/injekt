@@ -38,7 +38,11 @@ pub fn checksum_bytes(data: &[u8]) -> String {
 
 #[must_use]
 pub fn verify_checksum(data: &str, expected_hex: &str) -> bool {
-    checksum(data) == expected_hex
+    use subtle::ConstantTimeEq as _;
+    // Constant-time compare (length leaks, content does not — acceptable:
+    // SHA256 hex is always 64 chars; a short `expected_hex` fails fast).
+    let actual = checksum(data);
+    bool::from(actual.as_bytes().ct_eq(expected_hex.as_bytes()))
 }
 
 #[must_use]

@@ -121,7 +121,7 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--confirm` | Strict second-pass confirmation: replay each finding's technique on that single parameter in a fresh session, keep only re-confirmed (OOB skipped, ~2× request cost) | `false` |
 | `--ignore-code <LIST>` | Status codes treated as negative probes (e.g. `--ignore-code 429,503`); never yields a finding. Baseline/WAF detection runs **before** this filter and is never ignored | — |
 | `--raw-file <PATH>` | Raw HTTP request file (Burp/ZAP export) — **takes priority over `--target`** (see [Target resolution](#target-resolution)) | — |
-| `--tamper <LIST>` | WAF tampers (17 total, see [Tamper scripts](#tamper-scripts)): `space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,randomcase,versionedcomment,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,base64encode` | auto `space2comment` on WAF 403/406 |
+| `--tamper <LIST>` | WAF tampers (19 total, see [Tamper scripts](#tamper-scripts)): `space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,randomcase,versionedcomment,versionedmorekeywords,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,base64encode` (opt-in: breaks boolean differentials) | auto `space2comment` on WAF 403/406 |
 | `--hpp` | HTTP Parameter Pollution: duplicate param `?id=1&id=PAYLOAD` (Query/Body) | `false` |
 | `--chunked` | Chunked transfer: streamed `Transfer-Encoding: chunked` body (Body only) | `false` |
 | `--oob-domain <DOMAIN>` | Collaborator base domain (enables OOB probes, **OPT-IN**) | — |
@@ -182,9 +182,11 @@ injekt --target "https://example.com/?id=1" --output report.json
 
 ### Tamper scripts
 
-17 tampers, composable with `--tamper a,b,c` (applied as original + each single + full chain).
+19 tampers, composable with `--tamper a,b,c` (applied as original + each single + full chain).
 Case-insensitive, with sqlmap-style aliases (`comment` → `space2comment`, `url` → `charencode`,
 `double` → `doubleurlencode`, `hex` → `hexencode`, … — unknown names are ignored with a warning).
+Boolean TRUE/FALSE pairs only try boolean-safe sets (`base64encode` excluded there; it stays
+available to single-payload techniques as explicit opt-in).
 
 | Tamper | Transformation | Typical use |
 |--------|---------------|-------------|
@@ -204,7 +206,12 @@ Case-insensitive, with sqlmap-style aliases (`comment` → `space2comment`, `url
 | `hexencode` | Hex `%xx` per byte | Encoding filters |
 | `unicodeencode` | `%uXXXX` per char | IIS/ASP stacks |
 | `overlongutf8` | `/` → `%c0%af` | Overlong-UTF8 decoders |
-| `base64encode` | Base64-encode the whole payload | Apps that decode base64 params |
+| `space2dash` | ` ` → `--%0A` | **MySQL** dash-comment style |
+| `space2mssqlblank` | ` ` → random of `%09 %0A %0B %0C %0D` | **MSSQL** blank range |
+| `randomcomments` | ` ` → random `/**/` or `/**/**/` | Signature rotation |
+| `equaltolike` | `=` → ` LIKE ` (`>=`/`<=`/`!=` kept) | `=`-signature WAFs; auto-added at L3 |
+| `versionedmorekeywords` | extended keyword set → `/*!50000KW*/` | **MySQL**, broader than `versionedcomment` |
+| `base64encode` | whole payload → Base64 | Opt-in only: opaque, skipped for boolean pairs |
 
 **Enumeration/Extraction Flags** (require `--extract` or `--auto-enumerate` in recon):
 | Flag | Description |
@@ -273,7 +280,7 @@ Outputs:
 ```
 modern SQLi detection — zero persistence, OPSEC by design
   Techniques      boolean, time, error, union, stacked, oob, json
-  Tampers         space2comment, randomcase, versionedcomment, charencode, doubleurlencode, hexencode, unicodeencode, overlongutf8, space2tab, space2newline, space2randomblank, betweencomment, space2dash, randomcomments, equaltolike, base64encode
+  Tampers         space2comment, space2plus, space2tab, space2newline, space2randomblank, randomcase, versionedcomment, betweencomment, charencode, doubleurlencode, hexencode, unicodeencode, overlongutf8, space2dash, space2mssqlblank, randomcomments, equaltolike, versionedmorekeywords, base64encode
   OOB             opt-in via --oob-domain <collaborator> [--oob-poll-url <url> with {token}]
   Request tampers --hpp (duplicate ?id=1&id=PAYLOAD), --chunked (Transfer-Encoding: chunked body)
   DBMS            mysql, postgres, mssql, oracle
@@ -478,7 +485,7 @@ src/
 │   ├── matcher.rs                   # MatcherConfig (--string/--not-string/--code/--text-only)
 │   └── scanner/                     # engine + scheduler
 ├── techniques/
-│   ├── tamper.rs                    # 17 WAF evasion tampers
+│   ├── tamper.rs                    # 19 WAF evasion tampers
 │   ├── request_tamper.rs            # HPP + chunked
 │   ├── payload_opts.rs              # PayloadOpts (prefix/suffix/encoding/fetch-using)
 │   ├── boolean/ time/ error/        # Classic detectors + payloads

@@ -193,6 +193,7 @@ impl InjektServer {
             confirm: false,
             ignore_codes: Vec::new(),
             no_banner: true,
+            force: false,
         }
     }
 
@@ -545,7 +546,7 @@ pub struct ScanParams {
     pub text_only: Option<bool>,
     /// Force fetch oracle: direct, boolean or time
     pub fetch_using: Option<String>,
-    /// WAF tamper scripts: space2comment, randomcase, versionedcomment, charencode, doubleurlencode, hexencode, unicodeencode, overlongutf8, space2tab, space2newline, space2randomblank, betweencomment
+    /// WAF tamper scripts: space2comment, randomcase, versionedcomment, versionedmorekeywords, charencode, doubleurlencode, hexencode, unicodeencode, overlongutf8, space2tab, space2newline, space2randomblank, space2dash, space2mssqlblank, betweencomment, randomcomments, equaltolike, base64encode (opt-in: breaks boolean differentials)
     pub tamper: Option<Vec<String>>,
     /// Proxy URL (use socks5h:// for remote DNS, socks5:// is rejected)
     pub proxy: Option<String>,

@@ -173,9 +173,8 @@ async fn run_bulk_cli(cli: &Cli, cancel: CancellationToken) -> Result<()> {
     report.print_summary(&scrubber);
     if let Some(out) = &cli.output {
         let json = serde_json::to_string_pretty(&report.to_json(&scrubber))?;
-        let scrubbed_path = scrubber.scrub(out);
-        write_output_file_async(out, &json, false, &scrubbed_path).await?;
-        info!(path=%scrubbed_path, "bulk json report written (0o600)");
+        write_output_file_async(out, &json, cli.force, &scrubber.scrub(out)).await?;
+        info!(path=%scrubber.scrub(out), "bulk json report written (0o600, no overwrite unless --force)");
     }
     Ok(())
 }
@@ -248,9 +247,10 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> Result<()> {
 
     if let Some(out) = &cli.output {
         let json = result.report.to_json(&scrubber);
-        let scrubbed_path = scrubber.scrub(out);
-        write_output_file_async(out, &json, false, &scrubbed_path).await?;
-        info!(path=%scrubbed_path, "json report written (0o600)");
+        // Secure write: 0o600, create_new (no overwrite unless --force),
+        // relative-only + canonicalized parent (see `output::file`).
+        write_output_file_async(out, &json, cli.force, &scrubber.scrub(out)).await?;
+        info!(path=%scrubber.scrub(out), "json report written (0o600, no overwrite unless --force)");
     }
 
     if let Some(path) = &cli.export_encrypted {

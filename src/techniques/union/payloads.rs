@@ -84,7 +84,7 @@ pub fn union_payloads_for(dbms: Option<&str>, columns: usize) -> Vec<UnionPayloa
         Some("oracle") => "oracle",
         _ => "generic",
     };
-    // (prefix + select-core): prefix is prepended verbatim; numeric uses a
+    // (prefix, select-core): prefix is prepended verbatim; numeric uses a
     // leading `1` value since payloads replace the parameter value.
     let base: Vec<(String, &str)> = vec![
         (format!("'\"())) {union_cols}"), label),

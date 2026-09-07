@@ -63,7 +63,9 @@ impl RawRequest {
                 continue;
             }
             if let Some((k, v)) = line.split_once(':') {
-                headers.insert(k.trim().to_owned(), v.trim().to_owned());
+                // Lowercase at insertion: single canonical form, O(1) lookups
+                // without per-access `eq_ignore_ascii_case` chains.
+                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_owned());
             } else {
                 return Err(RawRequestError::Header(line.to_owned()));
             }
@@ -84,10 +86,8 @@ impl RawRequest {
 
     #[must_use]
     pub fn content_type(&self) -> Option<&str> {
-        self.headers
-            .get("Content-Type")
-            .or_else(|| self.headers.get("content-type"))
-            .map(String::as_str)
+        // Keys are lowercased at insertion (see `parse`).
+        self.headers.get("content-type").map(String::as_str)
     }
 
     #[must_use]
@@ -104,10 +104,7 @@ impl RawRequest {
         if self.path.starts_with("http://") || self.path.starts_with("https://") {
             return Some(self.path.clone());
         }
-        let host = self
-            .headers
-            .get("Host")
-            .or_else(|| self.headers.get("host"))?;
+        let host = self.headers.get("host")?;
         let path = if self.path.starts_with('/') {
             self.path.clone()
         } else {
@@ -128,7 +125,9 @@ mod tests {
         let r = RawRequest::parse(raw).unwrap();
         assert_eq!(r.method, "GET");
         assert_eq!(r.path, "/?id=1");
-        assert_eq!(r.headers.get("Host").unwrap(), "example.com");
+        // Keys are lowercased at insertion.
+        assert_eq!(r.headers.get("host").unwrap(), "example.com");
+        assert_eq!(r.headers.get("user-agent").unwrap(), "test");
     }
 
     #[test]

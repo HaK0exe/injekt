@@ -22,10 +22,9 @@ impl RedirectPolicy {
         }
     }
 
-    /// Maximum number of redirect hops to follow, or `None` if redirects
-    /// must not be followed at all.
+    /// Max hops for manual follow. `None` means "do not follow".
     #[must_use]
-    pub fn max_hops(&self) -> Option<usize> {
+    pub const fn max_hops(&self) -> Option<usize> {
         match self {
             Self::None => None,
             Self::Limited(max) => Some(*max),

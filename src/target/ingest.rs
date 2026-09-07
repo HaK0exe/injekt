@@ -10,10 +10,18 @@
 //! truncated to [`MAX_BULK_TARGETS`].
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use crate::target::bulk::MAX_BULK_TARGETS;
 use crate::target::raw_request::RawRequest;
 use crate::target::url::TargetUrl;
+
+/// `<loc>` harvester compiled once (was `Regex::new` per sitemap file).
+fn sitemap_loc_regex() -> Option<&'static regex::Regex> {
+    static CELL: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    CELL.get_or_init(|| regex::Regex::new(r"(?i)<loc>\s*(https?://[^<\s]+)\s*</loc>").ok())
+        .as_ref()
+}
 
 /// Maximum bytes accepted for any ingestion file (`--bulk-file`,
 /// `--openapi-file`, `--sitemap-file`, stdin). Fail fast instead of
@@ -284,10 +292,7 @@ fn replace_path_templates(path: &str) -> String {
 /// Sitemap harvester: extracts `<loc>https://…</loc>` entries (case-insensitive).
 #[must_use]
 pub fn parse_sitemap_targets(content: &str) -> Vec<String> {
-    use std::sync::OnceLock;
-    static RE: OnceLock<Option<regex::Regex>> = OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"(?i)<loc>\s*(https?://[^<\s]+)\s*</loc>").ok());
-    let Some(re) = re.as_ref() else {
+    let Some(re) = sitemap_loc_regex() else {
         tracing::warn!("sitemap regex unavailable, skipping sitemap parse");
         return Vec::new();
     };

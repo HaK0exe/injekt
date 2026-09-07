@@ -2,6 +2,7 @@
 
 use crate::{
     cli::args::{Cli, Commands, ReconCommands},
+    cli::output::file::write_output_file_sync,
     engine::orchestrator::EngineConfig,
     http::{client::HttpClient, jitter::Jitter, rate_limit::RateLimiter},
     recon::{
@@ -197,20 +198,25 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
     match command {
         ReconCommands::Crawl(args) => {
             let result = run_crawl(&cli, cancel, args).await?;
-            emit_json(&result.report, cli.output.as_deref(), cli.no_redact)?;
+            emit_json(
+                &result.report,
+                cli.output.as_deref(),
+                cli.no_redact,
+                cli.force,
+            )?;
         }
         ReconCommands::Scan(args) => {
             let result = run_scan(&cli, cancel, args).await?;
-            emit_json(&result, cli.output.as_deref(), cli.no_redact)?;
+            emit_json(&result, cli.output.as_deref(), cli.no_redact, cli.force)?;
         }
         ReconCommands::Import(args) => {
             if args.test {
                 let result = run_import(&cli, cancel, args).await?;
-                emit_json(&result, cli.output.as_deref(), cli.no_redact)?;
+                emit_json(&result, cli.output.as_deref(), cli.no_redact, cli.force)?;
             } else {
                 // Offline: list candidates without sending any probes (OPSEC).
                 let candidates = run_import_offline(args, cli.no_redact)?;
-                emit_json(&candidates, cli.output.as_deref(), cli.no_redact)?;
+                emit_json(&candidates, cli.output.as_deref(), cli.no_redact, cli.force)?;
             }
         }
     }
@@ -330,7 +336,13 @@ fn build_client(cli: &Cli) -> anyhow::Result<HttpClient> {
             .collect();
         match parts.as_slice() {
             [mean, standard_deviation] => Jitter::new(*mean, *standard_deviation),
-            _ => Jitter::default(),
+            _ => {
+                tracing::warn!(
+                    value = %value,
+                    "invalid jitter (expected \"mean_ms,std_ms\"), using default 750,250"
+                );
+                Jitter::default()
+            }
         }
     };
     let limiter = Arc::new(RateLimiter::new(cli.effective_rate_limit()));
@@ -373,12 +385,13 @@ fn emit_json<T: serde::Serialize>(
     value: &T,
     path: Option<&str>,
     no_redact: bool,
+    force: bool,
 ) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(value)?;
     if let Some(path) = path {
         let scrubber = crate::session::scrubber::Scrubber::new(no_redact);
         let scrubbed_path = scrubber.scrub(path);
-        crate::cli::output::file::write_output_file_sync(path, &json, false, &scrubbed_path)?;
+        write_output_file_sync(path, &json, force, &scrubbed_path)?;
     } else {
         println!("{json}");
     }
