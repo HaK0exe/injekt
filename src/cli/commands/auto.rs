@@ -6,16 +6,18 @@
 //! * Bare host or `--with-recon` → crawl, then test each discovered candidate.
 //! * Escalation loop (unless `--no-escalate`): L1 as-configured → L2
 //!   (`level ≥ 2` + `space2comment,randomcase`) → L3 (`level 3` + `text-only`
-//!   fallback + `hpp`). Stops at the first step with findings, so clean
-//!   targets pay a single pass and WAF-ish targets get two extra chances.
+//!   fallback + `hpp` + `space2comment,randomcase,charencode,equaltolike`).
+//!   Stops at the first step with findings, so clean targets pay a single
+//!   pass and WAF-ish targets get two extra chances. `base64encode` is never
+//!   auto-enabled: it breaks boolean TRUE/FALSE differentials.
 
 use crate::{
     cli::args::{AutoArgs, Cli},
+    cli::output::file::write_output_file_async,
     engine::orchestrator::{Engine, EngineConfig},
     reporting::{console, json::JsonReport},
     session::scrubber::Scrubber,
 };
-use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
 
 /// One escalation step: label + mutated engine config.
@@ -55,9 +57,12 @@ pub fn escalation_plan(base: &EngineConfig, escalate: bool) -> Vec<EscalationSte
 
     let mut l3 = base.clone();
     l3.level = base.level.max(3);
-    if l3.tampers.len() < 3 {
+    // 4 tampers → 6 transformation sets (`t.len()+2` bound): adds `equaltolike`
+    // (`=`-signature WAFs) orthogonal to the space/encoding coverage. Opaque
+    // tampers (`base64encode`) stay opt-in only — never auto-escalated.
+    if l3.tampers.len() < 4 {
         l3.tampers = crate::techniques::tamper::parse_tamper_list(Some(
-            "space2comment,randomcase,charencode",
+            "space2comment,randomcase,charencode,equaltolike",
         ));
     }
     l3.matcher.text_only = true;
@@ -182,8 +187,9 @@ async fn run_auto_direct(
             vec![],
             total_requests,
         );
-        write_json(out, &report.to_json(&scrubber)).await?;
-        tracing::info!(path = %scrubber.scrub(out), "auto json report written (0o600)");
+        write_output_file_async(out, &report.to_json(&scrubber), cli.force, &scrubber.scrub(out))
+            .await?;
+        tracing::info!(path = %scrubber.scrub(out), "auto json report written (0o600, no overwrite unless --force)");
     }
     Ok(())
 }
@@ -301,8 +307,9 @@ async fn run_auto_recon(
     );
     console::print_findings(&report.findings, &scrubber);
     if let Some(out) = cli.output.as_deref() {
-        let json = serde_json::to_string_pretty(&report)?;
-        write_json(out, &json).await?;
+        let scrubbed = report.scrubbed(&scrubber);
+        let json = serde_json::to_string_pretty(&scrubbed)?;
+        write_output_file_async(out, &json, cli.force, &scrubber.scrub(out)).await?;
     }
     Ok(())
 }
@@ -310,21 +317,14 @@ async fn run_auto_recon(
 fn scrub_candidate(
     c: crate::recon::parameter::ParameterCandidate,
 ) -> crate::recon::parameter::ParameterCandidate {
+    // Intentionally identity pre-scan: scrubbing URLs here (e.g. `[REDACTED]`)
+    // would break testing. Scrubbing happens post-scan via
+    // `DiscoveryReport::scrubbed` before print/write.
     c
 }
 
-async fn write_json(path: &str, json: &str) -> anyhow::Result<()> {
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(path).await?;
-    file.write_all(json.as_bytes()).await?;
-    file.write_all(b"\n").await?;
-    file.sync_all().await?;
-    Ok(())
+async fn write_json(path: &str, json: &str, force: bool, scrubbed_for_log: &str) -> anyhow::Result<()> {
+    write_output_file_async(path, json, force, scrubbed_for_log).await
 }
 
 #[cfg(test)]
@@ -358,6 +358,26 @@ mod tests {
         base.tampers = crate::techniques::tamper::parse_tamper_list(Some("versionedcomment"));
         let steps = escalation_plan(&base, true);
         assert_eq!(steps[1].config.tampers, base.tampers);
+    }
+
+    #[test]
+    fn l3_adds_equaltolike_without_base64() {
+        use crate::techniques::tamper::Tamper;
+        let steps = escalation_plan(&base_config(), true);
+        let l3 = &steps[2].config.tampers;
+        assert!(
+            l3.contains(&Tamper::EqualToLike),
+            "L3 should add equaltolike: {l3:?}"
+        );
+        assert!(
+            !l3.contains(&Tamper::Base64Encode),
+            "base64encode must stay opt-in (breaks boolean differentials): {l3:?}"
+        );
+        // bounded escalation: 4 tampers → 6 sets, not exponential
+        assert_eq!(
+            crate::techniques::tamper::tamper_transformation_sets(l3).len(),
+            l3.len() + 2
+        );
     }
 
     #[test]

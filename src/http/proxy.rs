@@ -53,13 +53,18 @@ impl ProxyConfig {
     /// Returns an error if `input` uses the unsupported `socks5://` scheme
     /// (DNS-leak risk) or otherwise fails to parse as a proxy URL.
     pub fn parse(input: &str) -> Result<Self, ProxyError> {
-        if input.starts_with("socks5://") {
+        let lowered = input.to_ascii_lowercase();
+        if lowered.starts_with("socks5://") {
             return Err(ProxyError::DnsLeak);
         }
-        if input.starts_with("socks5h://") {
+        // Plain `socks://` / `socks4://` are ambiguous (no remote-DNS guarantee).
+        if lowered.starts_with("socks://") || lowered.starts_with("socks4://") {
+            return Err(ProxyError::Invalid(input.to_owned()));
+        }
+        if lowered.starts_with("socks5h://") {
             return Ok(Self::Socks5h(input.to_owned()));
         }
-        if input.starts_with("http://") || input.starts_with("https://") {
+        if lowered.starts_with("http://") || lowered.starts_with("https://") {
             return Ok(Self::Http(input.to_owned()));
         }
         Err(ProxyError::Invalid(input.to_owned()))

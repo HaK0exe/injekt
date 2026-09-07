@@ -2,6 +2,7 @@
 
 use crate::{
     cli::args::{Cli, Commands, ReconCommands},
+    cli::output::file::write_output_file_sync,
     engine::orchestrator::EngineConfig,
     http::{client::HttpClient, jitter::Jitter, rate_limit::RateLimiter},
     recon::{
@@ -11,9 +12,7 @@ use crate::{
     },
 };
 use http::{HeaderName, HeaderValue};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::{io::Write as _, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 /// Result of a recon crawl operation.
@@ -184,20 +183,20 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
     match command {
         ReconCommands::Crawl(args) => {
             let result = run_crawl(&cli, cancel, args).await?;
-            emit_json(&result.report, cli.output.as_deref())?;
+            emit_json(&result.report, cli.output.as_deref(), cli.force)?;
         }
         ReconCommands::Scan(args) => {
             let result = run_scan(&cli, cancel, args).await?;
-            emit_json(&result, cli.output.as_deref())?;
+            emit_json(&result, cli.output.as_deref(), cli.force)?;
         }
         ReconCommands::Import(args) => {
             if args.test {
                 let result = run_import(&cli, cancel, args).await?;
-                emit_json(&result, cli.output.as_deref())?;
+                emit_json(&result, cli.output.as_deref(), cli.force)?;
             } else {
                 // Offline: list candidates without sending any probes (OPSEC).
                 let candidates = run_import_offline(args, cli.no_redact)?;
-                emit_json(&candidates, cli.output.as_deref())?;
+                emit_json(&candidates, cli.output.as_deref(), cli.force)?;
             }
         }
     }
@@ -317,14 +316,21 @@ fn build_client(cli: &Cli) -> anyhow::Result<HttpClient> {
             .collect();
         match parts.as_slice() {
             [mean, standard_deviation] => Jitter::new(*mean, *standard_deviation),
-            _ => Jitter::default(),
+            _ => {
+                tracing::warn!(
+                    value = %value,
+                    "invalid jitter (expected \"mean_ms,std_ms\"), using default 750,250"
+                );
+                Jitter::default()
+            }
         }
     };
     let limiter = Arc::new(RateLimiter::new(cli.effective_rate_limit()));
     let mut builder = HttpClient::builder()
         .timeout(Duration::from_secs(15))
         .jitter(jitter)
-        .rate_limiter(limiter);
+        .rate_limiter(limiter)
+        .allow_private(cli.allow_private);
     if let Some(proxy) = cli.effective_proxy() {
         builder = builder.proxy(crate::http::proxy::ProxyConfig::parse(&proxy)?);
     }
@@ -349,17 +355,10 @@ fn build_client(cli: &Cli) -> anyhow::Result<HttpClient> {
         .map_err(|error| anyhow::anyhow!("client build: {error}"))
 }
 
-fn emit_json<T: serde::Serialize>(value: &T, path: Option<&str>) -> anyhow::Result<()> {
+fn emit_json<T: serde::Serialize>(value: &T, path: Option<&str>, force: bool) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(value)?;
     if let Some(path) = path {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(path)?;
-        file.write_all(json.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
+        write_output_file_sync(path, &json, force, path)?;
     } else {
         println!("{json}");
     }

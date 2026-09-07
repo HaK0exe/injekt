@@ -21,4 +21,13 @@ impl RedirectPolicy {
             Self::Limited(max) => count < *max,
         }
     }
+
+    /// Max hops for manual follow. `None` means "do not follow".
+    #[must_use]
+    pub const fn max_hops(&self) -> Option<usize> {
+        match self {
+            Self::None => None,
+            Self::Limited(max) => Some(*max),
+        }
+    }
 }

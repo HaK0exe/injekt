@@ -14,6 +14,7 @@ fn test_client() -> HttpClient {
         .timeout(Duration::from_secs(5))
         .jitter(Jitter::new(1.0, 0.5).with_min(0))
         .rate_limiter(std::sync::Arc::new(RateLimiter::disabled()))
+        .allow_private(true)
         .build()
         .expect("client build")
 }
@@ -182,6 +183,329 @@ async fn tamper_randomcase_preserves_semantics_case_insensitive() {
         let out = Tamper::RandomCase.apply("SELECT");
         assert_eq!(out.to_ascii_lowercase(), "select");
         assert_eq!(out.len(), 6);
+    }
+}
+
+/// Mock that simulates a WAF blocking literal spaces but allowing the MySQL
+/// dash-comment bypass. The injection point percent-encodes the tamper's
+/// `%0A` into `%250A`, so the mock keys on `--%25`.
+fn dash_waf_responder(req: &wiremock::Request) -> ResponseTemplate {
+    let url = req.url.to_string().to_ascii_lowercase();
+    let baseline = baseline_body();
+    if !url.contains("or") && !url.contains("%27") {
+        return ResponseTemplate::new(200).set_body_string(baseline);
+    }
+    let is_dash = url.contains("--%25");
+    let has_true = url.contains("1%3d1") || url.contains("1=1");
+    let has_false = url.contains("1%3d2") || url.contains("1=2");
+    if is_dash {
+        if has_true && !has_false {
+            return ResponseTemplate::new(200).set_body_string(baseline);
+        }
+        if has_false {
+            return ResponseTemplate::new(200)
+                .set_body_string("dash false branch — completely different content 77 unique");
+        }
+    }
+    ResponseTemplate::new(200).set_body_string(baseline)
+}
+
+#[tokio::test]
+async fn tamper_space2dash_bypasses_waf_boolean() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(dash_waf_responder)
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.threads = 1;
+    cfg.techniques = vec!["boolean".to_owned()];
+    cfg.tampers = vec![Tamper::Space2Dash];
+    cfg.allow_private = true;
+    cfg.no_redact = true;
+    let cancel = CancellationToken::new();
+    let engine = Engine::new(cfg, client, cancel);
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        !findings.is_empty(),
+        "with space2dash tamper should bypass WAF and find boolean, got 0"
+    );
+    let bf = findings
+        .iter()
+        .find(|f| f.technique == injekt::session::state::TechniqueKind::Boolean)
+        .expect("boolean finding");
+    assert!(
+        bf.evidence.contains("space2dash"),
+        "tamper label missing, got {}",
+        bf.evidence
+    );
+}
+
+/// Mock that simulates a WAF stripping `=` comparisons: only `LIKE`-based
+/// injections evaluate. `form_urlencoded` renders spaces as `+`, so the mock
+/// keys on `1+like+1` / `1+like+2`.
+fn like_waf_responder(req: &wiremock::Request) -> ResponseTemplate {
+    let url = req.url.to_string().to_ascii_lowercase();
+    let baseline = baseline_body();
+    if !url.contains("or") && !url.contains("%27") {
+        return ResponseTemplate::new(200).set_body_string(baseline);
+    }
+    if url.contains("like") {
+        if url.contains("1+like+1") && !url.contains("1+like+2") {
+            return ResponseTemplate::new(200).set_body_string(baseline);
+        }
+        if url.contains("1+like+2") {
+            return ResponseTemplate::new(200)
+                .set_body_string("like false branch — completely different content 78 unique");
+        }
+    }
+    ResponseTemplate::new(200).set_body_string(baseline)
+}
+
+#[tokio::test]
+async fn tamper_equaltolike_bypasses_equals_waf_boolean() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(like_waf_responder)
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.threads = 1;
+    cfg.techniques = vec!["boolean".to_owned()];
+    cfg.tampers = vec![Tamper::EqualToLike];
+    cfg.allow_private = true;
+    cfg.no_redact = true;
+    let cancel = CancellationToken::new();
+    let engine = Engine::new(cfg, client, cancel);
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        !findings.is_empty(),
+        "with equaltolike tamper should bypass =-stripping WAF and find boolean, got 0"
+    );
+    let bf = findings
+        .iter()
+        .find(|f| f.technique == injekt::session::state::TechniqueKind::Boolean)
+        .expect("boolean finding");
+    assert!(
+        bf.evidence.contains("equaltolike"),
+        "tamper label missing, got {}",
+        bf.evidence
+    );
+}
+
+#[tokio::test]
+async fn without_equaltolike_equals_waf_blocks_boolean() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(like_waf_responder)
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.threads = 1;
+    cfg.techniques = vec!["boolean".to_owned()];
+    cfg.tampers = Vec::new();
+    cfg.allow_private = true;
+    cfg.no_redact = true;
+    let cancel = CancellationToken::new();
+    let engine = Engine::new(cfg, client, cancel);
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        findings.is_empty(),
+        "without equaltolike, =-stripping WAF should block and yield 0 findings, got {findings:?}"
+    );
+}
+
+/// Mock keyed on any percent-encoded blank (`%25xx` after the injection-point
+/// encoding): simulates a WAF allowing only encoded whitespace.
+fn blank_waf_responder(req: &wiremock::Request) -> ResponseTemplate {
+    let url = req.url.to_string().to_ascii_lowercase();
+    let baseline = baseline_body();
+    if !url.contains("or") && !url.contains("%27") {
+        return ResponseTemplate::new(200).set_body_string(baseline);
+    }
+    let has_true = url.contains("1%3d1") || url.contains("1=1");
+    let has_false = url.contains("1%3d2") || url.contains("1=2");
+    if url.contains("%25") {
+        if has_true && !has_false {
+            return ResponseTemplate::new(200).set_body_string(baseline);
+        }
+        if has_false {
+            return ResponseTemplate::new(200)
+                .set_body_string("blank false branch — completely different content 79 unique");
+        }
+    }
+    ResponseTemplate::new(200).set_body_string(baseline)
+}
+
+#[tokio::test]
+async fn tamper_space2mssqlblank_bypasses_waf_boolean() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(blank_waf_responder)
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.threads = 1;
+    cfg.techniques = vec!["boolean".to_owned()];
+    cfg.tampers = vec![Tamper::Space2MssqlBlank];
+    cfg.allow_private = true;
+    cfg.no_redact = true;
+    let cancel = CancellationToken::new();
+    let engine = Engine::new(cfg, client, cancel);
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        !findings.is_empty(),
+        "with space2mssqlblank tamper should bypass WAF and find boolean, got 0"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.evidence.contains("space2mssqlblank")),
+        "tamper label missing, got {:?}",
+        findings.iter().map(|f| &f.evidence).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn tamper_randomcomments_bypasses_waf_boolean() {
+    // RandomComments always emits `/**/` (single or doubled) per space, so the
+    // existing `**`-keyed WAF mock applies deterministically.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(waf_tamper_responder)
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.threads = 1;
+    cfg.techniques = vec!["boolean".to_owned()];
+    cfg.tampers = vec![Tamper::RandomComments];
+    cfg.allow_private = true;
+    cfg.no_redact = true;
+    let cancel = CancellationToken::new();
+    let engine = Engine::new(cfg, client, cancel);
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        !findings.is_empty(),
+        "with randomcomments tamper should bypass WAF and find boolean, got 0"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.evidence.contains("randomcomments")),
+        "tamper label missing, got {:?}",
+        findings.iter().map(|f| &f.evidence).collect::<Vec<_>>()
+    );
+}
+
+/// Mock keyed on MySQL versioned comments (`50000`): TRUE/FALSE evaluate only
+/// when keywords are wrapped.
+fn versioned_more_waf_responder(req: &wiremock::Request) -> ResponseTemplate {
+    let url = req.url.to_string().to_ascii_lowercase();
+    let baseline = baseline_body();
+    if !url.contains("or") && !url.contains("%27") {
+        return ResponseTemplate::new(200).set_body_string(baseline);
+    }
+    let has_true = url.contains("1%3d1") || url.contains("1=1");
+    let has_false = url.contains("1%3d2") || url.contains("1=2");
+    if url.contains("50000") {
+        if has_true && !has_false {
+            return ResponseTemplate::new(200).set_body_string(baseline);
+        }
+        if has_false {
+            return ResponseTemplate::new(200).set_body_string(
+                "versioned-more false branch — completely different content 80 unique",
+            );
+        }
+    }
+    ResponseTemplate::new(200).set_body_string(baseline)
+}
+
+#[tokio::test]
+async fn tamper_versionedmorekeywords_bypasses_waf_boolean() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(versioned_more_waf_responder)
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.threads = 1;
+    cfg.techniques = vec!["boolean".to_owned()];
+    cfg.tampers = vec![Tamper::VersionedMoreKeywords];
+    cfg.allow_private = true;
+    cfg.no_redact = true;
+    let cancel = CancellationToken::new();
+    let engine = Engine::new(cfg, client, cancel);
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        !findings.is_empty(),
+        "with versionedmorekeywords tamper should bypass WAF and find boolean, got 0"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.evidence.contains("versionedmorekeywords")),
+        "tamper label missing, got {:?}",
+        findings.iter().map(|f| &f.evidence).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn tamper_base64_skipped_for_boolean_without_poisoning() {
+    // `base64encode` is excluded from boolean transformation sets: mixing it
+    // with a working tamper must still bypass via the safe set, and the
+    // finding must never be labelled base64.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(waf_tamper_responder)
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.threads = 1;
+    cfg.techniques = vec!["boolean".to_owned()];
+    cfg.tampers = vec![Tamper::Base64Encode, Tamper::Space2Comment];
+    cfg.allow_private = true;
+    cfg.no_redact = true;
+    let cancel = CancellationToken::new();
+    let engine = Engine::new(cfg, client, cancel);
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        !findings.is_empty(),
+        "safe tamper should still bypass even when base64 is also configured, got 0"
+    );
+    for f in &findings {
+        assert!(
+            !f.evidence.contains("base64"),
+            "boolean finding must never be labelled base64, got {}",
+            f.evidence
+        );
     }
 }
 

@@ -211,18 +211,47 @@ pub fn inject_xml_tag(body: &str, tag: &str, payload: &str) -> Option<String> {
     if bare.is_empty() {
         return None;
     }
-    let pattern = format!(
-        r"<{tag}(?:\s[^>]*)?>([^<]*)</{tag}>",
-        tag = regex::escape(bare)
-    );
-    let re = Regex::new(&pattern).ok()?;
-    let captures = re.captures(body)?;
-    let content = captures.get(1)?;
-    let mut out = String::with_capacity(body.len() + payload.len());
-    out.push_str(&body[..content.start()]);
-    out.push_str(payload);
-    out.push_str(&body[content.end()..]);
-    Some(out)
+    // Regex-free scan (was `Regex::new` per call — hot loop over every
+    // payload × tamper variant). Semantics kept: first `<tag attrs?>content`
+    // with strict `</tag>`, attributes tolerated, self-closers ignored,
+    // content without `<`.
+    let closer = format!("</{bare}>");
+    let mut search_from = 0usize;
+    while let Some(open_rel) = body[search_from..].find('<') {
+        let open_idx = search_from + open_rel;
+        let after_lt = &body[open_idx + 1..];
+        // Must be exactly `<bare` (not `</bare`, not `<barely`).
+        if after_lt.starts_with('/') || !after_lt.starts_with(bare) {
+            search_from = open_idx + 1;
+            continue;
+        }
+        let after_tag = &after_lt[bare.len()..];
+        let first = after_tag.chars().next();
+        if !first.is_some_and(|c| c == '>' || c.is_ascii_whitespace()) {
+            // Longer tag name (`<ab>` when looking for `a`) or `<a/>`.
+            search_from = open_idx + 1;
+            continue;
+        }
+        // End of the opening tag: first `>` (attributes cannot contain `>`).
+        let Some(gt_rel) = after_tag.find('>') else {
+            return None;
+        };
+        let content_start = open_idx + 1 + bare.len() + gt_rel + 1;
+        // Content runs to the next `<` and must be followed by strict `</tag>`.
+        let Some(lt_rel) = body[content_start..].find('<') else {
+            return None;
+        };
+        let content_end = content_start + lt_rel;
+        if body[content_end..].starts_with(&closer) {
+            let mut out = String::with_capacity(body.len() + payload.len());
+            out.push_str(&body[..content_start]);
+            out.push_str(payload);
+            out.push_str(&body[content_end..]);
+            return Some(out);
+        }
+        search_from = content_end + 1;
+    }
+    None
 }
 
 /// Motif d'ouverture `XML` partagé par [`xml_tags`].

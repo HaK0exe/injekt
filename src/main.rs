@@ -51,7 +51,8 @@ async fn main() -> anyhow::Result<()> {
             commands::auto::run(&cli, args, cancel).await?;
         }
         Some(Commands::Init(args)) => {
-            commands::scaffold::run_init(args)?;
+            let force = cli.force;
+            commands::scaffold::run_init(args, force)?;
         }
         Some(Commands::Completions(args)) => {
             commands::scaffold::run_completions(&cli, args)?;

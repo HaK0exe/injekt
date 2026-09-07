@@ -10,10 +10,18 @@
 //! truncated to [`MAX_BULK_TARGETS`].
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use crate::target::bulk::MAX_BULK_TARGETS;
 use crate::target::raw_request::RawRequest;
 use crate::target::url::TargetUrl;
+
+/// `<loc>` harvester compiled once (was `Regex::new` per sitemap file).
+fn sitemap_loc_regex() -> Option<&'static regex::Regex> {
+    static CELL: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    CELL.get_or_init(|| regex::Regex::new(r"(?i)<loc>\s*(https?://[^<\s]+)\s*</loc>").ok())
+        .as_ref()
+}
 
 /// Merge every ingestion source from [`crate::cli::args::Cli`] into one
 /// deduplicated target list.
@@ -257,7 +265,7 @@ fn replace_path_templates(path: &str) -> String {
 #[must_use]
 pub fn parse_sitemap_targets(content: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let Ok(re) = regex::Regex::new(r"(?i)<loc>\s*(https?://[^<\s]+)\s*</loc>") else {
+    let Some(re) = sitemap_loc_regex() else {
         return out;
     };
     for capture in re.captures_iter(content) {

@@ -92,25 +92,22 @@ impl HttpPollVerifier {
         }
     }
 
-    /// Shared client for all polls, or `None` when it cannot be built.
-    fn client(&self) -> Option<&reqwest::Client> {
-        if let Some(c) = self.cached_client.get() {
-            return Some(c);
-        }
-        let built = reqwest::Client::builder()
-            .timeout(core::time::Duration::from_secs(self.timeout_secs))
-            .build()
-            .ok()?;
-        Some(self.cached_client.get_or_init(|| built))
+    /// Shared client for all polls (connection pool kept across the 3
+    /// polls of one OOB test). Built once via a single `get_or_init`.
+    fn client(&self) -> &reqwest::Client {
+        self.cached_client.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(core::time::Duration::from_secs(self.timeout_secs))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
     }
 }
 
 impl OobVerifier for HttpPollVerifier {
     async fn verify(&self, token: &str) -> bool {
         let url = expand_poll_url(&self.poll_url, token);
-        let Some(client) = self.client() else {
-            return false;
-        };
+        let client = self.client();
         let resp = tokio::time::timeout(
             core::time::Duration::from_secs(self.timeout_secs + 2),
             client.get(&url).send(),

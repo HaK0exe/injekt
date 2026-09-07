@@ -22,9 +22,9 @@ techniques = ["all"]
 /// Write a starter `injekt.toml`.
 ///
 /// # Errors
-/// Returns an error when the destination exists without `--force`, the
-/// profile name is unknown, or the file cannot be written.
-pub fn run_init(args: &InitArgs) -> anyhow::Result<()> {
+/// Returns an error when the destination exists without `--force` (global
+/// `Cli::force`), the profile name is unknown, or the file cannot be written.
+pub fn run_init(args: &InitArgs, force: bool) -> anyhow::Result<()> {
     let profile = args.preset.to_ascii_lowercase();
     if !crate::cli::profile::Profile::all_names().contains(&profile.as_str()) {
         anyhow::bail!(
@@ -34,7 +34,7 @@ pub fn run_init(args: &InitArgs) -> anyhow::Result<()> {
         );
     }
     let path = std::path::Path::new(&args.path);
-    if path.exists() && !args.force {
+    if path.exists() && !force {
         anyhow::bail!("{} exists (use --force to overwrite)", path.display());
     }
     if let Some(parent) = path.parent()
@@ -103,9 +103,8 @@ mod tests {
         let args = InitArgs {
             path: "/tmp/injekt-should-not-exist.toml".to_owned(),
             preset: "nope".to_owned(),
-            force: true,
         };
-        assert!(run_init(&args).is_err());
+        assert!(run_init(&args, true).is_err());
     }
 
     #[test]
@@ -114,9 +113,8 @@ mod tests {
         let args = InitArgs {
             path: path.to_string_lossy().into_owned(),
             preset: "stealth".to_owned(),
-            force: true,
         };
-        assert!(run_init(&args).is_ok());
+        assert!(run_init(&args, true).is_ok());
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(content.contains("stealth"));
         let _ = std::fs::remove_file(&path);

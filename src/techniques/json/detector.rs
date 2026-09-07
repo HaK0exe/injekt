@@ -44,7 +44,6 @@ pub struct JsonResult {
 #[derive(Debug)]
 pub struct JsonDetector {
     boolean: BooleanDetector,
-    patterns: Vec<(Regex, String, String)>,
 }
 
 impl Default for JsonDetector {
@@ -53,12 +52,13 @@ impl Default for JsonDetector {
     }
 }
 
-impl JsonDetector {
-    /// # Panics
-    /// Panics if an internal static regex fails to compile (never happens in practice).
-    #[must_use]
-    pub fn new() -> Self {
-        let patterns: Vec<(&str, &str, &str)> = vec![
+/// JSON error signatures compiled once and shared by all detector instances
+/// (was `Regex::new` per `JsonDetector::new()`).
+fn json_patterns() -> &'static [(Regex, &'static str, &'static str)] {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Vec<(Regex, &'static str, &'static str)>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let raw: &[(&str, &str, &str)] = &[
             (r"invalid json text", "mysql_json", "mysql"),
             (
                 r"invalid input syntax for type json",
@@ -77,17 +77,24 @@ impl JsonDetector {
                 "oracle",
             ),
         ];
-        let compiled = patterns
-            .into_iter()
-            .map(|(p, name, dbms)| {
-                #[allow(clippy::expect_used)]
-                let re = Regex::new(&format!("(?i){p}")).expect("static json pattern regex");
-                (re, name.to_owned(), dbms.to_owned())
+        raw.iter()
+            .filter_map(|(p, name, dbms)| {
+                Regex::new(&format!("(?i){p}"))
+                    .ok()
+                    .map(|re| (re, *name, *dbms))
             })
-            .collect();
+            .collect()
+    })
+}
+
+impl JsonDetector {
+    #[must_use]
+    pub fn new() -> Self {
+        // Touch the static so a broken pattern surfaces early in tests
+        // (empty table = error channel inert, never a panic).
+        let _ = json_patterns();
         Self {
             boolean: BooleanDetector::new(),
-            patterns: compiled,
         }
     }
 
@@ -131,14 +138,14 @@ impl JsonDetector {
                 matched_pattern: None,
             };
         }
-        for (re, name, dbms) in &self.patterns {
+        for (re, name, dbms) in json_patterns() {
             if re.is_match(body) {
                 return JsonResult {
                     is_vulnerable: true,
                     confidence: 0.9,
-                    dbms: Some(dbms.clone()),
+                    dbms: Some((*dbms).to_owned()),
                     channel: Some(JsonChannel::Error),
-                    matched_pattern: Some(name.clone()),
+                    matched_pattern: Some((*name).to_owned()),
                 };
             }
         }

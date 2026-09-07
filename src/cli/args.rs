@@ -17,7 +17,7 @@ pub enum TechniqueOpt {
     All,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Clone)]
 #[command(name="injekt", version, about="Modern SQLi detection — zero persistence, anonymisation by design", long_about=None)]
 #[non_exhaustive]
 // Each bool is an independent CLI flag (clap derive); a state-machine/enum
@@ -205,7 +205,7 @@ pub struct Cli {
     #[arg(long, global = true, env = "INJEKT_OOB_WAIT_SECS")]
     pub oob_wait_secs: Option<u64>,
 
-    /// WAF tamper scripts (comma-separated): space2comment,space2plus,randomcase,versionedcomment,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2tab,space2newline,space2randomblank,betweencomment
+    /// WAF tamper scripts (comma-separated): space2comment,space2plus,randomcase,versionedcomment,versionedmorekeywords,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,betweencomment,randomcomments,equaltolike,base64encode (opt-in: breaks boolean differentials)
     #[arg(long, global = true, value_delimiter = ',', env = "INJEKT_TAMPER")]
     pub tamper: Vec<String>,
 
@@ -263,9 +263,94 @@ pub struct Cli {
     /// Suppress the startup banner (written to stderr; stdout stays clean either way)
     #[arg(long, global = true)]
     pub no_banner: bool,
+
+    /// Allow overwriting existing `--output` files and absolute/`..` output
+    /// paths (explicit opt-in, OPSEC-sensitive: reports may contain secrets).
+    #[arg(long, global = true)]
+    pub force: bool,
 }
 
-#[derive(Subcommand, Debug)]
+// Manual `Debug` so `--cookies` / `--proxy` / `--headers` / `--oob-poll-url`
+// never appear in logs, panics or `tracing` records (OPSEC: secrets stay in
+// `SecretString` / scrubbed output only).
+impl core::fmt::Debug for Cli {
+    #[allow(clippy::too_many_lines)]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let redacted_opt = |v: &Option<String>| v.as_ref().map(|_| "[REDACTED]".to_owned());
+        let redacted_headers: Vec<&str> = self.headers.iter().map(|_| "[REDACTED]").collect();
+        f.debug_struct("Cli")
+            .field("command", &self.command)
+            .field("profile", &self.profile)
+            .field("config", &self.config)
+            .field("target", &self.target)
+            .field("bulk_file", &self.bulk_file)
+            .field("method", &self.method)
+            .field("headers", &redacted_headers)
+            .field("cookies", &redacted_opt(&self.cookies))
+            .field("proxy", &redacted_opt(&self.proxy))
+            .field("threads", &self.threads)
+            .field("timeout", &self.timeout)
+            .field("retries", &self.retries)
+            .field("delay", &self.delay)
+            .field("techniques", &self.techniques)
+            .field("params", &self.params)
+            .field("data", &self.data)
+            .field("prefix", &self.prefix)
+            .field("suffix", &self.suffix)
+            .field("safe_chars", &self.safe_chars)
+            .field("skip_urlencode", &self.skip_urlencode)
+            .field("fetch_using", &self.fetch_using)
+            .field("dbms", &self.dbms)
+            .field("extract", &self.extract)
+            .field("dbs", &self.dbs)
+            .field("tables", &self.tables)
+            .field("columns", &self.columns)
+            .field("dump", &self.dump)
+            .field("banner", &self.banner)
+            .field("current_user", &self.current_user)
+            .field("current_db", &self.current_db)
+            .field("hostname", &self.hostname)
+            .field("db", &self.db)
+            .field("table", &self.table)
+            .field("column", &self.column)
+            .field("start", &self.start)
+            .field("stop", &self.stop)
+            .field("count", &self.count)
+            .field("output", &self.output)
+            .field("rate_limit", &self.rate_limit)
+            .field("jitter", &self.jitter)
+            .field("marker", &self.marker)
+            .field("string", &self.string)
+            .field("not_string", &self.not_string)
+            .field("code", &self.code)
+            .field("text_only", &self.text_only)
+            .field("level", &self.level)
+            .field("confirm", &self.confirm)
+            .field("ignore_codes", &self.ignore_codes)
+            .field("oob_domain", &self.oob_domain)
+            .field("oob_poll_url", &redacted_opt(&self.oob_poll_url))
+            .field("oob_wait_secs", &self.oob_wait_secs)
+            .field("tamper", &self.tamper)
+            .field("hpp", &self.hpp)
+            .field("chunked", &self.chunked)
+            .field("export_encrypted", &self.export_encrypted)
+            .field("import", &self.import)
+            .field("no_redact", &self.no_redact)
+            .field("allow_private", &self.allow_private)
+            .field("raw_file", &self.raw_file)
+            .field("raw_dir", &self.raw_dir)
+            .field("stdin", &self.stdin)
+            .field("openapi_file", &self.openapi_file)
+            .field("sitemap_file", &self.sitemap_file)
+            .field("dry_run", &self.dry_run)
+            .field("verbose", &self.verbose)
+            .field("no_banner", &self.no_banner)
+            .field("force", &self.force)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Subcommand, Debug, Clone)]
 #[non_exhaustive]
 pub enum Commands {
     Scan(ScanArgs),
@@ -284,14 +369,14 @@ pub enum Commands {
     Mcp(McpArgs),
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[non_exhaustive]
 pub struct ReconArgs {
     #[command(subcommand)]
     pub command: ReconCommands,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 #[non_exhaustive]
 pub enum ReconCommands {
     /// Crawl a target and print discovered parameters without testing them.
@@ -339,7 +424,7 @@ pub struct ReconImportArgs {
     pub enumerate: bool,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[non_exhaustive]
 pub struct ScanArgs {
     #[arg(long)]
@@ -389,9 +474,9 @@ pub struct InitArgs {
     /// Preset to seed the file with (`quick|balanced|stealth|aggressive`).
     #[arg(long, default_value = "balanced")]
     pub preset: String,
-    /// Overwrite an existing file.
-    #[arg(long)]
-    pub force: bool,
+    // Note: overwrite uses the global `--force` (`Cli::force`), not a
+    // subcommand-local flag, so `injekt init --force` keeps working via the
+    // global arg without a clap duplicate.
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -787,6 +872,7 @@ mod tests {
             dry_run: false,
             verbose: false,
             no_banner: true,
+            force: false,
         }
     }
 
