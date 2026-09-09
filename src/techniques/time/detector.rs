@@ -83,7 +83,7 @@ impl TimeDetector {
         let first = self.evaluate(first_ms, expected_sleep_secs);
         let second = self.evaluate(second_ms, expected_sleep_secs);
         if first.is_vulnerable && second.is_vulnerable {
-            self.evaluate((first_ms + second_ms) / 2.0, expected_sleep_secs)
+            self.evaluate(first_ms.midpoint(second_ms), expected_sleep_secs)
         } else {
             // Negative: report the weaker shot so evidence shows the miss.
             let weaker = first_ms.min(second_ms);
@@ -108,16 +108,19 @@ mod tests {
                 status: 200,
                 body: b"ok".to_vec(),
                 duration: Duration::from_millis(mean_ms),
+                headers: Vec::new(),
             },
             Sample {
                 status: 200,
                 body: b"ok".to_vec(),
                 duration: Duration::from_millis(mean_ms),
+                headers: Vec::new(),
             },
             Sample {
                 status: 200,
                 body: b"ok".to_vec(),
                 duration: Duration::from_millis(mean_ms),
+                headers: Vec::new(),
             },
         ];
         Baseline::new(&samples)
@@ -127,8 +130,8 @@ mod tests {
     fn from_baseline_matches_threshold_ms() {
         let bl = baseline(100);
         let det = TimeDetector::from_baseline(&bl);
-        assert_eq!(det.baseline_mean_ms, bl.mean_ms);
-        assert_eq!(det.baseline_stddev_ms, bl.stddev_ms);
+        assert!((det.baseline_mean_ms - bl.mean_ms).abs() < f64::EPSILON);
+        assert!((det.baseline_stddev_ms - bl.stddev_ms).abs() < f64::EPSILON);
         // Same formula: mean + 2 * max(stddev, 100).
         assert!((det.threshold() - bl.threshold_ms(2.0)).abs() < f64::EPSILON);
     }
@@ -155,7 +158,7 @@ mod tests {
         assert!(ok.is_vulnerable);
         let flaky = det.evaluate_confirmed(3200.0, 120.0, 3.0);
         assert!(!flaky.is_vulnerable);
-        assert_eq!(flaky.confidence, 0.1);
+        assert!((flaky.confidence - 0.1).abs() < f64::EPSILON);
     }
 
     #[test]

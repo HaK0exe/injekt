@@ -121,7 +121,7 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--confirm` | Strict second-pass confirmation: replay each finding's technique on that single parameter in a fresh session, keep only re-confirmed (OOB skipped, ~2× request cost) | `false` |
 | `--ignore-code <LIST>` | Status codes treated as negative probes (e.g. `--ignore-code 429,503`); never yields a finding. Baseline/WAF detection runs **before** this filter and is never ignored | — |
 | `--raw-file <PATH>` | Raw HTTP request file (Burp/ZAP export) — **takes priority over `--target`** (see [Target resolution](#target-resolution)) | — |
-| `--tamper <LIST>` | WAF tampers (19 total, see [Tamper scripts](#tamper-scripts)): `space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,randomcase,versionedcomment,versionedmorekeywords,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,base64encode` (opt-in: breaks boolean differentials) | auto `space2comment` on WAF 403/406 |
+| `--tamper <LIST>` | WAF tampers (19 total, see [Tamper scripts](#tamper-scripts)): `space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,randomcase,versionedcomment,versionedmorekeywords,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,base64encode` (opt-in: breaks boolean differentials) | auto `space2comment` on active WAF blocking |
 | `--hpp` | HTTP Parameter Pollution: duplicate param `?id=1&id=PAYLOAD` (Query/Body) | `false` |
 | `--chunked` | Chunked transfer: streamed `Transfer-Encoding: chunked` body (Body only) | `false` |
 | `--oob-domain <DOMAIN>` | Collaborator base domain (enables OOB probes, **OPT-IN**) | — |
@@ -134,7 +134,7 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--jitter <MEAN,STD>` | **Milliseconds**, e.g. `"750,250"` (750±250ms, floor 200ms) | `750,250` (human jitter is **on by default**, even without the flag) |
 | `--marker <STR>` | Injection marker: `*`, `§`, `{{}}` | auto-detect |
 | `--export-encrypted <PATH>` | Encrypted snapshot (XChaCha20-Poly1305 + Argon2id, **OPT-IN**) | — |
-| `--import <PATH>` | Import encrypted snapshot (resume session) | — |
+| `--import <PATH>` | Legacy flag: rejected by `scan` (use `replay --file` to inspect an export, `recon import --file` for candidates) | — |
 | `--no-redact` | **Disable scrubbing (local debugging only!)** | `false` |
 | `--allow-private` | Allow loopback/private IPs (anti-SSRF bypass, lab only) | `false` |
 | `-v, --verbose` | Debug logs (`tracing` at `debug` level) | `info` |
@@ -171,10 +171,9 @@ injekt --target "https://example.com/?id=1" \
 # Allow private lab targets
 injekt --target "http://192.168.1.10/?id=1" --allow-private
 
-# Encrypted session export/import (OPT-IN)
+# Encrypted session export (OPT-IN) + inspection
 injekt --target "https://example.com/?id=1" --export-encrypted ./session.enc
-injekt --import ./session.enc --target "https://example.com/?id=1"  # resume
-injekt replay --file ./session.enc
+INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc  # decrypt + summary
 
 # Output JSON report
 injekt --target "https://example.com/?id=1" --output report.json
@@ -190,7 +189,7 @@ available to single-payload techniques as explicit opt-in).
 
 | Tamper | Transformation | Typical use |
 |--------|---------------|-------------|
-| `space2comment` | ` ` → `/**/` | Generic WAF bypass; **auto-applied on repeated 403/406** |
+| `space2comment` | ` ` → `/**/` (trailing `-- ...` / `#...` terminators preserved — mangling `-- -` into `--/**/-` would break the comment server-side) | Generic WAF bypass; **auto-applied on active WAF blocking** |
 | `space2plus` | ` ` → `+` | Query-string contexts |
 | `space2tab` | ` ` → `%09` | Whitespace filters |
 | `space2newline` | ` ` → `%0a` | Whitespace filters |
@@ -266,11 +265,11 @@ injekt recon import --file discovered.json --test --enumerate
 | `--test` | Actively scan imported candidates (requires network) |
 | `--enumerate` | Enable enumeration on confirmed findings |
 
-#### `replay` — Encrypted Session Replay
+#### `replay` — Encrypted Session Inspection
 ```bash
-injekt replay --file ./session.enc
+INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
 ```
-Shows basic info about an encrypted session file (size, path). Full resume via `--import`.
+Decrypts an `--export-encrypted` snapshot (`INJEKT_PASSPHRASE` or TTY prompt) and prints a scrubbed summary (findings, request count). Inspection only — re-run `scan --target <url>` to resume testing.
 
 #### `info` — Capability Information
 ```bash
@@ -431,11 +430,8 @@ The `Scrubber` (`src/session/scrubber.rs`) processes all output:
 # Export (prompts for passphrase ≥12 chars, or INJEKT_PASSPHRASE env)
 injekt --target "https://example.com/?id=1" --export-encrypted ./session.enc
 
-# Import (resume session)
-injekt --import ./session.enc --target "https://example.com/?id=1"
-
-# Replay (inspect)
-injekt replay --file ./session.enc
+# Inspect (decrypt + scrubbed summary; not a full scan resume)
+INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
 ```
 - Format: XChaCha20-Poly1305 + Argon2id (v2)
 - File permissions: 0o600 on Unix
@@ -479,7 +475,8 @@ src/
 │   ├── jitter.rs                    # Normal distribution jitter (ms)
 │   └── rate_limit.rs                # Token bucket (default 10/s)
 ├── detection/
-│   ├── baseline.rs                  # 3-5 baselines, SHA-256, WAF 403/406
+│   ├── baseline.rs                  # 3-5 baselines, SHA-256, WAF aggregation
+│   ├── waf.rs                       # WAF/CDN header + challenge fingerprinting
 │   ├── response_diff.rs             # Levenshtein + Jaccard DiffResult
 │   ├── confirmation.rs              # TRUE/FALSE inverted, 3 trials min
 │   ├── matcher.rs                   # MatcherConfig (--string/--not-string/--code/--text-only)
@@ -608,7 +605,7 @@ injekt -u "https://example.com/?id=1" --techniques union --extract --dump
 
 ### WAF Bypass
 ```bash
-# Auto-detect WAF (403/406) → applies space2comment automatically
+# Auto-detect active WAF blocking (403/406 or challenge signals) → applies space2comment
 injekt -u "https://waf.example.com/?id=1"
 
 # Manual tamper chain
@@ -697,11 +694,8 @@ injekt -u "https://example.com/?id=1" \
 # Export (interactive passphrase ≥12 chars)
 injekt -u "https://example.com/?id=1" --export-encrypted session.enc
 
-# Resume later (same target required)
-injekt --import session.enc -u "https://example.com/?id=1"
-
-# Inspect session file
-injekt replay --file session.enc
+# Inspect later (decrypt + scrubbed summary; not a full scan resume)
+INJEKT_PASSPHRASE='...' injekt replay --file session.enc
 ```
 
 ---
@@ -783,10 +777,10 @@ auto-discovered files only warn. `injekt info` lists `profiles`.
 
 1. `--raw-file req.txt` — Burp/ZAP raw request (Host header + path → URL, https tried first).
    Save the raw request (including headers and body) to a file, then:
-   ```bash
-   injekt --raw-file req.txt
-   ```
-   The parser (`src/target/raw_request.rs`) handles multipart and infers Content-Type.
+    ```bash
+    injekt --raw-file req.txt
+    ```
+    The parser (`src/target/raw_request.rs`) replays method + headers + cookies + body; bodies covered: urlencoded, JSON (nested), XML/SOAP, multipart field values. `--raw-dir` bulk ingestion stays URL-only.
 2. Global `-u/--target <URL>`.
 3. `scan --target <URL>` (subcommand-level).
 

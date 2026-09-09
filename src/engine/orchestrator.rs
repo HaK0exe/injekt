@@ -202,6 +202,20 @@ pub struct EngineConfig {
     pub chunked: bool,
     pub allow_private: bool,
     pub no_redact: bool,
+    /// Skip DNS-time SSRF resolution (set when proxy does remote DNS,
+    /// e.g. `socks5h://`): lexical + IP-literal checks still apply.
+    pub remote_dns: bool,
+    /// Explicit `--method` override (e.g. `POST`); wins over raw-file method.
+    pub method_override: Option<String>,
+    /// Explicit `--dbms` hint (`mysql|postgres|mssql|oracle`); narrows
+    /// fingerprint + extraction queries instead of guessing.
+    pub dbms_hint: Option<String>,
+    /// Explicit `--marker` override (`*`, `§`, `{{}}` or combination);
+    /// OR-ed with `MarkerSet::detect` on the target string.
+    pub marker: Option<String>,
+    /// Fused `--raw-file` request (method + headers + cookies + body).
+    /// Takes precedence over recon-candidate synthetics and `--data`.
+    pub raw_request: Option<RawRequest>,
     pub extract: bool,
     pub dbs: bool,
     pub tables: bool,
@@ -277,6 +291,11 @@ impl Default for EngineConfig {
             chunked: false,
             allow_private: false,
             no_redact: false,
+            remote_dns: false,
+            method_override: None,
+            dbms_hint: None,
+            marker: None,
+            raw_request: None,
             extract: false,
             dbs: false,
             tables: false,
@@ -359,9 +378,13 @@ impl Engine {
         }
 
         // Parse (lexical) + DNS-time SSRF check (anti DNS-rebinding).
+        // Skipped when the proxy does remote DNS (`socks5h://`): a local
+        // `lookup_host` would leak the hostname and fail `.onion` names the
+        // proxy could resolve. Lexical + IP-literal checks in `parse` still apply.
         let target = TargetUrl::parse(target_str, self.config.allow_private)
             .map_err(|e| crate::error::InjektError::Other(Box::new(e)))?;
         if !self.config.allow_private
+            && !self.config.remote_dns
             && let Some(host) = target.inner().host_str()
         {
             TargetUrl::resolve_and_check(host, false)
@@ -420,18 +443,30 @@ impl Engine {
         .await;
 
         if self.config.extract {
-            current = EngineState::Extraction;
-            info!(state=?current, "phase extraction — inference (opt-in)");
-            self.run_extraction(
-                &target,
-                target_str,
-                &marker_set,
-                &raw_request,
-                &baseline,
-                &effective_tampers,
-                effective_opts,
-            )
-            .await?;
+            // Gate early (same rule as enumeration): no finding => no oracle.
+            // Prevents hundreds of blind requests on a clean target, in
+            // particular with `--auto-enumerate`.
+            let snap = self.state.read().await.findings().to_vec();
+            if snap.is_empty() {
+                warn!("--extract requested but no confirmed vulnerability was found — skipping");
+            } else if !is_extraction_eligible(&snap) {
+                warn!(
+                    "likely FP, extraction skipped (no boolean-confirmed or error-with-fragment finding)"
+                );
+            } else {
+                current = EngineState::Extraction;
+                info!(state=?current, "phase extraction — inference (opt-in)");
+                self.run_extraction(
+                    &target,
+                    target_str,
+                    &marker_set,
+                    &raw_request,
+                    &baseline,
+                    &effective_tampers,
+                    effective_opts,
+                )
+                .await?;
+            }
         }
 
         // Enumeration phase (--dbs, --tables, --columns, --dump, --count,
@@ -469,24 +504,108 @@ impl Engine {
         Ok(current)
     }
 
-    /// `--data` acts as a synthetic raw request (POST) so body params flow
-    /// through baseline + injection like `--raw-file`. Real raw wins on conflict.
+    /// Fused raw request: `EngineConfig::raw_request` (`--raw-file` + CLI
+    /// overlays) wins, then the recon-candidate synthetic, then `--data`.
+    /// A bare `--method` without any body is carried as a method-only raw so
+    /// baseline + injection preserve it instead of falling back to `GET`.
     fn build_raw_request(
         &self,
         candidate: Option<&crate::recon::ParameterCandidate>,
     ) -> Option<RawRequest> {
-        let cli_raw_request = candidate.map(crate::recon::ParameterCandidate::raw_request);
-        if cli_raw_request.is_some() && self.config.post_data.is_some() {
-            warn!("--raw-file and --data both set — raw request wins, --data ignored");
+        if let Some(mut raw) = self.config.raw_request.clone() {
+            if let Some(m) = self.config.method_override.as_deref() {
+                let m = m.trim();
+                if !m.is_empty() {
+                    raw.method = m.to_ascii_uppercase();
+                }
+            }
+            return Some(raw);
         }
-        cli_raw_request.or_else(|| {
-            let data = self.config.post_data.as_deref()?;
+        let cli_raw_request = candidate.map(crate::recon::ParameterCandidate::raw_request);
+        if let Some(mut raw) = cli_raw_request {
+            if let Some(m) = self.config.method_override.as_deref() {
+                let m = m.trim();
+                if !m.is_empty() {
+                    raw.method = m.to_ascii_uppercase();
+                }
+            }
+            if self.config.post_data.is_some() {
+                warn!("--raw-file and --data both set — raw request wins, --data ignored");
+            }
+            return Some(raw);
+        }
+        if let Some(data) = self.config.post_data.as_deref() {
             let raw = synthetic_raw_from_data(data);
             if raw.is_none() && !data.is_empty() {
                 warn!("--data is blank — scanning without a body");
             }
-            raw
-        })
+            if let Some(mut raw) = raw {
+                if let Some(m) = self.config.method_override.as_deref() {
+                    let m = m.trim();
+                    if !m.is_empty() {
+                        raw.method = m.to_ascii_uppercase();
+                    }
+                }
+                return Some(raw);
+            }
+        }
+        // Bare `--method` (e.g. `--method POST --target <url>`): method carrier.
+        if let Some(m) = self.config.method_override.as_deref() {
+            let m = m.trim().to_ascii_uppercase();
+            if !m.is_empty() {
+                return Some(RawRequest {
+                    method: m,
+                    path: "/".to_owned(),
+                    headers: HashMap::new(),
+                    body: None,
+                    http_version: "HTTP/1.1".to_owned(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Marker set: `MarkerSet::detect(target)` OR-ed with explicit `--marker`.
+    /// Accepts `*`, `§` (or `%c2%a7`), `{{}}` in any combination; unknown
+    /// values warn and fall back to detection alone.
+    fn effective_marker_set(&self, target_str: &str) -> MarkerSet {
+        let mut set = MarkerSet::detect(target_str);
+        if let Some(m) = self.config.marker.as_deref() {
+            let lower = m.to_ascii_lowercase();
+            let mut known = false;
+            if m.contains('*') || lower.contains("%2a") {
+                set.asterisk = true;
+                known = true;
+            }
+            if m.contains('§') || lower.contains("%c2%a7") {
+                set.section = true;
+                known = true;
+            }
+            if m.contains("{{") && m.contains("}}") {
+                set.double_brace = true;
+                known = true;
+            }
+            if !known {
+                warn!(marker=%m, "unknown --marker, ignoring (expected *, § or {{}})");
+            }
+        }
+        set
+    }
+
+    /// Normalized `--dbms` hint as `DbmsKind`, if set and recognized.
+    fn dbms_hint_kind(&self) -> Option<crate::dbms::DbmsKind> {
+        let hint = self.config.dbms_hint.as_deref()?;
+        let v = hint.trim().to_ascii_lowercase();
+        match v.as_str() {
+            "mysql" | "mariadb" | "my" => Some(crate::dbms::DbmsKind::MySql),
+            "postgres" | "postgresql" | "pg" | "pgsql" => Some(crate::dbms::DbmsKind::Postgres),
+            "mssql" | "sqlserver" | "sql-server" | "tsql" => Some(crate::dbms::DbmsKind::MsSql),
+            "oracle" | "ora" => Some(crate::dbms::DbmsKind::Oracle),
+            _ => {
+                warn!(dbms=%hint, "unknown --dbms hint, ignoring (auto-fingerprint)");
+                None
+            }
+        }
     }
 
     /// Collects 3 baseline samples, derives the WAF-aware effective tampers/opts.
@@ -521,6 +640,22 @@ impl Engine {
             match resp {
                 Ok(r) => {
                     let status = r.status().as_u16();
+                    // Clone headers BEFORE the body read consumes the response.
+                    // Values truncated to 128 chars (OPSEC: bounds Set-Cookie
+                    // token retention); WAF detection only needs `contains`.
+                    let raw_headers: Vec<(String, String)> = r
+                        .headers()
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            value.to_str().ok().map(|raw| {
+                                let mut kept = raw.to_owned();
+                                if kept.len() > crate::detection::waf::HEADER_VALUE_KEEP {
+                                    kept.truncate(crate::detection::waf::HEADER_VALUE_KEEP);
+                                }
+                                (name.as_str().to_ascii_lowercase(), kept)
+                            })
+                        })
+                        .collect();
                     let body = match self.client.read_body_with_timeout(r).await {
                         Ok(b) => b,
                         Err(e) => {
@@ -533,6 +668,7 @@ impl Engine {
                         status,
                         body,
                         duration: elapsed,
+                        headers: raw_headers,
                     });
                     self.state.write().await.increment_requests();
                 }
@@ -555,8 +691,19 @@ impl Engine {
         if baseline.is_waf_blocked() {
             warn!("possible WAF detected (repeated 403/406)");
         }
-        // Effective tampers: if WAF blocked and user gave none, auto-enable light bypass
-        let effective_tampers: Vec<Tamper> = if baseline.is_waf_blocked()
+        if baseline.is_waf_suspected() {
+            warn!(
+                vendor=%baseline.waf_vendor.as_deref().unwrap_or("unknown"),
+                hits=%baseline.waf_hits.join(","),
+                blocking=%baseline.is_waf_blocking(),
+                "WAF/CDN fingerprinted from baseline headers/body"
+            );
+        }
+        // Effective tampers: only an active WAF block auto-enables a bypass.
+        // Mere CDN presence (for example `cf-ray` on a normal 200 response)
+        // remains informational and must not alter probe semantics.
+        let effective_tampers: Vec<Tamper> = if (baseline.is_waf_blocked()
+            || baseline.is_waf_blocking())
             && self.config.tampers.is_empty()
         {
             info!(
@@ -588,7 +735,7 @@ impl Engine {
         raw_request: Option<&RawRequest>,
         candidate_param: Option<&TargetParameter>,
     ) -> (MarkerSet, Vec<TargetParameter>) {
-        let marker_set = MarkerSet::detect(target_str);
+        let marker_set = self.effective_marker_set(target_str);
         let mut params = Vec::new();
         // Marker mode: synthetic params, but also test real query params (don't ignore them)
         if marker_set.asterisk {
@@ -713,6 +860,10 @@ impl Engine {
                         .await;
                     }
                     if config.techniques.iter().any(|t| t == "error" || t == "all") {
+                        let boolean_enabled = config
+                            .techniques
+                            .iter()
+                            .any(|t| t == "boolean" || t == "all");
                         test_error_bounded(
                             &client,
                             &state,
@@ -720,6 +871,7 @@ impl Engine {
                             &target,
                             &target_str,
                             &param,
+                            &baseline,
                             &marker_set,
                             raw_request.as_ref().as_ref(),
                             &tampers,
@@ -728,6 +880,7 @@ impl Engine {
                             &config.matcher,
                             config.level,
                             &config.ignore_codes,
+                            boolean_enabled,
                         )
                         .await;
                     }
@@ -909,6 +1062,14 @@ impl Engine {
         if findings_snapshot.is_empty() {
             return;
         }
+        // Explicit `--dbms` hint wins over guessing: fill immediately and skip
+        // active probing (saves requests, honours operator knowledge).
+        if let Some(hint) = self.dbms_hint_kind() {
+            let mut st = self.state.write().await;
+            st.fill_missing_dbms(hint);
+            info!(dbms=%hint, "fingerprint from --dbms hint");
+            return;
+        }
         if let Some(kind) = crate::dbms::fingerprint::guess_from_findings(&findings_snapshot) {
             let mut st = self.state.write().await;
             st.fill_missing_dbms(kind);
@@ -1060,11 +1221,31 @@ impl Engine {
         effective_tampers: &[Tamper],
         effective_opts: ProbeOpts,
     ) -> crate::error::Result<()> {
+        // Gate: unconfirmed 0.55 error findings alone must never trigger the
+        // heavy boolean oracle (~270-700 req into `inference inconsistency`).
+        // Require a boolean finding, an error with `extracted=yes`, or an
+        // error with `bool_confirm=true`. Empty findings never qualify
+        // (early `run_internal` gate already skips, this is defense in depth).
+        {
+            let snap = self.state.read().await.findings().to_vec();
+            if snap.is_empty() {
+                warn!("--extract requested but no findings — skipping");
+                return Ok(());
+            }
+            if !is_extraction_eligible(&snap) {
+                warn!(
+                    "likely FP, extraction skipped (no boolean-confirmed or error-with-fragment finding)"
+                );
+                return Ok(());
+            }
+        }
         // Pick first finding's param as injection point for extraction
         let (first_param, target_for_extract) = self.first_finding_param(target).await;
 
-        // Determine DBMS for extraction query
-        let dbms_kind = {
+        // Determine DBMS for extraction query (`--dbms` hint wins).
+        let dbms_kind = if let Some(hint) = self.dbms_hint_kind() {
+            hint
+        } else {
             let snap = self.state.read().await.findings().to_vec();
             crate::dbms::fingerprint::guess_from_findings(&snap)
                 .unwrap_or(crate::dbms::DbmsKind::MySql)
@@ -1336,10 +1517,12 @@ impl Engine {
         effective_tampers: &[Tamper],
         effective_opts: ProbeOpts,
     ) -> crate::error::Result<()> {
-        // Reuse extraction context
+        // Reuse extraction context (`--dbms` hint wins over guessing).
         let (first_param, target_for_extract) = self.first_finding_param(target).await;
 
-        let dbms_kind = {
+        let dbms_kind = if let Some(hint) = self.dbms_hint_kind() {
+            hint
+        } else {
             let snap = self.state.read().await.findings().to_vec();
             crate::dbms::fingerprint::guess_from_findings(&snap)
                 .unwrap_or(crate::dbms::DbmsKind::MySql)
@@ -1696,6 +1879,50 @@ fn inject_body_param(
         .and_then(|r| Method::from_bytes(r.method.as_bytes()).ok())
         .unwrap_or(Method::POST);
     let existing_body = raw.and_then(|r| r.body.as_deref());
+    // Structured bodies: `json:/a/0/b` and `xml:Tag` params (see
+    // `target::structured`) inject via path/tag helpers so nested JSON and
+    // XML/SOAP flow as valid documents instead of urlencoded noise.
+    // Multipart `name="field"` parts are replaced in place with the boundary
+    // preserved.
+    if let Some(body) = existing_body {
+        let (kind, rest) = crate::target::structured::split_name(&param.name);
+        match kind {
+            crate::target::structured::StructuredKind::Json => {
+                if let Some(injected) =
+                    crate::target::structured::inject_json_path(body, rest, payload)
+                {
+                    return (
+                        method,
+                        injected,
+                        headers_preserving_raw(raw, "application/json"),
+                    );
+                }
+            }
+            crate::target::structured::StructuredKind::Xml => {
+                if let Some(injected) =
+                    crate::target::structured::inject_xml_tag(body, rest, payload)
+                {
+                    let ct = raw
+                        .and_then(|r| r.content_type())
+                        .unwrap_or("application/xml");
+                    let ct_static: &'static str = if ct.to_ascii_lowercase().contains("soap") {
+                        "application/soap+xml"
+                    } else {
+                        "application/xml"
+                    };
+                    return (method, injected, headers_preserving_raw(raw, ct_static));
+                }
+            }
+            crate::target::structured::StructuredKind::Form => {
+                let ct = raw.and_then(|r| r.content_type()).unwrap_or_default();
+                if ct.to_ascii_lowercase().contains("multipart/form-data")
+                    && let Some(injected) = inject_multipart_field(body, &param.name, payload)
+                {
+                    return (method, injected, headers_preserving_raw_keep_ct(raw));
+                }
+            }
+        }
+    }
     // JSON bodies (`--data '{"a":1}'`): replace the key inside the object so
     // blind payloads flow as valid JSON instead of urlencoded noise.
     if let Some(body) = existing_body {
@@ -1819,6 +2046,88 @@ fn inject_body_param(
         }
     }
     (method, body_str, headers)
+}
+
+/// Headers for a structured injection: force `content_type` (JSON/XML) but
+/// preserve every other raw header (cookies, auth, UA). `content-length` is
+/// always dropped (recomputed by the HTTP stack).
+fn headers_preserving_raw(
+    raw: Option<&crate::target::raw_request::RawRequest>,
+    content_type: &'static str,
+) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    if let Ok(v) = http::HeaderValue::from_static(content_type)
+        .to_str()
+        .map(ToOwned::to_owned)
+    {
+        let _ = v;
+    }
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static(content_type),
+    );
+    if let Some(r) = raw {
+        for (k, v) in &r.headers {
+            if k.eq_ignore_ascii_case("content-type") || k.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            if let (Ok(name), Ok(val)) = (
+                http::HeaderName::from_bytes(k.as_bytes()),
+                http::HeaderValue::from_str(v),
+            ) {
+                headers.insert(name, val);
+            }
+        }
+    }
+    headers
+}
+
+/// Headers for a multipart injection: keep the original `Content-Type`
+/// (boundary included) verbatim, drop only `content-length`.
+fn headers_preserving_raw_keep_ct(
+    raw: Option<&crate::target::raw_request::RawRequest>,
+) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    if let Some(r) = raw {
+        for (k, v) in &r.headers {
+            if k.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            if let (Ok(name), Ok(val)) = (
+                http::HeaderName::from_bytes(k.as_bytes()),
+                http::HeaderValue::from_str(v),
+            ) {
+                headers.insert(name, val);
+            }
+        }
+    }
+    headers
+}
+
+/// Replace the value of a `name="field"` multipart part in place, preserving
+/// boundaries and other parts. Returns `None` when the field is absent.
+fn inject_multipart_field(body: &str, field: &str, payload: &str) -> Option<String> {
+    let needle = format!("name=\"{field}\"");
+    let pos = body.find(&needle)?;
+    // Value starts after the part-header blank line following the needle.
+    let after = &body[pos + needle.len()..];
+    let value_start_rel = after
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| after.find("\n\n").map(|i| i + 2))?;
+    let value_start = pos + needle.len() + value_start_rel;
+    // Value ends at the next line starting with `--` (boundary) or end.
+    let rest = &body[value_start..];
+    let value_end_rel = rest.find("\r\n--").map(|i| i + 2).or_else(|| {
+        // `\n--boundary` fallback; keep the leading newline out of the value.
+        rest.find("\n--").map(|i| i + 1)
+    });
+    let value_end = value_end_rel.map_or(body.len(), |rel| value_start + rel);
+    let mut out = String::with_capacity(body.len() + payload.len());
+    out.push_str(&body[..value_start]);
+    out.push_str(payload);
+    out.push_str(&body[value_end..]);
+    Some(out)
 }
 
 fn request_spec_from_raw(target: &TargetUrl, raw: &RawRequest) -> RequestSpec {
@@ -2161,7 +2470,7 @@ async fn test_boolean_bounded(
                 last_t_status = true_status;
                 last_f_status = false_status;
             }
-            let conf = crate::detection::confirmation::confirm(&trials);
+            let (conf, inverted) = crate::detection::confirmation::confirm_either(&trials);
             if conf.confirmed {
                 // Matcher veto gate: `Some(false)` rejects the candidate,
                 // `None` abstains and lets the detector decide.
@@ -2174,7 +2483,7 @@ async fn test_boolean_bounded(
                     detector.evaluate(&baseline_body, "", "", baseline.mean_ms, 0.0, 0.0)
                 });
                 let evidence = format!(
-                    "boolean true_sim={:.2} false_sim={:.2} trials={}/3 fp={:.2} tamper={}{}{}{}",
+                    "boolean true_sim={:.2} false_sim={:.2} trials={}/3 fp={:.2} tamper={}{}{}{}{}",
                     res.true_similarity,
                     res.false_similarity,
                     conf.trials,
@@ -2182,7 +2491,8 @@ async fn test_boolean_bounded(
                     tamper_label,
                     opts.evidence_suffix(),
                     popts.evidence_suffix(),
-                    matcher.evidence_suffix()
+                    matcher.evidence_suffix(),
+                    if inverted { " inverted" } else { "" }
                 );
                 let mut finding = Finding::new(
                     target.as_str(),
@@ -2203,7 +2513,175 @@ async fn test_boolean_bounded(
     }
 }
 
+/// Outcome of the lightweight error→boolean confirmation probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorBoolConfirm {
+    Confirmed,
+    Denied,
+    Inconclusive,
+    Skipped,
+}
+
+impl ErrorBoolConfirm {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "true",
+            Self::Denied => "false",
+            Self::Inconclusive => "inconclusive",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+struct ErrorBoolOutcome {
+    verdict: ErrorBoolConfirm,
+    true_sim: f64,
+    false_sim: f64,
+}
+
+/// Lightweight confirmation for error hits without an extracted fragment
+/// (confidence 0.75): one boolean TRUE/FALSE pair (+2 requests) on the same
+/// parameter, reusing the error-hit tamper set filtered to boolean-safe
+/// tampers. Returns `Skipped` without any request when the boolean technique
+/// is disabled, `Inconclusive` on transport failure/cancel (never scores
+/// `""`), `Denied` on a clean differential or matcher veto.
 #[allow(clippy::too_many_arguments)]
+async fn confirm_error_with_boolean(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    baseline: &baseline::Baseline,
+    baseline_body: &str,
+    marker_set: &MarkerSet,
+    raw: Option<&RawRequest>,
+    trans: &[Tamper],
+    opts: ProbeOpts,
+    popts: &PayloadOpts,
+    matcher: &crate::detection::matcher::MatcherConfig,
+    ignore_codes: &[u16],
+    boolean_enabled: bool,
+) -> ErrorBoolOutcome {
+    const INCONCLUSIVE: ErrorBoolOutcome = ErrorBoolOutcome {
+        verdict: ErrorBoolConfirm::Inconclusive,
+        true_sim: 0.0,
+        false_sim: 0.0,
+    };
+    if !boolean_enabled {
+        return ErrorBoolOutcome {
+            verdict: ErrorBoolConfirm::Skipped,
+            true_sim: 0.0,
+            false_sim: 0.0,
+        };
+    }
+    if cancel.is_cancelled() {
+        return INCONCLUSIVE;
+    }
+    let pairs = boolean_payloads_for(None);
+    let Some(pair) = pairs.first() else {
+        return INCONCLUSIVE;
+    };
+    // Keep the WAF-bypass coherence (e.g. auto space2comment) without breaking
+    // the TRUE/FALSE differential: drop opaque tampers like base64encode.
+    let safe_trans: Vec<Tamper> = trans
+        .iter()
+        .filter(|t| t.is_boolean_safe())
+        .cloned()
+        .collect();
+    let true_payload = build_final_payload(&pair.true_payload, &safe_trans, popts);
+    let false_payload = build_final_payload(&pair.false_payload, &safe_trans, popts);
+    let (true_raw, true_ms, true_status) = fetch_for_payload(
+        client,
+        state,
+        cancel,
+        target,
+        target_str,
+        param,
+        &true_payload,
+        marker_set,
+        raw,
+        opts,
+        popts,
+    )
+    .await;
+    if cancel.is_cancelled() {
+        return INCONCLUSIVE;
+    }
+    let (false_raw, false_ms, false_status) = fetch_for_payload(
+        client,
+        state,
+        cancel,
+        target,
+        target_str,
+        param,
+        &false_payload,
+        marker_set,
+        raw,
+        opts,
+        popts,
+    )
+    .await;
+    // Transport/body failures are never scored as `""` — inconclusive, not denied.
+    if true_status == 0 || false_status == 0 {
+        return INCONCLUSIVE;
+    }
+    if is_ignored(true_status, ignore_codes) || is_ignored(false_status, ignore_codes) {
+        return ErrorBoolOutcome {
+            verdict: ErrorBoolConfirm::Denied,
+            true_sim: 0.0,
+            false_sim: 1.0,
+        };
+    }
+    let true_body = matcher.pre_process(&true_raw);
+    let false_body = matcher.pre_process(&false_raw);
+    let res = BooleanDetector::new().evaluate(
+        baseline_body,
+        &true_body,
+        &false_body,
+        baseline.mean_ms,
+        true_ms,
+        false_ms,
+    );
+    if matcher.gate_boolean(&true_body, &false_body, true_status, false_status) == Some(false) {
+        return ErrorBoolOutcome {
+            verdict: ErrorBoolConfirm::Denied,
+            true_sim: res.true_similarity,
+            false_sim: res.false_similarity,
+        };
+    }
+    if res.is_vulnerable && res.confidence > 0.6 {
+        ErrorBoolOutcome {
+            verdict: ErrorBoolConfirm::Confirmed,
+            true_sim: res.true_similarity,
+            false_sim: res.false_similarity,
+        }
+    } else {
+        ErrorBoolOutcome {
+            verdict: ErrorBoolConfirm::Denied,
+            true_sim: res.true_similarity,
+            false_sim: res.false_similarity,
+        }
+    }
+}
+
+/// `true` when at least one finding justifies the heavy boolean-oracle
+/// extraction: an existing boolean finding, or an error finding with an
+/// extracted fragment (`extracted=yes`) or a confirmed boolean differential
+/// (`bool_confirm=true`). Unconfirmed 0.55 error findings alone never qualify
+/// — they would burn ~270-700 requests into `inference inconsistency`.
+#[must_use]
+fn is_extraction_eligible(findings: &[Finding]) -> bool {
+    findings.iter().any(|f| {
+        f.technique == TechniqueKind::Boolean
+            || (f.technique == TechniqueKind::Error
+                && (f.evidence.contains("extracted=yes")
+                    || f.evidence.contains("bool_confirm=true")))
+    })
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn test_error_bounded(
     client: &HttpClient,
     state: &Arc<RwLock<SessionState>>,
@@ -2211,6 +2689,7 @@ async fn test_error_bounded(
     target: &TargetUrl,
     target_str: &str,
     param: &TargetParameter,
+    baseline: &baseline::Baseline,
     marker_set: &MarkerSet,
     raw: Option<&RawRequest>,
     tampers: &[Tamper],
@@ -2219,10 +2698,17 @@ async fn test_error_bounded(
     matcher: &crate::detection::matcher::MatcherConfig,
     level: u8,
     ignore_codes: &[u16],
+    boolean_enabled: bool,
 ) {
+    use crate::techniques::error::detector::is_payload_reflected;
+
     let detector = ErrorDetector::new();
     let payloads = crate::techniques::error::payloads::error_payloads_for(None);
     let tamper_sets = tamper_transformation_sets(tampers);
+    // Baseline evaluated once per parameter: vetoes footer/banner FPs
+    // (e.g. verbose `MySQL 5.7` footer already present without injection).
+    let baseline_body = matcher.pre_process(&baseline.representative_body_str());
+    let baseline_len = baseline_body.len();
     for p in payloads
         .iter()
         .take(payload_budget(level, 2, payloads.len()))
@@ -2241,12 +2727,21 @@ async fn test_error_bounded(
                 popts,
             )
             .await;
+            // Transport/body errors surface as status 0 + `""`: never scored
+            // (empty body would otherwise be a dissimilar-body FP elsewhere,
+            // and an error pattern can never match it anyway — skip fast).
+            if status == 0 {
+                continue;
+            }
             let body = matcher.pre_process(&raw_body);
             // `--ignore-code`: an ignored status is skipped, never a finding.
             if is_ignored(status, ignore_codes) {
                 continue;
             }
-            let r = detector.evaluate(&body);
+            // Context-aware gate: baseline veto + reflected-payload masking.
+            // Kills the noxtools FP shape where `EXTRACTVALUE` is merely
+            // echoed in `value="...payload..."` with no DB error.
+            let r = detector.evaluate_with_context(&baseline_body, &body, &tampered);
             if r.is_vulnerable {
                 // Matcher veto gate: `Some(false)` rejects the candidate.
                 if matcher.matches(&body, status) == Some(false) {
@@ -2261,15 +2756,88 @@ async fn test_error_bounded(
                         .collect::<Vec<_>>()
                         .join(",")
                 };
+                let reflected = is_payload_reflected(&body, &tampered);
+                let extracted_flag = if r.extracted.is_some() { "yes" } else { "no" };
+                // Confirmation policy: a hit WITH an extracted fragment (0.9)
+                // is self-sufficient — push direct with no extra requests.
+                // A hit WITHOUT fragment (0.75) gets one boolean TRUE/FALSE
+                // pair (+2 req): confirmed upgrades to 0.9, otherwise the
+                // finding is kept degraded at 0.55 `unconfirmed` and barred
+                // from the heavy extraction oracle (see
+                // `is_extraction_eligible`).
+                let (confidence, bool_confirm, true_sim, false_sim, unconfirmed) =
+                    if r.extracted.is_some() {
+                        (
+                            r.confidence,
+                            "skipped(fragment)".to_owned(),
+                            0.0,
+                            0.0,
+                            false,
+                        )
+                    } else {
+                        let outcome = confirm_error_with_boolean(
+                            client,
+                            state,
+                            cancel,
+                            target,
+                            target_str,
+                            param,
+                            baseline,
+                            &baseline_body,
+                            marker_set,
+                            raw,
+                            trans,
+                            opts,
+                            popts,
+                            matcher,
+                            ignore_codes,
+                            boolean_enabled,
+                        )
+                        .await;
+                        match outcome.verdict {
+                            ErrorBoolConfirm::Confirmed => (
+                                0.9,
+                                ErrorBoolConfirm::Confirmed.as_str().to_owned(),
+                                outcome.true_sim,
+                                outcome.false_sim,
+                                false,
+                            ),
+                            ErrorBoolConfirm::Denied
+                            | ErrorBoolConfirm::Inconclusive
+                            | ErrorBoolConfirm::Skipped => (
+                                0.55,
+                                format!("{} unconfirmed", outcome.verdict.as_str()),
+                                outcome.true_sim,
+                                outcome.false_sim,
+                                true,
+                            ),
+                        }
+                    };
                 let mut finding = Finding::new(
                     target.as_str(),
                     param.key(),
                     TechniqueKind::Error,
-                    r.confidence,
+                    if baseline.is_waf_blocking() {
+                        // A blocking WAF (challenge/deny/rate-limit) silently
+                        // filters long payloads: doubt the pattern (0.9→0.6)
+                        // instead of trusting it blindly (noxtools lesson).
+                        crate::detection::waf::downgrade_for_waf(confidence)
+                    } else {
+                        confidence
+                    },
                     format!(
-                        "error pattern {:?} tamper={}{}{}{}",
+                        "error pattern {:?} tamper={} baseline_len={} injected_len={} reflected={} extracted={} bool_confirm={} true_sim={:.2} false_sim={:.2}{}{}{}{}{}",
                         r.matched_pattern,
                         tamper_label,
+                        baseline_len,
+                        body.len(),
+                        reflected,
+                        extracted_flag,
+                        bool_confirm,
+                        true_sim,
+                        false_sim,
+                        if unconfirmed { " unconfirmed" } else { "" },
+                        baseline.waf_evidence_suffix(),
                         opts.evidence_suffix(),
                         popts.evidence_suffix(),
                         matcher.evidence_suffix()
@@ -2896,7 +3464,7 @@ async fn test_json_bounded(
                 last_t_status = true_status;
                 last_f_status = false_status;
             }
-            let conf = crate::detection::confirmation::confirm(&trials);
+            let (conf, inverted) = crate::detection::confirmation::confirm_either(&trials);
             if conf.confirmed {
                 // Matcher veto gate: `Some(false)` rejects the candidate.
                 if matcher.gate_boolean(&last_true, &last_false, last_t_status, last_f_status)
@@ -2913,7 +3481,7 @@ async fn test_json_bounded(
                     TechniqueKind::Json,
                     conf.score,
                     format!(
-                        "json channel=boolean dbms={} true_sim={:.2} false_sim={:.2} trials={}/3 fp={:.2} tamper={}{}{}{}",
+                        "json channel=boolean dbms={} true_sim={:.2} false_sim={:.2} trials={}/3 fp={:.2} tamper={}{}{}{}{}",
                         p.dbms,
                         res.true_similarity,
                         res.false_similarity,
@@ -2922,7 +3490,8 @@ async fn test_json_bounded(
                         tamper_label,
                         opts.evidence_suffix(),
                         popts.evidence_suffix(),
-                        matcher.evidence_suffix()
+                        matcher.evidence_suffix(),
+                        if inverted { " inverted" } else { "" }
                     ),
                 );
                 finding.dbms = Some(p.dbms.clone());

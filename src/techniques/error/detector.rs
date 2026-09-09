@@ -34,11 +34,11 @@ impl ErrorDetector {
     #[must_use]
     pub fn new() -> Self {
         let patterns = vec![
-            // MySQL XPATH channel: EXTRACTVALUE legacy + UPDATEXML variant.
-            (
-                r"(?i)XPATH syntax error|EXTRACTVALUE|UPDATEXML",
-                "mysql_xpath",
-            ),
+            // MySQL XPATH strong: real DB error string. Requires the
+            // `XPATH syntax error` phrase — a bare `EXTRACTVALUE` keyword is
+            // NOT enough (it self-matches when the app reflects the payload
+            // verbatim in `value="...payload..."`, cf. noxtools FP).
+            (r"(?i)XPATH syntax error", "mysql_xpath"),
             // MySQL generic: syntax + BIGINT overflow (EXP) + JSON_KEYS.
             (
                 r"(?i)SQL syntax.*MySQL|mysql_fetch|valid MySQL result|BIGINT UNSIGNED value is out of range|DOUBLE value is out of range|JSON_KEYS|invalid JSON text",
@@ -94,13 +94,30 @@ impl ErrorDetector {
         for (re, name) in &self.patterns {
             if re.is_match(body) {
                 let extracted = extract_version(body);
+                // Strong error phrase with a quoted version fragment is a
+                // confirmed error-based signal (0.9). Same phrase without an
+                // extractable fragment is weaker (0.75) — still reported but
+                // flagged for boolean confirmation downstream.
+                let confidence = if extracted.is_some() { 0.9 } else { 0.75 };
                 return ErrorResult {
                     is_vulnerable: true,
-                    confidence: 0.9,
+                    confidence,
                     matched_pattern: Some(name.clone()),
                     extracted,
                 };
             }
+        }
+        // Weak-only: bare EXTRACTVALUE/UPDATEXML keyword with NO `XPATH
+        // syntax error` phrase. This is the noxtools FP shape — the app
+        // reflects the payload verbatim (`value="...extractvalue...">`)
+        // without any DB error. Never a finding on its own.
+        if contains_xpath_keyword(body) {
+            return ErrorResult {
+                is_vulnerable: false,
+                confidence: 0.3,
+                matched_pattern: Some("mysql_xpath_reflected".to_owned()),
+                extracted: None,
+            };
         }
         ErrorResult {
             is_vulnerable: false,
@@ -108,6 +125,149 @@ impl ErrorDetector {
             matched_pattern: None,
             extracted: None,
         }
+    }
+
+    /// Context-aware evaluation: baseline veto + reflected-payload masking.
+    ///
+    /// - If the baseline already matches an error pattern, the candidate is
+    ///   not a new signal (footer/banner FP) → not vulnerable.
+    /// - If the candidate only matches because the sent payload is reflected
+    ///   verbatim, masking the reflection removes the match → not vulnerable.
+    /// - Otherwise delegates to [`Self::evaluate`] on the masked body so the
+    ///   returned `extracted` fragment provably comes from DB output, not
+    ///   from the echoed payload.
+    #[must_use]
+    pub fn evaluate_with_context(
+        &self,
+        baseline_body: &str,
+        candidate_body: &str,
+        sent_payload: &str,
+    ) -> ErrorResult {
+        let raw = self.evaluate(candidate_body);
+        if !raw.is_vulnerable {
+            return raw;
+        }
+        // Baseline veto: same error already present without injection
+        // (e.g. verbose footer `MySQL 5.7`, generic `SQL error` template).
+        if self.evaluate(baseline_body).is_vulnerable {
+            return ErrorResult {
+                is_vulnerable: false,
+                confidence: 0.15,
+                matched_pattern: raw.matched_pattern.map(|p| format!("baseline_veto:{p}")),
+                extracted: None,
+            };
+        }
+        if sent_payload.is_empty() {
+            return raw;
+        }
+        let masked = mask_reflected(candidate_body, sent_payload);
+        // Avoid an extra regex pass when nothing was reflected.
+        if masked.len() == candidate_body.len() {
+            return raw;
+        }
+        let masked_res = self.evaluate(&masked);
+        if !masked_res.is_vulnerable {
+            return ErrorResult {
+                is_vulnerable: false,
+                confidence: 0.25,
+                matched_pattern: raw.matched_pattern.map(|p| format!("reflected:{p}")),
+                extracted: None,
+            };
+        }
+        masked_res
+    }
+}
+
+/// Bare `EXTRACTVALUE` / `UPDATEXML` keyword probe (case-insensitive).
+/// Used to distinguish a reflected payload echo from a real `XPATH syntax
+/// error` DB message.
+#[must_use]
+pub fn contains_xpath_keyword(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("extractvalue") || lower.contains("updatexml")
+}
+
+/// Case-insensitive check whether the sent payload is reflected verbatim
+/// (or HTML-entity encoded) in the response body. Used for evidence only;
+/// the veto itself goes through [`mask_reflected`].
+#[must_use]
+pub fn is_payload_reflected(body: &str, sent_payload: &str) -> bool {
+    if sent_payload.is_empty() || body.is_empty() {
+        return false;
+    }
+    let body_lower = body.to_ascii_lowercase();
+    let payload_lower = sent_payload.to_ascii_lowercase();
+    if body_lower.contains(&payload_lower) {
+        return true;
+    }
+    // Token-level fallback: server may truncate/escape the full payload but
+    // still echo the distinctive function name (observed noxtools shape:
+    // `value="...extractvalue(1,concat(0x7e,version()))..."`).
+    for token in ["extractvalue", "updatexml"] {
+        if payload_lower.contains(token) && body_lower.contains(token) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Remove case-insensitive occurrences of the sent payload (plus common
+/// HTML-entity encoded variants) from the response body.
+///
+/// The error detector must never match its own echoed payload: a response
+/// like `<input value="' AND EXTRACTVALUE...">` contains the keyword but no
+/// DB error. Masking before matching turns that FP into a clean negative
+/// while preserving a real `XPATH syntax error: '~5.7~'` fragment (which is
+/// DB output, not part of the sent payload).
+#[must_use]
+pub fn mask_reflected(body: &str, sent_payload: &str) -> String {
+    if sent_payload.is_empty() || body.is_empty() {
+        return body.to_owned();
+    }
+    let variants = payload_variants(sent_payload);
+    let mut out = body.to_owned();
+    for variant in &variants {
+        if variant.is_empty() {
+            continue;
+        }
+        out = case_insensitive_remove(&out, variant);
+        if out.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
+/// Original payload plus HTML-entity encoded reflections
+/// (`htmlspecialchars`-style echo in `value="..."` attributes).
+fn payload_variants(payload: &str) -> Vec<String> {
+    let mut variants = Vec::with_capacity(3);
+    variants.push(payload.to_owned());
+    // `&` first to avoid double-encoding.
+    let html = payload
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;");
+    if html != payload {
+        variants.push(html);
+    }
+    let html39 = payload.replace('&', "&amp;").replace('\'', "&#39;");
+    if html39 != payload && !variants.contains(&html39) {
+        variants.push(html39);
+    }
+    variants
+}
+
+/// Case-insensitive removal of `needle` from `haystack` via an escaped
+/// regex. Falls back to the unmodified body if the regex fails to compile
+/// (arbitrary payload input must never panic the detector).
+fn case_insensitive_remove(haystack: &str, needle: &str) -> String {
+    let pattern = format!("(?i){}", regex::escape(needle));
+    match Regex::new(&pattern) {
+        Ok(re) => re.replace_all(haystack, "").into_owned(),
+        Err(_) => haystack.to_owned(),
     }
 }
 
@@ -347,5 +507,108 @@ mod tests {
         let dbg = format!("{r:?}");
         // SecretString Debug must not leak the raw banner fragment.
         assert!(!dbg.contains("secret-banner-xyz"), "{dbg}");
+    }
+
+    #[test]
+    fn bare_extractvalue_keyword_is_not_a_finding() {
+        // noxtools FP: payload echoed verbatim, no DB error phrase.
+        let d = ErrorDetector::new();
+        let r = d.evaluate("' AND EXTRACTVALUE(1,CONCAT(0x7e,@@version)) -- -");
+        assert!(
+            !r.is_vulnerable,
+            "bare keyword must not be vulnerable: {r:?}"
+        );
+        assert!(r.confidence < 0.6, "weak signal only: {r:?}");
+        assert_eq!(r.matched_pattern.as_deref(), Some("mysql_xpath_reflected"));
+    }
+
+    #[test]
+    fn bare_updatexml_keyword_is_not_a_finding() {
+        let d = ErrorDetector::new();
+        let r = d.evaluate("' AND UPDATEXML(1,CONCAT(0x7e,@@version,0x7e),1) -- -");
+        assert!(!r.is_vulnerable, "{r:?}");
+    }
+
+    #[test]
+    fn reflected_payload_echo_is_not_a_finding() {
+        // Exact noxtools shape: `value="...payload..."` attribute echo.
+        let d = ErrorDetector::new();
+        let payload = "' AND EXTRACTVALUE(1,CONCAT(0x7e,@@version)) -- -";
+        let body = format!(
+            r#"<input name="amember_login" value="{payload}" autocomplete="username" /><div class="alert alert-error"></div>"#
+        );
+        let r = d.evaluate_with_context("<html>login baseline</html>", &body, payload);
+        assert!(!r.is_vulnerable, "reflected echo must veto: {r:?}");
+        // Two valid non-vulnerable outcomes: weak direct (`mysql_xpath_reflected`
+        // when the echo is the only signal) or masked veto (`reflected:...`
+        // when a strong pattern collapses after masking).
+        assert!(
+            r.matched_pattern
+                .as_deref()
+                .is_some_and(|p| p == "mysql_xpath_reflected" || p.starts_with("reflected:")),
+            "veto reason must be visible: {r:?}"
+        );
+    }
+
+    #[test]
+    fn reflected_strong_phrase_is_vetoed_after_masking() {
+        // Attacker-controlled `XPATH syntax error` string echoed without DB.
+        let d = ErrorDetector::new();
+        let payload = "XPATH syntax error";
+        let body = format!(r#"<input value="{payload}" /><div>normal</div>"#);
+        let r = d.evaluate_with_context("<html>baseline</html>", &body, payload);
+        assert!(!r.is_vulnerable, "{r:?}");
+        assert_eq!(r.matched_pattern.as_deref(), Some("reflected:mysql_xpath"));
+    }
+
+    #[test]
+    fn real_xpath_error_survives_masking() {
+        let d = ErrorDetector::new();
+        let payload = "' AND EXTRACTVALUE(1,CONCAT(0x7e,@@version)) -- -";
+        let body = format!(r#"<input value="{payload}" />XPATH syntax error: '~5.7.32~'"#);
+        let r = d.evaluate_with_context("<html>login baseline</html>", &body, payload);
+        assert!(r.is_vulnerable, "real DB error must survive masking: {r:?}");
+        assert_eq!(r.matched_pattern.as_deref(), Some("mysql_xpath"));
+        assert!(
+            exposed(&r).is_some_and(|e| e.contains("5.7.32")),
+            "version fragment must come from DB output: {r:?}"
+        );
+    }
+
+    #[test]
+    fn baseline_error_vetoes_footer_fp() {
+        let d = ErrorDetector::new();
+        let baseline = "Powered by MySQL 5.7.32 community footer";
+        let candidate = "Powered by MySQL 5.7.32 community footer";
+        let r = d.evaluate_with_context(baseline, candidate, "' AND 1=1 -- -");
+        assert!(!r.is_vulnerable, "baseline error is not new signal: {r:?}");
+        assert!(
+            r.matched_pattern
+                .as_deref()
+                .is_some_and(|p| p.starts_with("baseline_veto:")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn xpath_without_quoted_value_is_downgraded() {
+        let d = ErrorDetector::new();
+        let r = d.evaluate("XPATH syntax error occurred");
+        assert!(r.is_vulnerable);
+        assert!(
+            (r.confidence - 0.75).abs() < f64::EPSILON,
+            "strong phrase without fragment is 0.75, got {}",
+            r.confidence
+        );
+    }
+
+    #[test]
+    fn mask_reflected_is_case_insensitive_and_html_aware() {
+        let payload = "' AND EXTRACTVALUE(1,CONCAT(0x7e,@@version)) -- -";
+        let body = r#"<input value="' AND extractvalue(1,concat(0x7e,@@version)) -- -" />"#;
+        let masked = mask_reflected(body, payload);
+        assert!(!contains_xpath_keyword(&masked), "masked: {masked}");
+        assert!(is_payload_reflected(body, payload));
+        assert!(!is_payload_reflected("<html>clean</html>", payload));
     }
 }

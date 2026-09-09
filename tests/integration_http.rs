@@ -169,16 +169,19 @@ async fn baseline_waf_detection() {
             status: 403,
             body: b"blocked".to_vec(),
             duration: Duration::from_millis(50),
+            headers: Vec::new(),
         },
         Sample {
             status: 403,
             body: b"blocked".to_vec(),
             duration: Duration::from_millis(55),
+            headers: Vec::new(),
         },
         Sample {
             status: 200,
             body: b"ok".to_vec(),
             duration: Duration::from_millis(52),
+            headers: Vec::new(),
         },
     ];
     let bl = Baseline::new(&samples);

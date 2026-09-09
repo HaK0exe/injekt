@@ -1,0 +1,108 @@
+# bench/docker-compose.yml — Phase 1 lab (local dev).
+# Official runs use the same file on a dedicated runner; digests are frozen
+# in bench/versions.lock (`python3 runner/run.py pin`).
+#
+# Ports (host): app 8000 · waf-pl1 8081 · waf-pl2 8082 · mysql 3306 ·
+#               postgres 5432 · mssql 1433
+# Targets need injekt --allow-private (loopback/private anti-SSRF bypass).
+
+services:
+  app:
+    build: ./app
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_USER: bench
+      MYSQL_PASSWORD: bench
+      MYSQL_DB: bench
+      PG_HOST: postgres
+      PG_USER: bench
+      PG_PASSWORD: bench
+      PG_DB: bench
+      MSSQL_HOST: mssql
+      MSSQL_USER: sa
+      MSSQL_PASSWORD: Bench-P4ssw0rd!
+      MSSQL_DB: bench
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mssql:
+        condition: service_started
+    networks: [benchnet]
+    ports: ["8000:8000"]
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: bench
+      MYSQL_USER: bench
+      MYSQL_PASSWORD: bench
+    volumes:
+      - ./db/mysql/seed.sql:/docker-entrypoint-initdb.d/01-seed.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [benchnet]
+    ports: ["3306:3306"]
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: bench
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+    volumes:
+      - ./db/pg/seed.sql:/docker-entrypoint-initdb.d/01-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bench -d bench"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [benchnet]
+    ports: ["5432:5432"]
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: Bench-P4ssw0rd!
+      MSSQL_PID: Developer
+    volumes:
+      - ./db/mssql/seed.sql:/seed/seed.sql:ro
+    networks: [benchnet]
+    ports: ["1433:1433"]
+
+  # A6 — ModSecurity CRS paranoia 1 (bypass léger)
+  waf-pl1:
+    image: owasp/modsecurity-crs:nginx
+    environment:
+      BACKEND: http://app:8000
+      PORT: "8080"
+      MODSEC_RULE_ENGINE: "On"
+      PARANOIA: "1"
+      BLOCKING_PARANOIA: "1"
+      ANOMALY_INBOUND: "5"
+    depends_on: [app]
+    networks: [benchnet]
+    ports: ["8081:8080"]
+
+  # A7 — ModSecurity CRS paranoia 2 (bypass dur)
+  waf-pl2:
+    image: owasp/modsecurity-crs:nginx
+    environment:
+      BACKEND: http://app:8000
+      PORT: "8080"
+      MODSEC_RULE_ENGINE: "On"
+      PARANOIA: "2"
+      BLOCKING_PARANOIA: "2"
+      ANOMALY_INBOUND: "5"
+    depends_on: [app]
+    networks: [benchnet]
+    ports: ["8082:8080"]
+
+networks:
+  benchnet:

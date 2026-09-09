@@ -69,6 +69,10 @@ pub struct ClientBuilder<State> {
     retry: RetryPolicy,
     redirect_policy: RedirectPolicy,
     extra_headers: HeaderMap,
+    /// Operator-supplied headers (`--headers` / `--cookies`): per-request,
+    /// same-origin only — never `default_headers`, so a cross-host redirect
+    /// cannot leak `Authorization` / `Cookie` to the redirect target.
+    user_headers: HeaderMap,
     allow_private: bool,
     _state: core::marker::PhantomData<State>,
 }
@@ -86,6 +90,7 @@ impl ClientBuilder<NeedTimeout> {
             retry: RetryPolicy::default(),
             redirect_policy: RedirectPolicy::default(),
             extra_headers: HeaderMap::new(),
+            user_headers: HeaderMap::new(),
             allow_private: false,
             _state: core::marker::PhantomData,
         }
@@ -103,6 +108,7 @@ impl ClientBuilder<NeedTimeout> {
             retry: self.retry,
             redirect_policy: self.redirect_policy,
             extra_headers: self.extra_headers,
+            user_headers: self.user_headers,
             allow_private: self.allow_private,
             _state: core::marker::PhantomData,
         }
@@ -167,6 +173,15 @@ impl<State> ClientBuilder<State> {
         self.extra_headers.insert(name, value);
         self
     }
+
+    /// Operator-supplied header (`--headers` / `--cookies`): stored
+    /// per-request and only sent same-origin (see `send_with_retry`).
+    /// Prefer this over [`Self::header`] for anything sensitive.
+    #[must_use]
+    pub fn user_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.user_headers.insert(name, value);
+        self
+    }
 }
 
 impl ClientBuilder<HasTimeout> {
@@ -190,6 +205,10 @@ impl ClientBuilder<HasTimeout> {
             .use_rustls_tls()
             .redirect(reqwest_policy);
 
+        // `socks5h://` resolves remotely: remember it so `send_with_retry`
+        // skips local DNS-time SSRF resolution (no local leak, `.onion`
+        // works). Lexical + IP-literal checks still apply everywhere.
+        let remote_dns = matches!(self.proxy, Some(ProxyConfig::Socks5h(_)));
         if let Some(proxy) = self.proxy {
             let p = reqwest::Proxy::all(proxy.as_str())?;
             builder = builder.proxy(p);
@@ -203,6 +222,10 @@ impl ClientBuilder<HasTimeout> {
         for (k, v) in &self.extra_headers {
             default_headers.insert(k.clone(), v.clone());
         }
+        // NOTE: `user_headers` are intentionally NOT in `default_headers`:
+        // `reqwest` would re-apply them on every cross-host redirect hop.
+        // They are injected per-request in `build_request` only when the hop
+        // is same-origin with the initial target.
         builder = builder.default_headers(default_headers);
 
         let inner = builder.build()?;
@@ -218,6 +241,8 @@ impl ClientBuilder<HasTimeout> {
             timeout,
             redirect_policy: self.redirect_policy,
             allow_private: self.allow_private,
+            user_headers: self.user_headers,
+            remote_dns,
         })
     }
 }
@@ -240,6 +265,8 @@ pub struct HttpClient {
     timeout: Duration,
     redirect_policy: RedirectPolicy,
     allow_private: bool,
+    user_headers: HeaderMap,
+    remote_dns: bool,
 }
 
 impl core::fmt::Debug for HttpClient {
@@ -251,6 +278,8 @@ impl core::fmt::Debug for HttpClient {
             .field("timeout", &self.timeout)
             .field("redirect_policy", &self.redirect_policy)
             .field("allow_private", &self.allow_private)
+            .field("user_headers", &"[REDACTED]")
+            .field("remote_dns", &self.remote_dns)
             .finish_non_exhaustive()
     }
 }
@@ -321,14 +350,25 @@ impl HttpClient {
         self.allow_private
     }
 
+    /// Whether DNS is resolved remotely by the proxy (`socks5h://`).
+    /// When `true`, local DNS-time SSRF resolution is skipped (no local leak).
+    #[must_use]
+    pub const fn uses_remote_dns(&self) -> bool {
+        self.remote_dns
+    }
+
     /// Generic send with jitter, rate-limit, retry, timeout and cancellation.
     ///
     /// SSRF hardening (OWASP): the initial URL and **every** redirect hop are
-    /// re-validated lexically + DNS-time via [`TargetUrl`] before connecting.
+    /// re-validated lexically via [`TargetUrl`] before connecting, plus
+    /// DNS-time unless the proxy resolves remotely (`socks5h://`, see
+    /// `remote_dns`: local `lookup_host` would leak the hostname and break
+    /// `.onion`, and cannot prove the IP the proxy will dial — TOCTOU).
     /// `reqwest` auto-follow is disabled at build time; this method follows
     /// `Location` manually up to `redirect_policy`. The manual [`CookieJar`]
-    /// is scoped per URL (never forwarded cross-host) and per-request headers
-    /// are dropped on cross-host hops.
+    /// is scoped per URL (never forwarded cross-host), per-request headers
+    /// are dropped on cross-host hops, and operator `--headers`/`--cookies`
+    /// (`user_headers`) are only sent same-origin with the initial target.
     ///
     /// # Errors
     /// Returns an error if the request is cancelled, times out, targets a
@@ -339,9 +379,13 @@ impl HttpClient {
         spec: RequestSpec,
         cancel: &CancellationToken,
     ) -> Result<reqwest::Response, ClientError> {
-        TargetUrl::validate_redirect_location(&spec.url, self.allow_private)
-            .await
-            .map_err(|e| map_url_error(&spec.url, &e))?;
+        TargetUrl::validate_redirect_location_with_remote_dns(
+            &spec.url,
+            self.allow_private,
+            self.remote_dns,
+        )
+        .await
+        .map_err(|e| map_url_error(&spec.url, &e))?;
         // Cancellable jitter + rate-limit: internal sleeps are themselves
         // wrapped in `select!` so Ctrl+C aborts promptly (official tokio pattern).
         if !self.rate_limiter.acquire_cancellable(cancel).await {
@@ -351,10 +395,15 @@ impl HttpClient {
             return Err(ClientError::Cancelled);
         }
 
+        let origin_url = spec.url.clone();
         let mut current = spec;
+        // Operator headers go to the origin; cross-host hops drop them.
+        let mut include_user = true;
         let mut hops = 0_usize;
         loop {
-            let resp = self.send_single_with_retry(&current, cancel).await?;
+            let resp = self
+                .send_single_with_retry(&current, include_user, cancel)
+                .await?;
             let status = resp.status();
             if !is_redirect_status(status) {
                 return Ok(resp);
@@ -377,9 +426,13 @@ impl HttpClient {
             // Resolve relative `Location` against the current URL; validate
             // the next hop BEFORE any connection (fail-closed).
             let next_url = resolve_redirect_url(&current.url, &location)?;
-            TargetUrl::validate_redirect_location(&next_url, self.allow_private)
-                .await
-                .map_err(|e| map_url_error(&next_url, &e))?;
+            TargetUrl::validate_redirect_location_with_remote_dns(
+                &next_url,
+                self.allow_private,
+                self.remote_dns,
+            )
+            .await
+            .map_err(|e| map_url_error(&next_url, &e))?;
             if cancel.is_cancelled() {
                 return Err(ClientError::Cancelled);
             }
@@ -387,15 +440,25 @@ impl HttpClient {
             if !self.rate_limiter.acquire_cancellable(cancel).await {
                 return Err(ClientError::Cancelled);
             }
+            // Same-origin gate for operator headers: compare against the
+            // initial target, not just the previous hop (an open-redirect
+            // chain A→B→A must not re-arm the leak on the way back unless B
+            // equals the origin — strict, fail-closed).
+            if !is_same_host(&origin_url, &next_url) {
+                include_user = false;
+            }
             current = follow_spec(&current, status, next_url);
             hops += 1;
         }
     }
 
     /// Single-hop send with retry (no redirect following).
+    /// Every retry re-acquires the rate limiter so 429/5xx/timeout storms
+    /// cannot exceed the configured RPS ceiling.
     async fn send_single_with_retry(
         &self,
         spec: &RequestSpec,
+        include_user: bool,
         cancel: &CancellationToken,
     ) -> Result<reqwest::Response, ClientError> {
         let mut attempt = 0usize;
@@ -403,7 +466,7 @@ impl HttpClient {
             if cancel.is_cancelled() {
                 return Err(ClientError::Cancelled);
             }
-            let req = self.build_request(spec).await;
+            let req = self.build_request(spec, include_user).await;
 
             // per-request timeout covers send() only; jitter/rate-limit already done
             let send_fut = req.send();
@@ -440,9 +503,13 @@ impl HttpClient {
                             .get(reqwest::header::RETRY_AFTER)
                             .and_then(|v| v.to_str().ok());
                         let delay = self.retry.delay_for_retry_after(attempt, retry_after);
+                        // Rate-limit retries: sleep the backoff AND take a token.
                         tokio::select! {
                             () = cancel.cancelled() => return Err(ClientError::Cancelled),
                             () = tokio::time::sleep(delay) => {},
+                        }
+                        if !self.rate_limiter.acquire_cancellable(cancel).await {
+                            return Err(ClientError::Cancelled);
                         }
                         continue;
                     }
@@ -461,6 +528,9 @@ impl HttpClient {
                             () = cancel.cancelled() => return Err(ClientError::Cancelled),
                             () = tokio::time::sleep(delay) => {},
                         }
+                        if !self.rate_limiter.acquire_cancellable(cancel).await {
+                            return Err(ClientError::Cancelled);
+                        }
                         continue;
                     }
                     return Err(e);
@@ -469,7 +539,7 @@ impl HttpClient {
         }
     }
 
-    async fn build_request(&self, spec: &RequestSpec) -> RequestBuilder {
+    async fn build_request(&self, spec: &RequestSpec, include_user: bool) -> RequestBuilder {
         let mut req = match spec.method {
             Method::GET => self.inner.get(&spec.url),
             Method::POST => self.inner.post(&spec.url),
@@ -477,6 +547,15 @@ impl HttpClient {
         };
         for (k, v) in &spec.headers {
             req = req.header(k, v);
+        }
+        // Operator headers (`--headers`/`--cookies`): same-origin only.
+        // `spec.headers` (per-request, e.g. raw-file) always wins on conflict.
+        if include_user {
+            for (k, v) in &self.user_headers {
+                if !spec.headers.contains_key(k) {
+                    req = req.header(k, v);
+                }
+            }
         }
         if let Some(b) = &spec.body {
             // Chunked transfer: when Transfer-Encoding: chunked is set, stream the
@@ -653,8 +732,10 @@ fn resolve_redirect_url(current_url: &str, location: &str) -> Result<String, Cli
 
 /// Build the follow-up spec for a redirect hop: rewrite method/body per RFC
 /// and drop per-request headers cross-host to avoid credential leaks.
-/// (`CookieJar` is already scoped per URL in `build_request`; `reqwest`
-/// `default_headers` such as `--headers` are client-wide by design.)
+/// (`CookieJar` is already scoped per URL in `build_request`; operator
+/// `--headers`/`--cookies` live in `HttpClient::user_headers` and are gated
+/// same-origin with the initial target in `send_with_retry`, so they never
+/// reach a cross-host hop even though `reqwest` `default_headers` would.)
 fn follow_spec(
     current: &RequestSpec,
     status: reqwest::StatusCode,

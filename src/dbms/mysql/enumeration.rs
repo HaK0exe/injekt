@@ -22,13 +22,28 @@ pub fn list_columns(db: &str, table: &str) -> String {
 
 #[must_use]
 pub fn dump_table(db: &str, table: &str, columns: &[String], start: usize, stop: usize) -> String {
-    let cols = if columns.is_empty() {
-        "*".to_owned()
-    } else {
-        columns.join(",")
-    };
     let limit = stop.saturating_sub(start);
-    format!("SELECT {cols} FROM `{db}`.`{table}` LIMIT {limit} OFFSET {start}")
+    // Scalar-only oracle (`LENGTH((query))` / `ASCII(SUBSTRING(...))`): the
+    // query must return exactly 1 row × 1 column. Multi-column / multi-row
+    // `SELECT a,b … LIMIT n` fails with `1241 Operand should contain 1
+    // column(s)`. Aggregate rows with `GROUP_CONCAT` over a paginated
+    // subquery; columns joined with `0x1F`, rows with `0x1E`.
+    if columns.is_empty() {
+        // No `--column`: single-row probe (reliable only for single-column
+        // tables; use `--column a,b` for a scalar multi-column dump).
+        format!("SELECT * FROM `{db}`.`{table}` LIMIT 1 OFFSET {start}")
+    } else if columns.len() == 1 {
+        let col = &columns[0];
+        format!(
+            "SELECT GROUP_CONCAT(`{col}` SEPARATOR 0x1E) FROM (SELECT `{col}` FROM `{db}`.`{table}` LIMIT {limit} OFFSET {start}) AS t"
+        )
+    } else {
+        let escaped: Vec<String> = columns.iter().map(|c| format!("`{c}`")).collect();
+        let concat = escaped.join(",");
+        format!(
+            "SELECT GROUP_CONCAT(row_data SEPARATOR 0x1E) FROM (SELECT CONCAT_WS(0x1F,{concat}) AS row_data FROM `{db}`.`{table}` LIMIT {limit} OFFSET {start}) AS t"
+        )
+    }
 }
 
 #[must_use]

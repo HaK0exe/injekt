@@ -78,6 +78,7 @@ async fn recon_crawler_discovers_links_forms_and_js_candidates() {
             include_subdomains: false,
             respect_robots: true,
             allow_private: true,
+            remote_dns: false,
         },
     );
     let report = crawler
@@ -130,6 +131,7 @@ async fn recon_crawler_respects_robots_disallow() {
             include_subdomains: false,
             respect_robots: true,
             allow_private: true,
+            remote_dns: false,
         },
     );
     let report = crawler
@@ -211,6 +213,7 @@ async fn recon_crawler_caps_pages_per_template() {
             include_subdomains: false,
             respect_robots: true,
             allow_private: true,
+            remote_dns: false,
         },
     );
     let report = crawler

@@ -318,8 +318,8 @@ async fn run_auto_recon(
     );
     console::print_findings(&report.findings, &scrubber);
     if let Some(out) = cli.output.as_deref() {
-        let scrubbed = report.scrubbed(&scrubber);
-        let json = serde_json::to_string_pretty(&scrubbed)?;
+        let scrubbed_report = report.scrubbed(&scrubber);
+        let json = serde_json::to_string_pretty(&scrubbed_report)?;
         write_json(out, &json, cli.force, &scrubber.scrub(out)).await?;
     }
     Ok(())

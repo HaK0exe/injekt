@@ -32,3 +32,6 @@ report*.json
 # OS / editor cruft
 .DS_Store
 .env
+
+# Bench lab artefacts (local runs — never committed; versions.lock IS committed)
+bench/reports/

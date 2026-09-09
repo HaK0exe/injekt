@@ -233,14 +233,10 @@ pub fn inject_xml_tag(body: &str, tag: &str, payload: &str) -> Option<String> {
             continue;
         }
         // End of the opening tag: first `>` (attributes cannot contain `>`).
-        let Some(gt_rel) = after_tag.find('>') else {
-            return None;
-        };
+        let gt_rel = after_tag.find('>')?;
         let content_start = open_idx + 1 + bare.len() + gt_rel + 1;
         // Content runs to the next `<` and must be followed by strict `</tag>`.
-        let Some(lt_rel) = body[content_start..].find('<') else {
-            return None;
-        };
+        let lt_rel = body[content_start..].find('<')?;
         let content_end = content_start + lt_rel;
         if body[content_end..].starts_with(&closer) {
             let mut out = String::with_capacity(body.len() + payload.len());

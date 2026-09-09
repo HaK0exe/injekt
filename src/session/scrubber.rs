@@ -8,7 +8,10 @@ use std::sync::OnceLock;
 ///
 /// - Replaces Authorization, Cookie, Set-Cookie, X-Api-Key fully with `[REDACTED]`
 /// - JWT, Bearer, AWS keys, PEM blocks replaced with hash or `[REDACTED]`
-/// - Extracted values masked by default.
+/// - Findings, targets and evidences are always scrubbed (unless `--no-redact`).
+/// - Extracted DB content (`--extract`/`--dump`/enumeration payoff) is shown
+///   in full by design: the operator explicitly opted into exfiltration, so
+///   redacting it would defeat the feature. Only its log lines use hashes.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct Scrubber {

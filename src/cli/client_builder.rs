@@ -32,6 +32,12 @@ pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<Http
     };
 
     let mut builder = HttpClient::builder().timeout(Duration::from_secs(cli.effective_timeout()));
+    // Realistic browser identity (UA + Sec-CH-UA + Accept*): without it every
+    // request goes out with no User-Agent at all, which trips protocol-anomaly
+    // rules (e.g. CRS 920320) and contradicts the documented OPSEC posture.
+    // One identity per scan (rotation across scans); per-request spec headers
+    // still win on conflict.
+    builder = builder.identity(crate::http::identity::Identity::random());
     builder = builder
         .jitter(jitter)
         .rate_limiter(rl)
@@ -53,7 +59,9 @@ pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<Http
                 "invalid --headers value '{header}', expected 'Name: value'"
             )));
         };
-        builder = builder.header(
+        // Same-origin only: stored per-request, never as reqwest
+        // `default_headers` (which would leak cross-host on redirect).
+        builder = builder.user_header(
             HeaderName::from_bytes(name.trim().as_bytes())
                 .map_err(|e| InjektError::Http(format!("invalid header name '{name}': {e}")))?,
             HeaderValue::from_str(value.trim())
@@ -62,7 +70,7 @@ pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<Http
     }
 
     if let Some(cookies) = &cli.cookies {
-        builder = builder.header(
+        builder = builder.user_header(
             http::header::COOKIE,
             HeaderValue::from_str(cookies)
                 .map_err(|e| InjektError::Http(format!("invalid --cookies header value: {e}")))?,

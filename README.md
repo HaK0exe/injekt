@@ -2,7 +2,7 @@
 
 **Modern SQL injection detection & exploitation in Rust — zero persistence, anonymisation by design.**
 
-> Superior to `sqlmap`/`ghauri` in performance, maintainability and discretion. Everything lives in RAM and is wiped on exit.
+> Modern async Rust architecture (bounded concurrency, RAM-only session, MCP, OOB with proof). No comparative benchmark against `sqlmap`/`ghauri` is shipped in this repo — performance claims should be verified with your own reproducible measurements.
 
 [![CI](https://github.com/HaK0exe/injekt/actions/workflows/ci.yml/badge.svg)](https://github.com/HaK0exe/injekt/actions/workflows/ci.yml) [![Rust 1.88](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org) [![Edition 2024](https://img.shields.io/badge/edition-2024-blue)](https://doc.rust-lang.org/edition-guide/) [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE) [![unsafe_code deny](https://img.shields.io/badge/unsafe-deny-success)](https://doc.rust-lang.org/rustc/lints/listing/allowed-by-default.html)
 
@@ -29,8 +29,8 @@
 
 - **Targets**: strict URL parsing (`url` crate), private/loopback anti-SSRF rejection, Burp/ZAP raw-request parser, `ParameterLocation{Query,Body,Header,Cookie}`, markers `*` / `§` / `{{}}`.
 - **HTTP** (`src/http/`): type-state builder (`timeout()` mandatory before `build()`), `Arc<reqwest::Client>` rustls, jitter, `RateLimiter` token-bucket, in-memory `CookieJar` (`zeroize`), `Identity` rotation, `ProxyConfig` Tor `socks5h://`, retry exponential + jitter, redirect policy, gzip/br.
-- **Detection** (`src/detection/`): 3-5 baselines → SHA-256 + mean/σ + WAF 403/406 detection, Levenshtein + Jaccard diff (`DiffResult{similarity,time_delta,confidence}`), confirmation TRUE/FALSE inverted (3 trials min).
-- **Techniques** (`src/techniques/`): `boolean` (`OR 1=1` / `AND 1=1`, comment per DBMS), `time` (`SLEEP/pg_sleep/WAITFOR/BENCHMARK`, threshold `baseline+2σ`), `error` (`EXTRACTVALUE/CONVERT/CAST`), `union` (ORDER BY enumeration), `stacked` (`; SELECT` marker), `oob` (OPT-IN DNS/HTTP via `--oob-domain`, collaborator polling), `json` (dual-channel boolean + error over `JSON_EXTRACT`/`->>`/`JSON_VALUE`/`OPENJSON`/`JSON_EXISTS` per DBMS), `tamper` WAF evasion (`--tamper space2comment,randomcase,versionedcomment,versionedmorekeywords,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2plus/tab/newline/randomblank/dash/mssqlblank,betweencomment,randomcomments,equaltolike,base64encode(opt-in)` + auto `space2comment` on WAF 403/406).
+- **Detection** (`src/detection/`): 3-5 baselines → SHA-256 + mean/σ + WAF/CDN fingerprinting from status, headers, and challenge bodies; Levenshtein + Jaccard diff (`DiffResult{similarity,time_delta,confidence}`); reflected error-payload masking and TRUE/FALSE confirmation.
+- **Techniques** (`src/techniques/`): `boolean` (`OR 1=1` / `AND 1=1`, comment per DBMS), `time` (`SLEEP/pg_sleep/WAITFOR/BENCHMARK`, threshold `baseline+2σ`), `error` (`EXTRACTVALUE/CONVERT/CAST`), `union` (ORDER BY enumeration), `stacked` (`; SELECT` marker), `oob` (OPT-IN DNS/HTTP via `--oob-domain`, collaborator polling), `json` (dual-channel boolean + error over `JSON_EXTRACT`/`->>`/`JSON_VALUE`/`OPENJSON`/`JSON_EXISTS` per DBMS), `tamper` WAF evasion (`--tamper space2comment,randomcase,versionedcomment,versionedmorekeywords,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2plus/tab/newline/randomblank/dash/mssqlblank,betweencomment,randomcomments,equaltolike,base64encode(opt-in)` + auto `space2comment` only on an active WAF block).
 - **DBMS** (`src/dbms/`): trait `DbmsDetector` with native `async fn`, fingerprint for MySQL 8.x (`@@version`), Postgres 15+ (`version()`), MSSQL 2022 (`@@version`), Oracle 21c (`v$version`).
 - **Extraction** (`src/extraction/`): binary search ASCII 32-126, `buffer_unordered` bounded, verification (length + checksum), `SecretString` zeroized after report.
 - **Recon** (`src/recon/`): static crawler for links, forms, and basic JS endpoints; same-origin scope control, robots.txt support, candidate deduplication, and rate-limited scan/enumeration handoff.
@@ -145,8 +145,8 @@ injekt --target "http://192.168.1.10/?id=1" --allow-private
 
 # Encrypted session export (OPT-IN) — creates sensitive artefact
 injekt --target "https://example.com/?id=1" --export-encrypted ./session.enc
-injekt --import ./session.enc --target "https://example.com/?id=1"  # resume
-injekt replay --file ./session.enc
+# Inspect an export (decrypt + scrubbed summary, not a full scan resume):
+INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
 injekt info
 
 # MCP Server (for AI assistants)
@@ -161,7 +161,10 @@ cat report.json | jq .
 ```bash
 # Save the Burp/ZAP request (headers + body) to req.txt, then:
 injekt --raw-file req.txt --threads 5
-# --raw-file takes priority over --target; parser supports multipart + auto Content-Type.
+# --raw-file replays method + headers + cookies + body through the engine;
+# --method/--headers/--cookies/--data override or extend the file.
+# Bodies covered: urlencoded, JSON (nested via json: paths), XML/SOAP
+# (xml: tags), multipart field values. `--raw-dir` bulk ingestion stays URL-only.
 ```
 
 ---
@@ -201,7 +204,7 @@ Options:
       --jitter <MEAN,STD>         Milliseconds, e.g. "750,250" [default: 750,250 — on even without the flag]
       --techniques <LIST>         boolean,time,error,union,stacked,oob,json,all [default: all]
       --fetch-using <MODE>        Force oracle: direct, boolean or time (narrows techniques)
-      --tamper <LIST>             WAF tampers: space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,randomcase,versionedcomment,versionedmorekeywords,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,base64encode(opt-in) [default: none, auto space2comment on WAF 403/406]
+      --tamper <LIST>             WAF tampers: space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,randomcase,versionedcomment,versionedmorekeywords,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,base64encode(opt-in) [default: none, auto space2comment on active WAF blocking]
       --hpp                       HTTP Parameter Pollution: duplicate ?id=1&id=PAYLOAD (Query/Body)
       --chunked                   Chunked transfer: streamed Transfer-Encoding: chunked body (Body only)
       --prefix/--suffix <STR>     Payload prefix/suffix applied after tampers

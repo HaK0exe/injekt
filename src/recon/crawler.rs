@@ -3,7 +3,10 @@
 use crate::{
     http::client::{HttpClient, RequestSpec},
     recon::{
-        filters::{is_in_scope, normalize_page_url, page_template_key},
+        filters::{
+            is_in_scope, normalize_page_url, page_template_key, should_skip_candidate,
+            should_skip_crawl_url,
+        },
         parameter::{CandidateMethod, FormContext, ParamType, ParameterCandidate},
     },
     target::{parameters::ParameterLocation, url::TargetUrl},
@@ -20,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct CrawlConfig {
     pub depth: usize,
     pub max_pages: usize,
@@ -30,6 +34,9 @@ pub struct CrawlConfig {
     pub include_subdomains: bool,
     pub respect_robots: bool,
     pub allow_private: bool,
+    /// Skip local DNS-time SSRF resolution (proxy resolves remotely, e.g.
+    /// `socks5h://`). Lexical + IP-literal checks still apply.
+    pub remote_dns: bool,
 }
 
 impl Default for CrawlConfig {
@@ -41,6 +48,7 @@ impl Default for CrawlConfig {
             include_subdomains: false,
             respect_robots: true,
             allow_private: false,
+            remote_dns: false,
         }
     }
 }
@@ -95,7 +103,9 @@ impl Crawler {
         cancel: &CancellationToken,
     ) -> anyhow::Result<CrawlReport> {
         let started = std::time::Instant::now();
-        let root = parse_target(target, self.config.allow_private).await?;
+        let root =
+            parse_target_with_remote_dns(target, self.config.allow_private, self.config.remote_dns)
+                .await?;
         tracing::info!(
             "starting crawl at '{root}' (depth: {}, max pages: {})",
             self.config.depth,
@@ -106,6 +116,12 @@ impl Crawler {
         } else {
             RobotsRules::default()
         };
+        // `Crawl-delay` from robots.txt is honoured as a minimum per-fetch
+        // delay (in addition to the client's rate limiter / jitter).
+        let crawl_delay = robots.crawl_delay;
+        if let Some(d) = crawl_delay {
+            tracing::info!(delay=?d, "robots.txt crawl-delay active");
+        }
         let mut queue = VecDeque::from([(root.clone(), 0usize)]);
         let mut queued = HashSet::from([normalize_page_url(root.clone()).to_string()]);
         let mut visited = HashSet::new();
@@ -143,6 +159,14 @@ impl Crawler {
             }
             *template_count += 1;
             visited.insert(page_key);
+            // Honour robots `Crawl-delay` (parsed in `RobotsRules`): minimum
+            // delay between page fetches, cancellable via Ctrl+C.
+            if let Some(delay) = crawl_delay {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    () = tokio::time::sleep(delay) => {},
+                }
+            }
             let response = self
                 .client
                 .send_with_retry(RequestSpec::get(page_url.to_string()), cancel)
@@ -190,6 +214,11 @@ impl Crawler {
                 if is_in_scope(&root, &candidate.url, self.config.include_subdomains)
                     && TargetUrl::parse(candidate.url.as_str(), self.config.allow_private).is_ok()
                     && robots.allows(candidate.url.path())
+                    && !should_skip_candidate(
+                        &candidate.url,
+                        &candidate.param_name,
+                        candidate.method,
+                    )
                     && candidate_keys.insert(candidate.dedup_key())
                 {
                     candidates.push(candidate);
@@ -215,6 +244,7 @@ impl Crawler {
                     if is_in_scope(&root, &link, self.config.include_subdomains)
                         && TargetUrl::parse(link.as_str(), self.config.allow_private).is_ok()
                         && robots.allows(link.path())
+                        && !should_skip_crawl_url(&link)
                     {
                         let key = normalize_page_url(link.clone()).to_string();
                         if queued.insert(key) {
@@ -275,18 +305,31 @@ impl Crawler {
     }
 }
 
+#[allow(dead_code)]
 async fn parse_target(target: &str, allow_private: bool) -> anyhow::Result<Url> {
+    parse_target_with_remote_dns(target, allow_private, false).await
+}
+
+async fn parse_target_with_remote_dns(
+    target: &str,
+    allow_private: bool,
+    remote_dns: bool,
+) -> anyhow::Result<Url> {
     let with_scheme = if target.contains("://") {
         target.to_owned()
     } else {
         format!("https://{target}")
     };
-    // Lexical + DNS-time SSRF check (anti DNS-rebinding); per-link filtering
-    // in the crawl loop stays lexical-only for speed, enforcement happens
-    // per-fetch inside `HttpClient::send_with_retry`.
-    let parsed = TargetUrl::validate_redirect_location(&with_scheme, allow_private)
-        .await
-        .map_err(|error| anyhow::anyhow!("invalid recon target: {error}"))?;
+    // Lexical (+ DNS-time unless the proxy resolves remotely) SSRF check;
+    // per-link filtering in the crawl loop stays lexical-only for speed,
+    // enforcement happens per-fetch inside `HttpClient::send_with_retry`.
+    let parsed = TargetUrl::validate_redirect_location_with_remote_dns(
+        &with_scheme,
+        allow_private,
+        remote_dns,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("invalid recon target: {error}"))?;
     Ok(parsed.inner().clone())
 }
 
@@ -380,18 +423,30 @@ fn extract_document(base: &Url, body: &str) -> ExtractedDocument {
 
 fn add_link_candidates(out: &mut ExtractedDocument, mut url: Url, param_type: ParamType) {
     url.set_fragment(None);
-    for (name, value) in url.query_pairs() {
+    // Collect pairs first: `query_pairs` borrows `url` while we also push.
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(n, v)| (n.into_owned(), v.into_owned()))
+        .collect();
+    for (name, value) in pairs {
+        // Drop Elementor-style `post-*.css?ver=3.8.0` noise at the source:
+        // static asset + cache-busting param is never SQLi-testable.
+        if should_skip_candidate(&url, &name, CandidateMethod::Get) {
+            continue;
+        }
         out.candidates.push(ParameterCandidate {
             url: url.clone(),
             method: CandidateMethod::Get,
-            param_name: name.into_owned(),
+            param_name: name,
             location: ParameterLocation::Query,
             param_type,
-            original_value: value.into_owned(),
+            original_value: value,
             form_context: None,
         });
     }
-    out.links.push(url);
+    if !should_skip_crawl_url(&url) {
+        out.links.push(url);
+    }
 }
 
 fn selector(value: &str) -> Selector {

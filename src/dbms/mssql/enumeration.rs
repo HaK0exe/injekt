@@ -22,15 +22,28 @@ pub fn list_columns(db: &str, table: &str) -> String {
 
 #[must_use]
 pub fn dump_table(db: &str, table: &str, columns: &[String], start: usize, stop: usize) -> String {
-    let cols = if columns.is_empty() {
-        "*".to_owned()
-    } else {
-        columns.join(",")
-    };
     let limit = stop.saturating_sub(start);
-    format!(
-        "SELECT {cols} FROM [{db}].[dbo].[{table}] ORDER BY (SELECT NULL) OFFSET {start} ROWS FETCH NEXT {limit} ROWS ONLY"
-    )
+    // Scalar-only oracle: aggregate to 1×1 via `STRING_AGG` over a paginated
+    // subquery (rows `|`, columns `CHAR(31)`-joined client-side as `|`).
+    if columns.is_empty() {
+        format!(
+            "SELECT * FROM [{db}].[dbo].[{table}] ORDER BY (SELECT NULL) OFFSET {start} ROWS FETCH NEXT 1 ROWS ONLY"
+        )
+    } else if columns.len() == 1 {
+        let col = &columns[0];
+        format!(
+            "SELECT STRING_AGG([{col}], '|') FROM (SELECT [{col}] FROM [{db}].[dbo].[{table}] ORDER BY (SELECT NULL) OFFSET {start} ROWS FETCH NEXT {limit} ROWS ONLY) AS t"
+        )
+    } else {
+        let concat = columns
+            .iter()
+            .map(|c| format!("CAST([{c}] AS NVARCHAR(MAX))"))
+            .collect::<Vec<_>>()
+            .join("+'|'+");
+        format!(
+            "SELECT STRING_AGG(row_data, '|') FROM (SELECT ({concat}) AS row_data FROM [{db}].[dbo].[{table}] ORDER BY (SELECT NULL) OFFSET {start} ROWS FETCH NEXT {limit} ROWS ONLY) AS t"
+        )
+    }
 }
 
 #[must_use]

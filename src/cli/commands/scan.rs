@@ -67,6 +67,11 @@ pub(crate) fn engine_config(cli: &Cli) -> EngineConfig {
         chunked: cli.chunked,
         allow_private: cli.allow_private,
         no_redact: cli.no_redact,
+        remote_dns: cli.uses_remote_dns(),
+        method_override: cli.method.clone(),
+        dbms_hint: cli.normalized_dbms_hint(),
+        marker: cli.marker.clone(),
+        raw_request: cli.merged_raw_request(),
         extract: cli.extract,
         dbs: cli.dbs,
         tables: cli.tables,
@@ -94,6 +99,18 @@ pub(crate) fn engine_config(cli: &Cli) -> EngineConfig {
 pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult> {
     if let Err(e) = cli.validate_explicit_config() {
         return Err(crate::error::InjektError::Other(e.into()).into());
+    }
+    // `--import` is not a scan-resume flag: session resume lives in
+    // `replay --file` (decrypt + summary) and `recon import --file`.
+    // Fail fast instead of silently ignoring it.
+    if let Some(path) = cli.import.as_deref() {
+        return Err(crate::error::InjektError::Other(
+            format!(
+                "--import '{path}' is not supported for scan; use `replay --file <export.enc>` to inspect an encrypted export or `recon import --file <crawl.json> --test` for candidates"
+            )
+            .into(),
+        )
+        .into());
     }
     info!(resolution=%cli.resolution_summary(), "scan config resolved");
     let target = cli
@@ -314,10 +331,14 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> Result<()> {
             &pass,
             path,
         ) {
-            warn!(error=%e, "export failed");
-        } else {
-            info!(path=%scrubbed_path, "export chiffré écrit (0o600, v2 argon2id)");
+            // Fail the command: a silent warning + exit 0 would pretend the
+            // sensitive artefact exists while nothing was written.
+            return Err(crate::error::InjektError::Other(
+                format!("export failed for '{scrubbed_path}': {e}").into(),
+            )
+            .into());
         }
+        info!(path=%scrubbed_path, "export chiffré écrit (0o600, v2 argon2id)");
     }
 
     Ok(())

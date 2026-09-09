@@ -21,15 +21,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --check
-      # Lint policy lives in Cargo.toml's [lints] table (unwrap_used/expect_used/
-      # dbg_macro/todo deny, clippy::pedantic warn) — no blanket -D warnings here,
-      # that would fail CI on every pedantic nit instead of the denies that matter.
       - name: cargo clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
+
+  msrv:
+    name: MSRV 1.88 (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.88
+      - name: cargo check (locked)
+        run: cargo check --all-targets --locked
 
   test:
     name: build + test
-    needs: lint
+    needs: [lint, msrv]
     strategy:
       fail-fast: false
       matrix:

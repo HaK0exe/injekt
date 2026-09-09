@@ -243,6 +243,7 @@ async fn crawl(
         include_subdomains: args.include_subdomains,
         respect_robots: !args.ignore_robots,
         allow_private: cli.allow_private,
+        remote_dns: cli.uses_remote_dns(),
     };
     Crawler::new(client, config)
         .crawl(&args.target, cancel)
@@ -309,6 +310,11 @@ fn engine_config(cli: &Cli, enumerate: bool) -> EngineConfig {
         chunked: cli.chunked,
         allow_private: cli.allow_private,
         no_redact: cli.no_redact,
+        remote_dns: cli.uses_remote_dns(),
+        method_override: cli.method.clone(),
+        dbms_hint: cli.normalized_dbms_hint(),
+        marker: cli.marker.clone(),
+        raw_request: cli.merged_raw_request(),
         extract: cli.extract,
         dbs: enumerate && cli.dbs,
         tables: enumerate && cli.tables,
@@ -334,15 +340,14 @@ fn build_client(cli: &Cli) -> anyhow::Result<HttpClient> {
             .split(',')
             .filter_map(|part| part.trim().parse().ok())
             .collect();
-        match parts.as_slice() {
-            [mean, standard_deviation] => Jitter::new(*mean, *standard_deviation),
-            _ => {
-                tracing::warn!(
-                    value = %value,
-                    "invalid jitter (expected \"mean_ms,std_ms\"), using default 750,250"
-                );
-                Jitter::default()
-            }
+        if let [mean, standard_deviation] = parts.as_slice() {
+            Jitter::new(*mean, *standard_deviation)
+        } else {
+            tracing::warn!(
+                value = %value,
+                "invalid jitter (expected \"mean_ms,std_ms\"), using default 750,250"
+            );
+            Jitter::default()
         }
     };
     let limiter = Arc::new(RateLimiter::new(cli.effective_rate_limit()));
@@ -353,6 +358,7 @@ fn build_client(cli: &Cli) -> anyhow::Result<HttpClient> {
     };
     let mut builder = HttpClient::builder()
         .timeout(Duration::from_secs(cli.effective_timeout()))
+        .identity(crate::http::identity::Identity::random())
         .jitter(jitter)
         .rate_limiter(limiter)
         .retry_policy(retry)
@@ -364,13 +370,13 @@ fn build_client(cli: &Cli) -> anyhow::Result<HttpClient> {
         let Some((name, value)) = header.split_once(':') else {
             anyhow::bail!("invalid --headers value, expected 'Name: value'");
         };
-        builder = builder.header(
+        builder = builder.user_header(
             HeaderName::from_bytes(name.trim().as_bytes())?,
             HeaderValue::from_str(value.trim())?,
         );
     }
     if let Some(cookies) = &cli.cookies {
-        builder = builder.header(
+        builder = builder.user_header(
             http::header::COOKIE,
             HeaderValue::from_str(cookies)
                 .map_err(|error| anyhow::anyhow!("invalid --cookies header value: {error}"))?,

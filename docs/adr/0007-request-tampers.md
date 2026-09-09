@@ -56,7 +56,7 @@ injekt recon scan --target ex.com --hpp --chunked --auto-enumerate --dbs
 - HPP targets Query/Body only (Cookie/Header duplication is backend-specific).
 - Chunked targets Body only; Query + `--chunked` is a no-op (still finds
   normally — covered by test).
-- No auto-enable (unlike `space2comment` on WAF 403/406): HPP doubles params
+- No auto-enable (unlike `space2comment` on active WAF blocking): HPP doubles params
   and chunked changes framing, so both stay explicit OPT-IN.
 
 ## Testing

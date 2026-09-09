@@ -179,10 +179,9 @@ pub struct Cli {
     #[arg(long, global = true, value_parser = clap::value_parser!(u8).range(1..=5), env = "INJEKT_LEVEL")]
     pub level: Option<u8>,
 
-    /// Strict second-pass confirmation (opt-in): after detection, replay each
-    /// finding's technique for that single parameter against a fresh session
-    /// and keep only re-confirmed findings (OOB skipped: async collaborator
-    /// evidence is not replayable). Roughly doubles request cost.
+    /// Strict second-pass confirmation (currently logs a warning only:
+    /// second-pass replay is not implemented yet; in-detection 3-trial
+    /// confirmation still applies regardless of this flag).
     #[arg(long, global = true)]
     pub confirm: bool,
 
@@ -220,6 +219,8 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub export_encrypted: Option<String>,
 
+    /// Legacy flag: `scan --import` is rejected (use `replay --file` to
+    /// inspect an encrypted export, `recon import --file` for candidates).
     #[arg(long, global = true)]
     pub import: Option<String>,
 
@@ -817,6 +818,122 @@ impl Cli {
                 None
             }
         }
+    }
+
+    /// Fused raw request: `--raw-file` base + `--method` / `--headers` /
+    /// `--cookies` / `--data` overlays. CLI flags win over the file; the file
+    /// wins over `--data` (with a warning when both carry a body).
+    #[must_use]
+    pub fn merged_raw_request(&self) -> Option<crate::target::raw_request::RawRequest> {
+        let mut base = self.raw_request();
+        // `--data` alone becomes a synthetic POST raw (same path as raw-file).
+        if base.is_none()
+            && let Some(data) = self.data.as_deref()
+        {
+            let trimmed = data.trim();
+            if !trimmed.is_empty() {
+                base = crate::engine::orchestrator::synthetic_raw_from_data(trimmed);
+            }
+        }
+        // `--headers`/`--cookies` alone (no file, no `--data`) still need a
+        // raw to fuse into, otherwise cookie/header params are never
+        // discovered and the flags only ride along passively.
+        if base.is_none()
+            && (!self.headers.is_empty()
+                || self
+                    .cookies
+                    .as_deref()
+                    .is_some_and(|c| !c.trim().is_empty()))
+        {
+            base = Some(crate::target::raw_request::RawRequest {
+                method: "GET".to_owned(),
+                path: "/".to_owned(),
+                headers: std::collections::HashMap::new(),
+                body: None,
+                http_version: "HTTP/1.1".to_owned(),
+            });
+        }
+        let mut req = base?;
+        // `--method` overrides the file method (validated later; uppercased here).
+        if let Some(m) = self.method.as_deref() {
+            let m = m.trim();
+            if !m.is_empty() {
+                req.method = m.to_ascii_uppercase();
+            }
+        }
+        // `--headers "Name: value"` override / extend the file headers
+        // (keys are lowercased, matching `RawRequest::parse` canonical form).
+        for h in &self.headers {
+            let Some((name, value)) = h.split_once(':') else {
+                continue;
+            };
+            let key = name.trim().to_ascii_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            req.headers.insert(key, value.trim().to_owned());
+        }
+        // `--cookies` merges with the file `Cookie` header (`; `-joined),
+        // preserving both the Burp session and the CLI session.
+        if let Some(cookies) = self.cookies.as_deref() {
+            let cookies = cookies.trim();
+            if !cookies.is_empty() {
+                let merged = match req.headers.get("cookie") {
+                    Some(existing) if !existing.trim().is_empty() => {
+                        format!("{}; {cookies}", existing.trim())
+                    }
+                    _ => cookies.to_owned(),
+                };
+                req.headers.insert("cookie".to_owned(), merged);
+            }
+        }
+        // `--data` fills an empty body only; a file body always wins.
+        if let Some(data) = self.data.as_deref() {
+            let trimmed = data.trim();
+            let file_has_body = req.body.as_deref().is_some_and(|b| !b.trim().is_empty());
+            if !trimmed.is_empty() && !file_has_body {
+                req.body = Some(trimmed.to_owned());
+                if !req.headers.contains_key("content-type") {
+                    let kind = crate::target::structured::sniff_kind(None, trimmed);
+                    let ct = match kind {
+                        crate::target::structured::StructuredKind::Json => "application/json",
+                        crate::target::structured::StructuredKind::Xml => "application/xml",
+                        _ => "application/x-www-form-urlencoded",
+                    };
+                    req.headers.insert("content-type".to_owned(), ct.to_owned());
+                }
+            }
+        }
+        Some(req)
+    }
+
+    /// `true` when the proxy performs remote DNS (`socks5h://`): local
+    /// DNS-time SSRF resolution must be skipped (no local leak, no false
+    /// `.onion` failure). Lexical + IP-literal checks still apply.
+    #[must_use]
+    pub fn uses_remote_dns(&self) -> bool {
+        self.effective_proxy()
+            .is_some_and(|p| p.to_ascii_lowercase().starts_with("socks5h://"))
+    }
+
+    /// Normalized `--dbms` hint (`mysql|postgres|mssql|oracle`) or `None`
+    /// when absent/unknown (unknown warns, falls back to auto-fingerprint).
+    #[must_use]
+    pub fn normalized_dbms_hint(&self) -> Option<String> {
+        let raw = self.dbms.as_deref()?;
+        let v = raw.trim().to_ascii_lowercase();
+        // Accept common aliases.
+        let norm = match v.as_str() {
+            "mysql" | "mariadb" | "my" => "mysql",
+            "postgres" | "postgresql" | "pg" | "pgsql" => "postgres",
+            "mssql" | "sqlserver" | "sql-server" | "tsql" => "mssql",
+            "oracle" | "ora" => "oracle",
+            _ => {
+                tracing::warn!(dbms=%raw, "unknown --dbms, ignoring (auto-fingerprint)");
+                return None;
+            }
+        };
+        Some(norm.to_owned())
     }
 }
 
