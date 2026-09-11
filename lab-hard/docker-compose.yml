@@ -1,0 +1,120 @@
+# lab-hard/docker-compose.yml — HARD lab full-2026, isolated from bench/.
+# INTENTIONALLY VULNERABLE — lab only, never expose to internet.
+# Ports (host): app 9000 · waf-strict 9082 · collab 9080 · mysql 9360 · pg 9432 · mssql 9533
+# Targets need injekt --allow-private (loopback/private anti-SSRF bypass).
+# Oracle 23ai-free is opt-in: docker compose --profile oracle up
+
+services:
+  app:
+    build: ./app
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_USER: hard
+      MYSQL_PASSWORD: hardpw123
+      MYSQL_DB: hard
+      PG_HOST: postgres
+      PG_USER: hard
+      PG_PASSWORD: hardpw123
+      PG_DB: hard
+      MSSQL_HOST: mssql
+      MSSQL_USER: sa
+      MSSQL_PASSWORD: Hard-P4ssw0rd!
+      MSSQL_DB: hard
+      ORACLE_HOST: oracle
+      ORACLE_USER: hard
+      ORACLE_PASSWORD: Hard-P4ssw0rd!
+      ORACLE_DB: FREEPDB1
+      OOB_DOMAIN: oob.labhard
+      COLLAB_URL: http://collab:9080
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mssql:
+        condition: service_started
+      collab:
+        condition: service_started
+    networks: [hardnet]
+    ports: ["9000:8000"]
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: roothardpw
+      MYSQL_DATABASE: hard
+      MYSQL_USER: hard
+      MYSQL_PASSWORD: hardpw123
+    volumes:
+      - ./db/mysql/seed.sql:/docker-entrypoint-initdb.d/01-seed.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proothardpw"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [hardnet]
+    ports: ["9360:3306"]
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: hard
+      POSTGRES_USER: hard
+      POSTGRES_PASSWORD: hardpw123
+    volumes:
+      - ./db/pg/seed.sql:/docker-entrypoint-initdb.d/01-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hard -d hard"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [hardnet]
+    ports: ["9432:5432"]
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: Hard-P4ssw0rd!
+      MSSQL_PID: Developer
+    volumes:
+      - ./db/mssql/seed.sql:/seed/seed.sql:ro
+    networks: [hardnet]
+    ports: ["9533:1433"]
+
+  oracle:
+    image: gvenzl/oracle-free:23-slim-faststart
+    environment:
+      ORACLE_PASSWORD: Hard-P4ssw0rd!
+      APP_USER: hard
+      APP_USER_PASSWORD: Hard-P4ssw0rd!
+    volumes:
+      - ./db/oracle/seed.sql:/container-entrypoint-initdb.d/01-seed.sql:ro
+    networks: [hardnet]
+    ports: ["9521:1521"]
+    profiles: [oracle]
+
+  collab:
+    build: ./collaborator
+    networks: [hardnet]
+    ports: ["9080:8080"]
+    command: ["--http", "8080", "--dns-port", "5353"]
+
+  # CRS4 PL2 strict — hardcore WAF. Query/cookie/body + Authorization inspectés.
+  waf-strict:
+    image: owasp/modsecurity-crs:4-nginx
+    environment:
+      BACKEND: http://app:8000
+      PORT: "8080"
+      MODSEC_RULE_ENGINE: "On"
+      PARANOIA: "2"
+      BLOCKING_PARANOIA: "2"
+      ANOMALY_INBOUND: "5"
+    volumes:
+      - ./waf/crs-pl2-strict.conf:/etc/modsecurity.d/owasp-crs/rules/REQUEST-999-HARD-STRICT.conf:ro
+    depends_on: [app]
+    networks: [hardnet]
+    ports: ["9082:8080"]
+
+networks:
+  hardnet:

@@ -1,0 +1,208 @@
+# lab-hard/runner/scenarios-hard.toml — HARD ground truth full-2026.
+# `via`: direct = app:9000, waf-strict = :9082 (CRS4 PL2).
+# arms: stock (no tamper) doit ÉCHOUER sur H1/H9/H10/H11 — preuve HARD.
+#       evasion/hpp/oob/json sont les bras solvables.
+
+[defaults]
+repeats = 5
+timeout_s = 600
+seed = 42
+
+[[scenario]]
+id = "H1"
+url = "http://127.0.0.1:9000/h/union?id=1"
+via = "direct"
+dbms = "mysql"
+sink = "query:id"
+expected = ["boolean", "union"]
+evasion = ["--tamper", "space2comment"]
+note = "UNION 5 cols, col3 reflected, spaces-filter ->400. space2comment bypass."
+
+[[scenario]]
+id = "H2"
+url = "http://127.0.0.1:9000/h/mssql-union?q=alice"
+via = "direct"
+dbms = "mssql"
+sink = "query:q"
+expected = ["boolean", "union"]
+note = "MSSQL string context, ORDER BY masked to 200 count-only (blind)."
+
+[[scenario]]
+id = "H3"
+url = "http://127.0.0.1:9000/h/litellm/chat"
+via = "direct"
+dbms = "postgres"
+method = "POST"
+headers = "Authorization: Bearer test"
+sink = "header:authorization"
+expected = ["union", "boolean"]
+note = "CVE-2026-42208 replica: Bearer -> PG UNION pre-auth, quoted PascalCase retry."
+
+[[scenario]]
+id = "H4"
+url = "http://127.0.0.1:9000/h/json-filter"
+via = "direct"
+dbms = "mysql"
+method = "POST"
+data = '{"filter": {"q": "alice"}}'
+sink = "body:filter.q"
+expected = ["boolean", "json"]
+note = "Team82 JSON-SQLi: JSON_EXTRACT sink, plain '=' rejected."
+
+[[scenario]]
+id = "H5"
+url = "http://127.0.0.1:9000/h/pg-jsonb"
+via = "direct"
+dbms = "postgres"
+method = "POST"
+data = '{"s": "alice"}'
+sink = "body:s"
+expected = ["boolean", "json"]
+note = "PG ->> sink, '=' without LIKE rejected."
+
+[[scenario]]
+id = "H6"
+url = "http://127.0.0.1:9000/h/oob?id=1"
+via = "direct"
+dbms = "postgres"
+sink = "query:id"
+expected = ["oob"]
+note = "OOB-only PG: CONSTANT response, collab proof required."
+
+[[scenario]]
+id = "H7"
+url = "http://127.0.0.1:9000/h/oob-mssql?id=1"
+via = "direct"
+dbms = "mssql"
+sink = "query:id"
+expected = ["oob"]
+note = "OOB-only MSSQL xp_dirtree style: CONSTANT response."
+
+[[scenario]]
+id = "H8"
+url = "http://127.0.0.1:9000/h/login-stack"
+via = "direct"
+dbms = "mssql"
+method = "POST"
+data = "user=alice&pass=x"
+sink = "body:user,body:pass"
+expected = ["boolean", "stacked"]
+note = "Stacked MSSQL, 5/s rate-limit ->429. HPP/chunked arm."
+
+[[scenario]]
+id = "H9"
+url = "http://127.0.0.1:9000/h/profile?u=alice"
+via = "direct"
+dbms = "mysql"
+sink = "query:u"
+expected = ["boolean"]
+note = "Second-order: POST /h/register stores, GET replays stored nick (vuln). Direct u param is parameterized."
+
+[[scenario]]
+id = "H10"
+url = "http://127.0.0.1:9000/h/slow?q=alice"
+via = "direct"
+dbms = "postgres"
+sink = "query:q"
+expected = ["boolean", "time"]
+note = "Time-tarpit pg_sleep drowned in jitter, threshold baseline+2sigma."
+
+[[scenario]]
+id = "H11"
+url = "http://127.0.0.1:9000/h/gauntlet?id=1"
+via = "direct"
+dbms = "mysql"
+sink = "query:id"
+expected = ["boolean"]
+evasion = ["--tamper", "space2tab,randomcase"]
+note = "Gauntlet: spaces-filter + /**/ + /*!*/ blocked -> tab/newline/dash + encoding chain."
+
+[[scenario]]
+id = "H12"
+url = "http://127.0.0.1:9000/h/hpp?id=1"
+via = "direct"
+dbms = "mysql"
+sink = "query:id"
+expected = ["boolean"]
+note = "HPP-only: single id filtered, ?id=1&id=PAYLOAD uses last raw. Requires --hpp."
+
+[[scenario]]
+id = "H13"
+url = "http://127.0.0.1:9000/h/orm?filter=alice"
+via = "direct"
+dbms = "mysql"
+sink = "query:filter"
+expected = ["boolean"]
+note = "ORM-raw whereRaw() style: no filter, nested operators."
+
+[[scenario]]
+id = "H14"
+url = "http://127.0.0.1:9000/h/whoami?db=mysql&id=1"
+via = "direct"
+dbms = "mysql"
+sink = "query:id"
+expected = ["boolean"]
+note = "Fingerprint-trap: identical shape mysql/pg/mssql (?db=), versions masked."
+
+[[scenario]]
+id = "H15"
+url = "http://127.0.0.1:9000/h/dump?id=1"
+via = "direct"
+dbms = "mysql"
+sink = "query:id"
+expected = ["boolean", "union"]
+note = "Extract drill: secret reflected, --extract --dump users.secret (canary untouched)."
+
+[[scenario]]
+id = "H16"
+url = "http://127.0.0.1:9082/h/union?id=1"
+via = "waf-strict"
+dbms = "mysql"
+sink = "query:id"
+expected = ["boolean", "union"]
+evasion = ["--tamper", "space2comment,randomcase"]
+note = "Same H1 behind CRS4 PL2 strict + ban 10x403=>429. Vector-shift + tamper chain."
+
+[[scenario]]
+id = "H17"
+url = "http://127.0.0.1:9082/h/litellm/chat"
+via = "waf-strict"
+dbms = "postgres"
+method = "POST"
+headers = "Authorization: Bearer test"
+sink = "header:authorization"
+expected = ["union", "boolean"]
+note = "LiteLLM behind WAF: Authorization inspected (942900/942901), must evade."
+
+# Negative controls: any finding = FALSE POSITIVE.
+[[scenario]]
+id = "N3"
+url = "http://127.0.0.1:9000/h/health-json"
+via = "direct"
+dbms = "mysql"
+method = "POST"
+data = '{"id": 1}'
+sink = "body:id"
+expected = []
+negative = true
+note = "Fully parameterized JSON. Finding = FP."
+
+[[scenario]]
+id = "N4"
+url = "http://127.0.0.1:9000/h/echo-len?id=1"
+via = "direct"
+dbms = "mysql"
+sink = "query:id"
+expected = []
+negative = true
+note = "Parameterized echo of input length only. Finding = FP."
+
+[[scenario]]
+id = "N5"
+url = "http://127.0.0.1:9000/h/honeypot?id=1"
+via = "direct"
+dbms = "mysql"
+sink = "query:id"
+expected = []
+negative = true
+note = "Honeypot: bans after 3 suspicious hits. Finding = FP."

@@ -1,0 +1,5 @@
+# lab-hard artefacts (local runs — never committed)
+reports/
+*.log
+__pycache__/
+*.pyc
