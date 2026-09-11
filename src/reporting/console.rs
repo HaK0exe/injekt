@@ -22,20 +22,21 @@ struct Row {
 
 /// Confidence bucket: drives both the icon shown next to each finding and
 /// the color of its evidence line — the score alone doesn't jump out in a
-/// wall of text.
+/// wall of text. Buckets are the C7 calibrated verdicts
+/// ([`crate::reporting::verdict::severity_for`]: `high` → precision ≥ 95 %,
+/// `medium` → ≥ 80 %); both confidence and false-positive probability must
+/// agree before a finding is promoted.
 enum Severity {
     High,
     Medium,
     Low,
 }
 
-fn severity(confidence: f64) -> Severity {
-    if confidence >= 0.8 {
-        Severity::High
-    } else if confidence >= 0.5 {
-        Severity::Medium
-    } else {
-        Severity::Low
+fn severity(confidence: f64, false_positive_prob: f64) -> Severity {
+    match crate::reporting::verdict::severity_for(confidence, false_positive_prob) {
+        crate::session::state::Severity::High => Severity::High,
+        crate::session::state::Severity::Medium => Severity::Medium,
+        crate::session::state::Severity::Low => Severity::Low,
     }
 }
 
@@ -47,11 +48,21 @@ pub fn print_findings(findings: &[Finding], scrubber: &Scrubber) {
 
     let high = findings
         .iter()
-        .filter(|f| matches!(severity(f.confidence), Severity::High))
+        .filter(|f| {
+            matches!(
+                severity(f.confidence, f.false_positive_prob),
+                Severity::High
+            )
+        })
         .count();
     let medium = findings
         .iter()
-        .filter(|f| matches!(severity(f.confidence), Severity::Medium))
+        .filter(|f| {
+            matches!(
+                severity(f.confidence, f.false_positive_prob),
+                Severity::Medium
+            )
+        })
         .count();
     let low = findings.len() - high - medium;
 
@@ -87,7 +98,7 @@ pub fn print_findings(findings: &[Finding], scrubber: &Scrubber) {
 
     for f in findings {
         let sf = f.scrubbed(scrubber);
-        let (icon, label) = match severity(f.confidence) {
+        let (icon, label) = match severity(f.confidence, f.false_positive_prob) {
             Severity::High => ("●".red().to_string(), "HIGH".red().bold().to_string()),
             Severity::Medium => ("●".yellow().to_string(), "MED".yellow().bold().to_string()),
             Severity::Low => ("●".dimmed().to_string(), "LOW".dimmed().to_string()),

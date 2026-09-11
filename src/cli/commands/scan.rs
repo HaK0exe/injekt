@@ -5,7 +5,7 @@ use crate::{
     cli::client_builder::build_client,
     cli::output::file::write_output_file_async,
     engine::orchestrator::{Engine, EngineConfig},
-    reporting::{console, json::JsonReport},
+    reporting::{console, json::JsonReport, render::render_report},
     session::scrubber::Scrubber,
 };
 use anyhow::Result;
@@ -33,8 +33,59 @@ pub(crate) fn engine_config(cli: &Cli) -> EngineConfig {
     } else {
         crate::techniques::tamper::parse_tamper_list(Some(&cli.tamper.join(",")))
     };
+    // C13 : lecture au boot uniquement sur opt-in explicite. OFF (`None`) =
+    // aucune IO, boost 1.0 neutre, chemin byte-identique au sans-knowledge.
+    let knowledge = crate::reasoning::knowledge::load_if_enabled(
+        cli.knowledge_enabled(),
+        cli.knowledge_path.as_deref(),
+    );
+    if let Some(ks) = knowledge.as_ref() {
+        tracing::debug!(
+            entries = ks.len(),
+            enabled = true,
+            "knowledge loaded (opt-in)"
+        );
+    }
     EngineConfig {
-        threads: cli.effective_threads(),
+        budget: crate::engine::orchestrator::BudgetConfig {
+            threads: cli.effective_threads(),
+            level: cli.effective_level(),
+            request_budget: None,
+        },
+        evasion: crate::engine::orchestrator::EvasionConfig {
+            payload_opts: cli.payload_opts(),
+            tampers,
+            hpp: cli.hpp,
+            chunked: cli.chunked,
+        },
+        net: crate::engine::orchestrator::NetConfig {
+            allow_private: cli.allow_private,
+            remote_dns: cli.uses_remote_dns(),
+            ignore_codes: cli.ignore_codes.clone(),
+            method_override: cli.method.clone(),
+        },
+        oob: crate::engine::orchestrator::OobConfig {
+            oob_domain: cli.oob_domain.clone(),
+            oob_poll_url: cli.oob_poll_url.clone(),
+            oob_wait_secs: cli.effective_oob_wait_secs(),
+        },
+        enumeration: crate::engine::orchestrator::EnumConfig {
+            extract: cli.extract,
+            dbs: cli.dbs,
+            tables: cli.tables,
+            columns: cli.columns,
+            dump: cli.dump,
+            banner: cli.banner,
+            current_user: cli.current_user,
+            current_db: cli.current_db,
+            hostname: cli.hostname,
+            db: cli.db.clone(),
+            table: cli.table.clone(),
+            column: cli.column.clone(),
+            start: cli.start,
+            stop: cli.stop,
+            count: cli.count,
+        },
         techniques: if !cli.techniques.is_empty() {
             cli.techniques.clone()
         } else if cli
@@ -54,39 +105,16 @@ pub(crate) fn engine_config(cli: &Cli) -> EngineConfig {
         },
         test_params: cli.params.clone(),
         post_data: cli.data.clone(),
-        payload_opts: cli.payload_opts(),
         matcher: cli.matcher_config(),
-        tampers,
-        level: cli.effective_level(),
         confirm: cli.confirm,
-        ignore_codes: cli.ignore_codes.clone(),
-        oob_domain: cli.oob_domain.clone(),
-        oob_poll_url: cli.oob_poll_url.clone(),
-        oob_wait_secs: cli.effective_oob_wait_secs(),
-        hpp: cli.hpp,
-        chunked: cli.chunked,
-        allow_private: cli.allow_private,
+        no_mutation: cli.no_mutation,
+        seed: cli.effective_seed(),
+        explain: cli.explain.clone(),
         no_redact: cli.no_redact,
-        remote_dns: cli.uses_remote_dns(),
-        method_override: cli.method.clone(),
         dbms_hint: cli.normalized_dbms_hint(),
         marker: cli.marker.clone(),
         raw_request: cli.merged_raw_request(),
-        extract: cli.extract,
-        dbs: cli.dbs,
-        tables: cli.tables,
-        columns: cli.columns,
-        dump: cli.dump,
-        banner: cli.banner,
-        current_user: cli.current_user,
-        current_db: cli.current_db,
-        hostname: cli.hostname,
-        db: cli.db.clone(),
-        table: cli.table.clone(),
-        column: cli.column.clone(),
-        start: cli.start,
-        stop: cli.stop,
-        count: cli.count,
+        knowledge,
     }
 }
 
@@ -129,11 +157,53 @@ pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult
     let findings = s.findings().to_vec();
     let extracted = s.extracted_exposed();
     let count = s.request_count();
+    let detectability = s.detectability();
     drop(s);
 
     let scrubber = Scrubber::new(cfg.no_redact);
-    let report =
-        JsonReport::new(target.clone(), findings, vec![], extracted, count).scrubbed(&scrubber);
+    let meta = crate::reporting::json::ReportMeta::current(
+        cfg.seed,
+        cli.active_profile()
+            .map(|p| format!("{p:?}").to_ascii_lowercase()),
+        cfg.techniques.clone(),
+        cfg.budget.level,
+        cfg.evasion
+            .tampers
+            .iter()
+            .map(|t| t.name().to_owned())
+            .collect(),
+    );
+    let report = JsonReport::new(target.clone(), findings, vec![], extracted, count, meta)
+        .with_detectability(detectability)
+        .scrubbed(&scrubber);
+
+    // C13 post-run (opt-in uniquement) : fusion des compteurs anonymes puis
+    // écriture (`fsync`, perms 0600). OFF = aucune IO. Le delta ne contient
+    // que `(technique, dbms, generic, succès?, req)` — jamais de cible,
+    // param, seed, evidence ou secret.
+    if cli.knowledge_enabled() {
+        let mut delta = crate::reasoning::knowledge::KnowledgeStore::empty();
+        crate::reasoning::knowledge::learn_from_run(
+            &mut delta,
+            &report.findings,
+            &cfg.techniques,
+            cfg.dbms_hint.as_deref(),
+            count,
+        );
+        match crate::reasoning::knowledge::save_delta_if_enabled(
+            &delta,
+            true,
+            cli.knowledge_path.as_deref(),
+        ) {
+            Ok(true) => tracing::info!(
+                path = %scrubber.scrub(&cli.effective_knowledge_path().display().to_string()),
+                entries = delta.len(),
+                "knowledge updated (opt-in, aggregates only)"
+            ),
+            Ok(false) => {}
+            Err(e) => warn!(error=%e, "knowledge save failed (run results kept in RAM)"),
+        }
+    }
 
     Ok(ScanResult {
         report,
@@ -188,10 +258,55 @@ async fn run_bulk_cli(cli: &Cli, cancel: CancellationToken) -> Result<()> {
         console::print_findings(&r.findings, &scrubber);
     }
     report.print_summary(&scrubber);
+    // C13 bulk (opt-in) : un seul delta agrégé sur tous les findings du run.
+    if cli.knowledge_enabled() {
+        let findings: Vec<crate::session::state::Finding> = report
+            .per_target
+            .iter()
+            .flat_map(|r| r.findings.clone())
+            .collect();
+        let mut delta = crate::reasoning::knowledge::KnowledgeStore::empty();
+        crate::reasoning::knowledge::learn_from_run(
+            &mut delta,
+            &findings,
+            &cfg.techniques,
+            cfg.dbms_hint.as_deref(),
+            report.request_count_total,
+        );
+        if let Err(e) = crate::reasoning::knowledge::save_delta_if_enabled(
+            &delta,
+            true,
+            cli.knowledge_path.as_deref(),
+        ) {
+            warn!(error=%e, "knowledge save failed (run results kept in RAM)");
+        }
+    }
     if let Some(out) = &cli.output {
-        let json = serde_json::to_string_pretty(&report.to_json(&scrubber))?;
-        write_output_file_async(out, &json, cli.force, &scrubber.scrub(out)).await?;
-        info!(path=%scrubber.scrub(out), "bulk json report written (0o600, no overwrite unless --force)");
+        let body = if matches!(cli.format, crate::cli::args::ReportFormat::Json) {
+            serde_json::to_string_pretty(&report.to_json(&scrubber))?
+        } else {
+            // SARIF/JUnit/Markdown aggregate every per-target finding into
+            // one CI-ready document (bulk has no single target URL).
+            let findings: Vec<crate::session::state::Finding> = report
+                .per_target
+                .iter()
+                .flat_map(|r| r.findings.clone())
+                .collect();
+            let aggregated = JsonReport::new(
+                format!(
+                    "bulk ({} ok / {} total)",
+                    report.targets_ok, report.targets_total
+                ),
+                findings,
+                vec![],
+                vec![],
+                report.request_count_total,
+                crate::reporting::json::ReportMeta::default(),
+            );
+            render_report(&aggregated, cli.format, &scrubber)
+        };
+        write_output_file_async(out, &body, cli.force, &scrubber.scrub(out)).await?;
+        info!(path=%scrubber.scrub(out), format=%cli.format.to_string(), "bulk report written (0o600, no overwrite unless --force)");
     }
     Ok(())
 }
@@ -206,35 +321,83 @@ pub fn has_ingestion_sources(cli: &Cli) -> bool {
         || cli.raw_dir.is_some()
 }
 
-/// Print the execution plan without sending any request.
+/// Print the offline execution plan without sending any request (C11).
+/// 0 requête: no `HttpClient` is built, no `send` is called — lexical URL
+/// parse + passive context + scheduler scores only.
 fn dry_run(cli: &Cli) {
-    let scrubber = Scrubber::new(cli.no_redact);
     println!("dry-run: scan plan (no request sent)");
     println!("  resolution: {}", cli.resolution_summary());
-    let targets = crate::target::ingest::collect_targets(cli, None)
-        .unwrap_or_else(|_| cli.effective_target().map(|t| vec![t]).unwrap_or_default());
+    let cfg = engine_config(cli);
+    // `collect_targets` is lexical-only (parse + dedup, no DNS/HTTP).
+    let targets = match crate::target::ingest::collect_targets(cli, None) {
+        Ok(t) => t,
+        Err(e) => {
+            // Fall back to the single effective target so `--target` typos
+            // still show a plan attempt instead of an empty run.
+            let single = cli.effective_target().into_iter().collect::<Vec<_>>();
+            if single.is_empty() {
+                println!("  targets: 0 ({e})");
+                return;
+            }
+            single
+        }
+    };
     if targets.is_empty() {
         println!("  targets: 0 (no valid target)");
-    } else {
-        println!("  targets: {}", targets.len());
-        for target in targets.iter().take(20) {
-            println!("    - {}", scrubber.scrub(target));
-        }
-        if targets.len() > 20 {
-            println!("    … ({} more)", targets.len() - 20);
+        return;
+    }
+    println!("  targets: {}", targets.len());
+    for target in targets.iter().take(20) {
+        let scrubber = Scrubber::new(cli.no_redact);
+        match crate::cli::plan::build_plan(target, &cfg) {
+            Ok(plan) => {
+                print!(
+                    "{}",
+                    crate::cli::plan::render_human(
+                        &plan.scrubbed(&scrubber),
+                        &cli.resolution_summary(),
+                        true
+                    )
+                );
+            }
+            Err(e) => {
+                println!("    - {}: plan failed: {e}", scrubber.scrub(target));
+            }
         }
     }
-    let cfg = engine_config(cli);
-    println!(
-        "  techniques: {} level={} threads={}",
-        if cfg.techniques.is_empty() {
-            "all".to_owned()
+    if targets.len() > 20 {
+        println!("    … ({} more)", targets.len() - 20);
+    }
+    // C13 : priors knowledge affichés en dry-run (0 requête, OPSEC-safe,
+    // scrubbé : agrégats seuls, aucun identifiant).
+    {
+        let scrubber = Scrubber::new(cli.no_redact);
+        if cli.knowledge_enabled() {
+            let path = cli.effective_knowledge_path();
+            let loaded = cfg
+                .knowledge
+                .as_ref()
+                .map_or(0, crate::reasoning::knowledge::KnowledgeStore::len);
+            println!(
+                "  knowledge: ON path={} entries={} (boost 1+alpha [0.5,1.5] -> clamp [0.5,2.0])",
+                scrubber.scrub(&path.display().to_string()),
+                loaded
+            );
+            if let Some(ks) = cfg.knowledge.as_ref() {
+                for tech in [
+                    "boolean", "error", "union", "time", "stacked", "oob", "json",
+                ] {
+                    if let Some(kind) = crate::reasoning::knowledge::parse_technique(tech) {
+                        let b = ks.boost_for(kind, "unknown", "generic");
+                        println!("    prior {tech}: boost={b:.2}");
+                    }
+                }
+            }
         } else {
-            cfg.techniques.join(",")
-        },
-        cfg.level,
-        cfg.threads
-    );
+            println!("  knowledge: OFF (RAM-only, boost 1.0 neutre)");
+        }
+    }
+    println!("  0 requête envoyée (HttpClient.send jamais appelé)");
 }
 
 /// Original CLI entry point — prints to stdout/stderr.
@@ -262,12 +425,22 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> Result<()> {
     console::print_findings(&result.report.findings, &scrubber);
     console::print_extracted(&result.report.extracted);
 
+    // `--explain <param>`: one-line reasoning verdict to stdout (in addition
+    // to the orchestrator `info!` log above). Reads findings + RAM-only trace.
+    if let Some(wanted) = cli.explain.as_deref() {
+        let st = result.state_handle.read().await;
+        match st.explain(wanted) {
+            Some(line) => println!("explain {wanted}: {line}"),
+            None => println!("explain {wanted}: no finding matches"),
+        }
+    }
+
     if let Some(out) = &cli.output {
-        let json = result.report.to_json(&scrubber);
+        let body = render_report(&result.report, cli.format, &scrubber);
         // Secure write: 0o600, create_new (no overwrite unless --force),
         // relative-only + canonicalized parent (see `output::file`).
-        write_output_file_async(out, &json, cli.force, &scrubber.scrub(out)).await?;
-        info!(path=%scrubber.scrub(out), "json report written (0o600, no overwrite unless --force)");
+        write_output_file_async(out, &body, cli.force, &scrubber.scrub(out)).await?;
+        info!(path=%scrubber.scrub(out), format=%cli.format.to_string(), "report written (0o600, no overwrite unless --force)");
     }
 
     if let Some(path) = &cli.export_encrypted {

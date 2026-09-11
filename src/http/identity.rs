@@ -36,10 +36,19 @@ impl Identity {
         ),
     ];
 
+    /// OS-random UA pick; seeded runs must use [`Self::random_with_rng`].
+    /// Routed through `make_rng(None)` so the seeded entry point stays unique.
     #[must_use]
     pub fn random() -> Self {
-        let mut rng = rand::rng();
-        let (ua, ch) = Self::POOL.choose(&mut rng).unwrap_or(&Self::POOL[0]);
+        let mut rng = crate::seeded_rng::make_rng(None);
+        Self::random_with_rng(&mut rng)
+    }
+
+    /// Seeded UA pick: draws from `rng` so the same `--seed` yields the same
+    /// identity. Pass `&mut crate::seeded_rng::make_rng(seed)`.
+    #[must_use]
+    pub fn random_with_rng(rng: &mut impl rand::Rng) -> Self {
+        let (ua, ch) = Self::POOL.choose(&mut *rng).unwrap_or(&Self::POOL[0]);
         Self {
             user_agent: (*ua).to_owned(),
             sec_ch_ua: (*ch).to_owned(),
@@ -84,5 +93,45 @@ impl Identity {
 impl Default for Identity {
     fn default() -> Self {
         Self::random()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::seeded_rng::make_rng;
+
+    #[test]
+    fn same_seed_same_identity() {
+        let mut a = make_rng(Some(99));
+        let mut b = make_rng(Some(99));
+        let ia = Identity::random_with_rng(&mut a);
+        let ib = Identity::random_with_rng(&mut b);
+        assert_eq!(ia.user_agent, ib.user_agent);
+        assert_eq!(ia.sec_ch_ua, ib.sec_ch_ua);
+    }
+
+    #[test]
+    fn different_seeds_likely_differ_over_sequence() {
+        let mut a = make_rng(Some(1));
+        let mut b = make_rng(Some(2));
+        let xs: Vec<String> = (0..10)
+            .map(|_| Identity::random_with_rng(&mut a).user_agent)
+            .collect();
+        let ys: Vec<String> = (0..10)
+            .map(|_| Identity::random_with_rng(&mut b).user_agent)
+            .collect();
+        assert_ne!(xs, ys);
+    }
+
+    #[test]
+    fn none_path_produces_known_pool_ua() {
+        let mut rng = make_rng(None);
+        let id = Identity::random_with_rng(&mut rng);
+        assert!(!id.user_agent.is_empty());
+        assert!(!id.headers().is_empty());
+        // OS-random wrapper stays usable.
+        assert!(!Identity::random().user_agent.is_empty());
     }
 }

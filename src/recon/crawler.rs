@@ -4,7 +4,8 @@ use crate::{
     http::client::{HttpClient, RequestSpec},
     recon::{
         filters::{
-            is_in_scope, normalize_page_url, page_template_key, should_skip_candidate,
+            candidate_template_key, is_in_scope, is_internal_crawl_path, is_placeholder_value,
+            is_templated_token, normalize_page_url, page_template_key, should_skip_candidate,
             should_skip_crawl_url,
         },
         parameter::{CandidateMethod, FormContext, ParamType, ParameterCandidate},
@@ -31,6 +32,11 @@ pub struct CrawlConfig {
     /// fetched — guards against pagination/listing/calendar traps burning
     /// the whole `max_pages` budget on redundant instances of one page shape.
     pub max_per_template: usize,
+    /// Cap on redundant candidate instances sharing one sink shape
+    /// ([`candidate_template_key`]) and on the total candidate list
+    /// (`max_candidates`): listing/gallery/proxy endpoints otherwise queue
+    /// hundreds of near-identical params that burn scan budget.
+    pub max_candidates: usize,
     pub include_subdomains: bool,
     pub respect_robots: bool,
     pub allow_private: bool,
@@ -45,6 +51,7 @@ impl Default for CrawlConfig {
             depth: 2,
             max_pages: 100,
             max_per_template: 3,
+            max_candidates: 500,
             include_subdomains: false,
             respect_robots: true,
             allow_private: false,
@@ -128,8 +135,13 @@ impl Crawler {
         let mut template_counts: HashMap<String, usize> = HashMap::new();
         let mut capped_templates = HashSet::new();
         let mut candidate_keys = HashSet::new();
+        let mut candidate_template_counts: HashMap<String, usize> = HashMap::new();
         let mut candidates = Vec::new();
         let mut warnings = Vec::new();
+        let mut dropped_placeholder = 0usize;
+        let mut dropped_template_cap = 0usize;
+        let mut dropped_noise = 0usize;
+        let mut dropped_over_cap = 0usize;
 
         while let Some((page_url, depth)) = queue.pop_front() {
             if cancel.is_cancelled() || visited.len() >= self.config.max_pages {
@@ -211,19 +223,41 @@ impl Crawler {
             let extracted = extract_document(&page_url, &body);
             let mut found_here = 0usize;
             for candidate in extracted.candidates {
-                if is_in_scope(&root, &candidate.url, self.config.include_subdomains)
-                    && TargetUrl::parse(candidate.url.as_str(), self.config.allow_private).is_ok()
-                    && robots.allows(candidate.url.path())
-                    && !should_skip_candidate(
-                        &candidate.url,
-                        &candidate.param_name,
-                        candidate.method,
-                    )
-                    && candidate_keys.insert(candidate.dedup_key())
+                if !is_in_scope(&root, &candidate.url, self.config.include_subdomains)
+                    || TargetUrl::parse(candidate.url.as_str(), self.config.allow_private).is_err()
+                    || !robots.allows(candidate.url.path())
                 {
-                    candidates.push(candidate);
-                    found_here += 1;
+                    continue;
                 }
+                if should_skip_candidate(&candidate.url, &candidate.param_name, candidate.method) {
+                    dropped_noise += 1;
+                    continue;
+                }
+                // Templated values (`{...}`, backslash-only artefacts) are
+                // template placeholders, not injectable inputs.
+                if is_placeholder_value(&candidate.original_value) {
+                    dropped_placeholder += 1;
+                    continue;
+                }
+                if !candidate_keys.insert(candidate.dedup_key()) {
+                    continue;
+                }
+                // Same sink shape (host + path pattern + param) with different
+                // instance data: keep the first few, drop the rest so one
+                // listing/gallery/proxy family can't flood the scan budget.
+                let sink_key = candidate_template_key(&candidate.url, &candidate.param_name);
+                let sink_count = candidate_template_counts.entry(sink_key).or_insert(0);
+                if *sink_count >= self.config.max_per_template {
+                    dropped_template_cap += 1;
+                    continue;
+                }
+                *sink_count += 1;
+                if candidates.len() >= self.config.max_candidates {
+                    dropped_over_cap += 1;
+                    continue;
+                }
+                candidates.push(candidate);
+                found_here += 1;
             }
             if found_here > 0 {
                 tracing::info!(
@@ -257,9 +291,14 @@ impl Crawler {
 
         candidates.sort_by_key(ParameterCandidate::dedup_key);
         tracing::info!(
-            "crawl finished: {} page(s) visited, {} parameter(s) found in {:.2}s",
+            "crawl finished: {} page(s) visited, {} parameter(s) kept ({} placeholder, {} noise, {} template-capped, {} over --max-candidates {}) in {:.2}s",
             visited.len(),
             candidates.len(),
+            dropped_placeholder,
+            dropped_noise,
+            dropped_template_cap,
+            dropped_over_cap,
+            self.config.max_candidates,
             started.elapsed().as_secs_f64()
         );
         Ok(CrawlReport {
@@ -411,10 +450,122 @@ fn extract_document(base: &Url, body: &str) -> ExtractedDocument {
 
     if let Some(js_endpoint) = js_endpoint_regex() {
         for captures in js_endpoint.captures_iter(body) {
-            if let Some(raw) = captures.get(1)
-                && let Ok(url) = base.join(raw.as_str())
-            {
-                add_link_candidates(&mut out, url, ParamType::Javascript);
+            if let Some(raw) = captures.get(1) {
+                let decoded = decode_embedded_url(raw.as_str());
+                if let Ok(url) = base.join(&decoded) {
+                    add_link_candidates(&mut out, url, ParamType::Javascript);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Decode URLs embedded in HTML/JS/JSON before `Url::join`.
+///
+/// JS-embedded endpoints frequently carry HTML-escaped (`&amp;`) or
+/// JSON-escaped (`\u0026`) separators (Next.js `__NEXT_DATA__`, inline
+/// `<script>`). Without decoding, `?title=a&amp;desc=b` parses as a single
+/// `amp;desc` param and `?a=1\u0026b=2` as one garbled value — both yield
+/// `1/1` single-param scans and wasted probes.
+///
+/// Order matters (same as `matcher::strip_html`): `\uXXXX` + `\/` first,
+/// then `&lt;/&gt;/&quot;/&#x27;/&#39;`, `&amp;` last to avoid turning
+/// `&amp;lt;` into `<`.
+///
+/// Double-escaping is common (HTML-escaped JSON inside HTML, JS string
+/// literals built from already-escaped data), so both phases run to a
+/// bounded fixed point (max 3 passes):
+/// - JS escapes: `\\u0026` (source-level) collapses to `\u0026` on pass 1
+///   and to `&` on pass 2. Trade-off: a literal backslash that is genuinely
+///   part of a query value (vanishingly rare — WHATWG parsers treat `\` as
+///   `/` on `http(s)` URLs anyway) may be over-decoded; structural
+///   correctness of the extracted URL wins for a scanner.
+/// - HTML entities run one full pass (pinning `&amp;lt;` to `&lt;`, never
+///   `<`), then only `&amp;` is repeated: it is the query separator, so a
+///   remnant corrupts param splitting (`amp;`-prefixed names), while other
+///   entities only affect values.
+///
+/// A trailing `\` run left by an escaped closing quote (`"...en\\"`) is
+/// stripped: it is a JS-string artefact, never a meaningful URL suffix.
+#[must_use]
+fn decode_embedded_url(raw: &str) -> String {
+    let mut current = raw.to_owned();
+    for _ in 0..3 {
+        let next = decode_js_string_escapes(&current);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    let mut decoded = decode_html_entities_once(&current);
+    for _ in 0..3 {
+        if !decoded.contains("&amp;") {
+            break;
+        }
+        let next = decoded.replace("&amp;", "&");
+        if next == decoded {
+            break;
+        }
+        decoded = next;
+    }
+    decoded.trim_end_matches('\\').to_owned()
+}
+
+/// Single HTML-entity pass for embedded URLs: `&lt;/&gt;/&quot;/&#x27;/&#39;`
+/// first, `&amp;` last so `&amp;lt;` decodes to `&lt;`, never `<`.
+fn decode_html_entities_once(raw: &str) -> String {
+    raw.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#X27;", "'")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Minimal JS string unescape: `\uXXXX`, `\/`, `\\`, `\"`, `\'`, plus
+/// `\n`/`\r`/`\t`. Unknown escapes are kept verbatim; lone `\u` without 4
+/// hex digits is kept. Char-based (never byte-indexes `&str`) so multibyte
+/// UTF-8 survives intact.
+fn decode_js_string_escapes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(next) = chars.next() else {
+            out.push('\\');
+            break;
+        };
+        match next {
+            'u' => {
+                let hex: String = chars.by_ref().take(4).collect();
+                if hex.len() == 4
+                    && let Ok(code) = u32::from_str_radix(&hex, 16)
+                {
+                    if let Some(ch) = char::from_u32(code) {
+                        out.push(ch);
+                    } else {
+                        out.push_str("\\u");
+                        out.push_str(&hex);
+                    }
+                } else {
+                    out.push_str("\\u");
+                    out.push_str(&hex);
+                }
+            }
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            '/' => out.push('/'),
+            '\\' | '"' | '\'' => out.push(next),
+            _ => {
+                out.push('\\');
+                out.push(next);
             }
         }
     }
@@ -422,6 +573,11 @@ fn extract_document(base: &Url, body: &str) -> ExtractedDocument {
 }
 
 fn add_link_candidates(out: &mut ExtractedDocument, mut url: Url, param_type: ParamType) {
+    // Cloudflare/internal endpoints are never SQLi-testable and never worth
+    // a crawl fetch (`/cdn-cgi/...`, `/_next/...` build artefacts).
+    if is_internal_crawl_path(&url) {
+        return;
+    }
     url.set_fragment(None);
     // Collect pairs first: `query_pairs` borrows `url` while we also push.
     let pairs: Vec<(String, String)> = url
@@ -429,6 +585,13 @@ fn add_link_candidates(out: &mut ExtractedDocument, mut url: Url, param_type: Pa
         .map(|(n, v)| (n.into_owned(), v.into_owned()))
         .collect();
     for (name, value) in pairs {
+        // OpenSearch-style placeholders (`q={search_term_string}`, decoded
+        // from `%7B...%7D` by `query_pairs`) are templates, not values.
+        // `is_placeholder_value` additionally drops JS-string artefacts
+        // (backslash-only values); genuinely empty values stay testable.
+        if is_templated_token(&name) || is_placeholder_value(&value) {
+            continue;
+        }
         // Drop Elementor-style `post-*.css?ver=3.8.0` noise at the source:
         // static asset + cache-busting param is never SQLi-testable.
         if should_skip_candidate(&url, &name, CandidateMethod::Get) {
@@ -454,11 +617,14 @@ fn selector(value: &str) -> Selector {
 }
 
 /// JS endpoint pattern compiled once (was `Regex::new` per crawled page).
+/// Escape-aware: `(?:\\.|[^\"'])*` lets an escaped quote (`\"`, `\'`) or an
+/// escaped backslash (`\\`) live inside the URL instead of cutting the match
+/// and leaving a trailing `\` artefact in the candidate.
 fn js_endpoint_regex() -> Option<&'static Regex> {
     static CELL: OnceLock<Option<Regex>> = OnceLock::new();
     CELL.get_or_init(|| {
         Regex::new(
-            r#"[\"']((?:https?://[^\"']+|/[^\"']+)[?&][A-Za-z_][A-Za-z0-9_.-]*=[^\"']*)[\"']"#,
+            r#"[\"']((?:https?://(?:\\.|[^\"'])+|/(?:\\.|[^\"'])+)[?&][A-Za-z_][A-Za-z0-9_.-]*=(?:\\.|[^\"'])*)[\"']"#,
         )
         .ok()
     })
@@ -470,7 +636,11 @@ fn resolve_attr(base: &Url, element: &ElementRef<'_>, attr: &str) -> Option<Url>
     if value.starts_with('#') || value.starts_with("javascript:") || value.starts_with("mailto:") {
         return None;
     }
-    base.join(value).ok().map(normalize_page_url)
+    // `scraper` already decodes most entities, but JS-injected `href`s and
+    // double-escaped payloads can still carry `&amp;`/`\u0026`: decoding here
+    // is idempotent (single-decode, `&amp;` last).
+    let decoded = decode_embedded_url(value);
+    base.join(&decoded).ok().map(normalize_page_url)
 }
 
 fn field_value(field: &ElementRef<'_>) -> String {
@@ -589,5 +759,113 @@ mod tests {
             RobotsRules::parse("User-agent: *\nDisallow: /private\nAllow: /private/public\n");
         assert!(!rules.allows("/private/a"));
         assert!(rules.allows("/private/public/a"));
+    }
+
+    #[test]
+    fn decode_embedded_url_handles_html_and_json_escapes() {
+        assert_eq!(
+            decode_embedded_url("/api?a=1&amp;desc=x"),
+            "/api?a=1&desc=x"
+        );
+        assert_eq!(decode_embedded_url(r"/api?a=1\u0026b=2"), "/api?a=1&b=2");
+        // Single decode only: `&amp;lt;` -> `&lt;`, not `<`.
+        assert_eq!(decode_embedded_url("/api?q=&amp;lt;"), "/api?q=&lt;");
+        // Multibyte UTF-8 survives JS unescaping.
+        assert_eq!(
+            decode_embedded_url(r"/api?q=caf\u00e9-\u65e5\u672c\u8a9e"),
+            "/api?q=caf\u{e9}-\u{65e5}\u{672c}\u{8a9e}"
+        );
+        // Lone `\u` without 4 hex digits is kept verbatim, no panic.
+        assert_eq!(decode_embedded_url(r"/api?q=\u12"), "/api?q=\\u12");
+    }
+
+    #[test]
+    fn decode_embedded_url_resolves_double_escapes() {
+        // Double-escaped separator: `&amp;amp;` must split into two params,
+        // not one `amp;`-prefixed remnant.
+        assert_eq!(decode_embedded_url("/api?a=1&amp;amp;b=2"), "/api?a=1&b=2");
+        // Double-escaped JSON separator: source-level `\\u0026` collapses to
+        // `\u0026` on pass 1 and to `&` on pass 2.
+        assert_eq!(decode_embedded_url(r"/api?a=1\\u0026b=2"), "/api?a=1&b=2");
+        // Trailing backslash from an escaped closing quote is a JS artefact.
+        assert_eq!(
+            decode_embedded_url(r"/api/path?locale=HK_EN\\"),
+            "/api/path?locale=HK_EN"
+        );
+        // Single-decode pin preserved: `&amp;lt;` stops at `&lt;`.
+        assert_eq!(decode_embedded_url("/api?q=&amp;lt;"), "/api?q=&lt;");
+        // Idempotent on clean URLs.
+        assert_eq!(decode_embedded_url("/api?a=1&b=2"), "/api?a=1&b=2");
+    }
+
+    #[test]
+    fn js_endpoint_regex_handles_escaped_quotes_and_backslashes() {
+        let base = Url::parse("https://example.com/page").unwrap();
+        // Escaped quote inside the value must not cut the match: both params
+        // survive and no value keeps a trailing backslash.
+        let doc = extract_document(&base, r#"var u="/api/x?title=a\'b&desc=c";"#);
+        assert!(
+            doc.candidates.iter().any(|c| c.param_name == "desc"),
+            "desc must survive an escaped quote: {:?}",
+            doc.candidates
+                .iter()
+                .map(|c| &c.param_name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !doc.candidates
+                .iter()
+                .any(|c| c.original_value.ends_with('\\')),
+            "no trailing backslash artefact expected"
+        );
+        // Double-escaped separator inside JS splits into two params.
+        let doc2 = extract_document(&base, r#"var u="/api/y?one=1&amp;amp;two=2";"#);
+        assert!(doc2.candidates.iter().any(|c| c.param_name == "one"));
+        assert!(doc2.candidates.iter().any(|c| c.param_name == "two"));
+        assert!(
+            !doc2
+                .candidates
+                .iter()
+                .any(|c| c.param_name.contains("amp;")),
+            "no amp; remnant expected"
+        );
+    }
+    #[test]
+    fn js_embedded_endpoints_split_params_after_decode() {
+        let base = Url::parse("https://example.com/page").unwrap();
+        let doc = extract_document(&base, r#"var u="/api/dynamic-og?title=Hi&amp;desc=New";"#);
+        assert!(
+            doc.candidates.iter().any(|c| c.param_name == "desc"),
+            "amp;desc must decode to desc: {:?}",
+            doc.candidates
+                .iter()
+                .map(|c| &c.param_name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !doc.candidates.iter().any(|c| c.param_name.contains("amp;")),
+            "no amp; remnant expected"
+        );
+        let doc2 = extract_document(&base, r#"var u="/api/x?cate=A\u0026desc=B";"#);
+        assert!(doc2.candidates.iter().any(|c| c.param_name == "cate"));
+        assert!(doc2.candidates.iter().any(|c| c.param_name == "desc"));
+    }
+
+    #[test]
+    fn templated_and_internal_js_endpoints_are_dropped() {
+        let base = Url::parse("https://example.com/page").unwrap();
+        let doc = extract_document(
+            &base,
+            r#"var a="/bg/agent?q=%7Bsearch_term_string%7D"; var b="/cdn-cgi/content?id=abc";"#,
+        );
+        assert!(
+            doc.candidates.is_empty(),
+            "placeholders + cdn-cgi must yield no candidates: {:?}",
+            doc.candidates
+                .iter()
+                .map(|c| c.url.as_str().to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert!(doc.links.is_empty());
     }
 }

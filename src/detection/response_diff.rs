@@ -19,6 +19,84 @@ impl DiffResult {
 }
 
 const MAX_LEVENSHTEIN_LEN: usize = 1024;
+/// Bench anti-noise: `bench/app.py::noisy()` injects a random `request_id`
+/// (8 hex chars) + `generated_at` (epoch float) into every JSON envelope so
+/// naive string-compare diffing breaks. Normalize both fields to fixed
+/// placeholders before any similarity so two identical pages with different
+/// noise compare ~1.0. Handles pretty-printed (`"request_id": "abc",`) and
+/// compact (`"request_id":"abc"`) shapes; unknown fields are untouched.
+/// Bodies without either marker are returned unchanged (cheap path).
+#[must_use]
+pub fn normalize_response_for_diff(body: &str) -> String {
+    if !body.contains("request_id") && !body.contains("generated_at") {
+        return body.to_owned();
+    }
+    let normalized_id = normalize_json_field(body, "request_id", "\"\"");
+    normalize_json_field(&normalized_id, "generated_at", "0")
+}
+
+/// Replace the value of one `"field": <value>` JSON member with `placeholder`,
+/// preserving keys, separators and structure. String values (`"..."`) and
+/// bare numbers/literals (`123.4`, `null`) are both handled; anything else
+/// leaves the body intact so detection never scores a mangled page.
+fn normalize_json_field(body: &str, field: &str, placeholder: &str) -> String {
+    let needle = format!("\"{field}\"");
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(start) = rest.find(needle.as_str()) {
+        let after_key = &rest[start + needle.len()..];
+        let Some(colon_off) = after_key.find(':') else {
+            out.push_str(rest);
+            return out;
+        };
+        // Byte offset of the value start inside `after_key`.
+        let mut value_off = colon_off + 1;
+        let bytes = after_key.as_bytes();
+        while value_off < bytes.len() && bytes[value_off].is_ascii_whitespace() {
+            value_off += 1;
+        }
+        if value_off >= bytes.len() {
+            out.push_str(rest);
+            return out;
+        }
+        // End offset (exclusive) of the value inside `after_key`.
+        let mut value_end = None;
+        if bytes[value_off] == b'"' {
+            let mut i = value_off + 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i = i.saturating_add(2);
+                } else if bytes[i] == b'"' {
+                    value_end = Some(i + 1);
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            let mut i = value_off;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'.' | b'+' | b'-'))
+            {
+                i += 1;
+            }
+            if i > value_off {
+                value_end = Some(i);
+            }
+        }
+        let Some(value_end) = value_end else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..start]);
+        out.push_str(needle.as_str());
+        out.push_str(": ");
+        out.push_str(placeholder);
+        rest = &after_key[value_end..];
+    }
+    out.push_str(rest);
+    out
+}
 
 /// Similarities below this threshold all take the same detection branch
 /// (`combined_sim < 0.5` in [`diff_against_baseline`]), so the DP result
@@ -28,12 +106,16 @@ const EARLY_EXIT_SIM: f64 = 0.5;
 /// Normalized Levenshtein similarity 0..1. Truncates inputs to 1024 chars
 /// and skips the O(n·m) DP when the length difference alone guarantees a
 /// similarity below [`EARLY_EXIT_SIM`].
+/// Bench noise (`request_id`/`generated_at`) is normalized first so direct
+/// callers get the same anti-noise behaviour as [`adaptive_similarity`].
 #[must_use]
 // Inputs are truncated to MAX_LEVENSHTEIN_LEN (1024); casts are always lossless.
 #[allow(clippy::cast_precision_loss)]
 pub fn levenshtein_similarity(a: &str, b: &str) -> f64 {
-    let a_trunc = truncate(a);
-    let b_trunc = truncate(b);
+    let norm_a = normalize_response_for_diff(a);
+    let norm_b = normalize_response_for_diff(b);
+    let a_trunc = truncate(&norm_a);
+    let b_trunc = truncate(&norm_b);
     // Early-exit: edit distance >= |n-m|, so similarity <= 1 - |n-m|/max.
     // Char counts are O(n); the DP they skip is O(n*m).
     let n_chars = a_trunc.chars().count();
@@ -88,22 +170,31 @@ fn truncate(s: &str) -> &str {
 }
 
 /// Choose similarity strategy based on body size: Levenshtein for small, Jaccard for large.
+/// Both inputs are normalized for bench noise (`request_id`/`generated_at`)
+/// before comparison so per-response randomness never reads as a differential.
 #[must_use]
 pub fn adaptive_similarity(a: &str, b: &str) -> f64 {
-    if a.len() > MAX_LEVENSHTEIN_LEN || b.len() > MAX_LEVENSHTEIN_LEN {
-        jaccard(a, b)
+    let norm_a = normalize_response_for_diff(a);
+    let norm_b = normalize_response_for_diff(b);
+    if norm_a.len() > MAX_LEVENSHTEIN_LEN || norm_b.len() > MAX_LEVENSHTEIN_LEN {
+        jaccard(&norm_a, &norm_b)
     } else {
-        levenshtein_similarity(a, b)
+        levenshtein_similarity(&norm_a, &norm_b)
     }
 }
 
 /// Jaccard index over whitespace tokens.
+/// Normalizes bench noise first (see [`normalize_response_for_diff`]): direct
+/// callers such as the boolean detector get the same anti-noise behaviour as
+/// [`adaptive_similarity`] without pre-processing.
 #[must_use]
 // Token-set sizes never approach f64's 2^52 mantissa limit for HTTP response bodies.
 #[allow(clippy::cast_precision_loss)]
 pub fn jaccard(a: &str, b: &str) -> f64 {
-    let sa: std::collections::HashSet<&str> = a.split_whitespace().collect();
-    let sb: std::collections::HashSet<&str> = b.split_whitespace().collect();
+    let norm_a = normalize_response_for_diff(a);
+    let norm_b = normalize_response_for_diff(b);
+    let sa: std::collections::HashSet<&str> = norm_a.split_whitespace().collect();
+    let sb: std::collections::HashSet<&str> = norm_b.split_whitespace().collect();
     if sa.is_empty() && sb.is_empty() {
         return 1.0;
     }
@@ -194,5 +285,25 @@ mod tests {
         assert!(t.is_char_boundary(t.len()));
         // Similarity over such bodies must not panic either.
         let _ = levenshtein_similarity(&s, &s);
+    }
+    #[test]
+    fn bench_noise_normalized_before_similarity() {
+        // `bench/app.py::noisy()` shape: same page, different per-response
+        // `request_id` + `generated_at` must compare ~identical.
+        let a = "{\n  \"data\": [{\"id\": 1}],\n  \"request_id\": \"a1b2c3d4\",\n  \"generated_at\": 1757328000.123\n}";
+        let b = "{\n  \"data\": [{\"id\": 1}],\n  \"request_id\": \"e5f6a7b8\",\n  \"generated_at\": 1757328001.456\n}";
+        assert!(adaptive_similarity(a, b) > 0.95);
+        let diff = diff_against_baseline(a, b, 100.0, 105.0, 100.0);
+        assert!(!diff.is_significant());
+        // Compact shape normalizes too.
+        let c = "{\"data\":1,\"request_id\":\"aaaa\",\"generated_at\":1.5}";
+        let d = "{\"data\":1,\"request_id\":\"bbbb\",\"generated_at\":2.5}";
+        assert!(adaptive_similarity(c, d) > 0.95);
+    }
+    #[test]
+    fn normalize_leaves_clean_bodies_untouched() {
+        let body = "{\"data\": [1, 2, 3]}";
+        assert_eq!(normalize_response_for_diff(body), body);
+        assert_eq!(normalize_response_for_diff(""), "");
     }
 }

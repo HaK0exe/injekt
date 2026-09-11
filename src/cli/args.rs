@@ -17,6 +17,34 @@ pub enum TechniqueOpt {
     All,
 }
 
+/// Report serialization selected by `--format` (C7 intelligent reporting).
+/// Controls `--output` file content (and `--bulk-file` aggregated reports);
+/// console output is unchanged. Default is `json` (historical behaviour).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+#[non_exhaustive]
+pub enum ReportFormat {
+    /// Historical `JsonReport` schema (extended with C7 calibrated fields).
+    #[default]
+    Json,
+    /// SARIF 2.1.0 for CI code-scanning ingestion.
+    Sarif,
+    /// `JUnit` XML for CI test-case dashboards.
+    Junit,
+    /// Human-sendable Markdown with remediation.
+    Md,
+}
+
+impl core::fmt::Display for ReportFormat {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Json => write!(f, "json"),
+            Self::Sarif => write!(f, "sarif"),
+            Self::Junit => write!(f, "junit"),
+            Self::Md => write!(f, "md"),
+        }
+    }
+}
+
 #[derive(Parser, Clone)]
 #[command(name="injekt", version, about="Modern SQLi detection — zero persistence, anonymisation by design", long_about=None)]
 #[non_exhaustive]
@@ -147,6 +175,19 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub output: Option<String>,
 
+    /// Report serialization for `--output` files: `json` (default, historical
+    /// `JsonReport` schema + C7 calibrated fields), `sarif` (2.1.0, CI
+    /// code-scanning), `junit` (CI test cases), `md` (human-sendable with
+    /// remediation). Console output is unchanged. All formats are scrubbed.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "json",
+        env = "INJEKT_FORMAT"
+    )]
+    pub format: ReportFormat,
+
     #[arg(long, global = true, env = "INJEKT_RATE_LIMIT")]
     pub rate_limit: Option<f64>,
 
@@ -179,11 +220,37 @@ pub struct Cli {
     #[arg(long, global = true, value_parser = clap::value_parser!(u8).range(1..=5), env = "INJEKT_LEVEL")]
     pub level: Option<u8>,
 
-    /// Strict second-pass confirmation (currently logs a warning only:
-    /// second-pass replay is not implemented yet; in-detection 3-trial
-    /// confirmation still applies regardless of this flag).
+    /// Strict second-pass confirmation (C6 real): re-sondes every confirmed
+    /// finding with fresh payloads + derived seed after detection (OOB
+    /// excluded, ~2x requests worst-case, documented). Never creates new
+    /// findings — only drops those that fail re-validation. In-detection
+    /// 3-trial confirmation still applies regardless of this flag.
     #[arg(long, global = true)]
     pub confirm: bool,
+
+    /// Disable the C5-tardif mini-mutation second-pass (escape hatch).
+    /// Default is mutation ON but strictly scoped: only on already-confirmed
+    /// findings, only from the `--confirm` second-pass, ≤4 variants / ≤8
+    /// requests per finding, seeded, traced (`mutation:<famille>`), silent
+    /// failure (the original finding is kept). No mutation ever runs in
+    /// first-pass detection or on unconfirmed targets.
+    #[arg(long = "no-mutation", global = true)]
+    pub no_mutation: bool,
+
+    /// One-line reasoning verdict for a finding (`--explain id@query`):
+    /// prints `TRUE≈baseline 0.91, FALSE≠baseline 0.22, 3/3, waf=none,
+    /// 14 req, seed 42` after the scan (or from `replay --file`).
+    /// No extra requests; reads the RAM-only trace + evidence.
+    #[arg(long, global = true, env = "INJEKT_EXPLAIN")]
+    pub explain: Option<String>,
+
+    /// Deterministic run seed, recorded in the JSON report (`seed`) for
+    /// reproducibility (C1 metrology). Seeds all non-cryptographic RNG
+    /// (tamper scripts, request jitter, UA rotation, retry backoff): runs
+    /// with the same seed are deterministic. Crypto randomness (export
+    /// salt/nonce) always stays on OS randomness and ignores this seed.
+    #[arg(long, global = true, env = "INJEKT_SEED")]
+    pub seed: Option<u64>,
 
     /// HTTP status codes treated as negative probes during detection
     /// (e.g. --ignore-code 429,503): an ignored response never yields a
@@ -229,6 +296,21 @@ pub struct Cli {
 
     #[arg(long, global = true)]
     pub allow_private: bool,
+
+    /// C13 Knowledge Engine opt-in (défaut OFF = RAM-only, 0 lecture/écriture,
+    /// boost 1.0 neutre byte-identique). Activé : lecture au boot de
+    /// `~/.cache/injekt/knowledge.json` (ou `--knowledge-path` /
+    /// `INJEKT_KNOWLEDGE_PATH`), boost `1+alpha` borné `[0.5,1.5]` puis clamp
+    /// scheduler `[0.5,2.0]`, écriture post-run (fusion, fsync, perms 0600).
+    /// Agrégats anonymes `(technique, dbms, contexte)` uniquement — jamais de
+    /// cible/param/seed/secret persisté.
+    #[arg(long, global = true, env = "INJEKT_ALLOW_KNOWLEDGE")]
+    pub allow_knowledge: bool,
+
+    /// Chemin du store knowledge (défaut `~/.cache/injekt/knowledge.json`).
+    /// Inutilisé quand `--allow-knowledge` est absent (aucune IO).
+    #[arg(long, global = true, env = "INJEKT_KNOWLEDGE_PATH")]
+    pub knowledge_path: Option<String>,
 
     /// Raw HTTP request file (Burp/ZAP) — alternative to --target
     #[arg(long, global = true)]
@@ -318,6 +400,7 @@ impl core::fmt::Debug for Cli {
             .field("stop", &self.stop)
             .field("count", &self.count)
             .field("output", &self.output)
+            .field("format", &self.format)
             .field("rate_limit", &self.rate_limit)
             .field("jitter", &self.jitter)
             .field("marker", &self.marker)
@@ -327,6 +410,9 @@ impl core::fmt::Debug for Cli {
             .field("text_only", &self.text_only)
             .field("level", &self.level)
             .field("confirm", &self.confirm)
+            .field("no_mutation", &self.no_mutation)
+            .field("explain", &self.explain)
+            .field("seed", &self.seed)
             .field("ignore_codes", &self.ignore_codes)
             .field("oob_domain", &self.oob_domain)
             .field("oob_poll_url", &redacted_opt(&self.oob_poll_url))
@@ -338,6 +424,8 @@ impl core::fmt::Debug for Cli {
             .field("import", &self.import)
             .field("no_redact", &self.no_redact)
             .field("allow_private", &self.allow_private)
+            .field("allow_knowledge", &self.allow_knowledge)
+            .field("knowledge_path", &self.knowledge_path)
             .field("raw_file", &self.raw_file)
             .field("raw_dir", &self.raw_dir)
             .field("stdin", &self.stdin)
@@ -401,6 +489,11 @@ pub struct ReconCrawlArgs {
     /// burning the whole --max-pages budget on redundant instances.
     #[arg(long, default_value_t = 3)]
     pub max_per_template: usize,
+    /// Cap on the total discovered parameters kept: listing/gallery/proxy
+    /// families otherwise queue hundreds of near-identical candidates that
+    /// burn scan budget. Redundant sink shapes are dropped first.
+    #[arg(long, default_value_t = 500)]
+    pub max_candidates: usize,
     #[arg(long)]
     pub include_subdomains: bool,
     #[arg(long)]
@@ -632,6 +725,30 @@ impl Cli {
             return v.clamp(1, 5);
         }
         self.active_profile().map_or(1, Profile::level)
+    }
+
+    /// Effective deterministic seed. Precedence: CLI/env > file.
+    /// Profiles never set a seed (reproducibility is explicit opt-in).
+    #[must_use]
+    pub fn effective_seed(&self) -> Option<u64> {
+        if let Some(v) = self.seed {
+            return Some(v);
+        }
+        self.file_snapshot().seed
+    }
+
+    /// C13 opt-in gate: `false` par défaut → RAM-only, aucune IO knowledge,
+    /// boost neutre `1.0` (chemin byte-identique au sans-knowledge).
+    #[must_use]
+    pub const fn knowledge_enabled(&self) -> bool {
+        self.allow_knowledge
+    }
+
+    /// Chemin effectif du store (`--knowledge-path` > `INJEKT_KNOWLEDGE_PATH` >
+    /// `~/.cache/injekt/knowledge.json`). Non résolu / non touché quand OFF.
+    #[must_use]
+    pub fn effective_knowledge_path(&self) -> std::path::PathBuf {
+        crate::reasoning::knowledge::resolve_knowledge_path(self.knowledge_path.as_deref())
     }
 
     /// Effective technique list. Non-empty CLI `--techniques` always wins
@@ -986,6 +1103,7 @@ mod tests {
             stop: None,
             count: false,
             output: None,
+            format: ReportFormat::Json,
             rate_limit: None,
             jitter: None,
             marker: None,
@@ -995,6 +1113,9 @@ mod tests {
             text_only: false,
             level: None,
             confirm: false,
+            no_mutation: false,
+            explain: None,
+            seed: None,
             ignore_codes: Vec::new(),
             oob_domain: None,
             oob_poll_url: None,
@@ -1006,6 +1127,8 @@ mod tests {
             import: None,
             no_redact: false,
             allow_private: false,
+            allow_knowledge: false,
+            knowledge_path: None,
             raw_file: None,
             raw_dir: None,
             stdin: false,
@@ -1058,6 +1181,31 @@ mod tests {
         assert_eq!(cli.effective_threads(), 9);
         assert_eq!(cli.effective_level(), 3);
         assert_eq!(cli.effective_techniques(), vec!["union".to_owned()]);
+    }
+
+    #[test]
+    fn seed_defaults_to_none_and_ignores_profile() {
+        let cli = blank_cli();
+        assert_eq!(cli.effective_seed(), None);
+        let mut cli = blank_cli();
+        cli.profile = Some(Profile::Stealth);
+        assert_eq!(cli.effective_seed(), None);
+    }
+
+    #[test]
+    fn seed_cli_wins_over_file() {
+        use std::io::Write as _;
+        let mut path = std::env::temp_dir();
+        path.push(format!("injekt-test-seed-{}.toml", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "seed = 42\n").unwrap();
+        drop(file);
+        let mut cli = blank_cli();
+        cli.config = Some(path.to_string_lossy().into_owned());
+        assert_eq!(cli.effective_seed(), Some(42));
+        cli.seed = Some(7);
+        assert_eq!(cli.effective_seed(), Some(7));
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

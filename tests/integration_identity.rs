@@ -43,8 +43,8 @@ fn identity_queries_per_dbms() {
 #[test]
 fn engine_config_has_identity_flags() {
     let cfg = injekt::engine::orchestrator::EngineConfig::default();
-    assert!(!cfg.banner);
-    assert!(!cfg.current_user);
-    assert!(!cfg.current_db);
-    assert!(!cfg.hostname);
+    assert!(!cfg.enumeration.banner);
+    assert!(!cfg.enumeration.current_user);
+    assert!(!cfg.enumeration.current_db);
+    assert!(!cfg.enumeration.hostname);
 }

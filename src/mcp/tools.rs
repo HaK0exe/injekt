@@ -169,6 +169,8 @@ impl InjektServer {
             stop: None,
             count: false,
             output: None,
+            format: crate::cli::args::ReportFormat::Json,
+            explain: None,
             rate_limit: None,
             jitter: None,
             marker: None,
@@ -182,6 +184,9 @@ impl InjektServer {
             import: None,
             no_redact: false,
             allow_private: false,
+            // C13: MCP = RAM-only, knowledge jamais activé (surface stdio minimale).
+            allow_knowledge: false,
+            knowledge_path: None,
             raw_file: None,
             raw_dir: None,
             stdin: false,
@@ -191,6 +196,8 @@ impl InjektServer {
             verbose: false,
             level: Some(1),
             confirm: false,
+            no_mutation: false,
+            seed: None,
             ignore_codes: Vec::new(),
             no_banner: true,
             force: false,
@@ -288,6 +295,7 @@ impl InjektServer {
             depth: params.depth.unwrap_or(2),
             max_pages: params.max_pages.unwrap_or(100),
             max_per_template: params.max_per_template.unwrap_or(3),
+            max_candidates: params.max_candidates.unwrap_or(500),
             include_subdomains: params.include_subdomains.unwrap_or(false),
             ignore_robots: params.ignore_robots.unwrap_or(false),
         };
@@ -320,6 +328,7 @@ impl InjektServer {
                 depth: params.depth.unwrap_or(2),
                 max_pages: params.max_pages.unwrap_or(100),
                 max_per_template: params.max_per_template.unwrap_or(3),
+                max_candidates: params.max_candidates.unwrap_or(500),
                 include_subdomains: params.include_subdomains.unwrap_or(false),
                 ignore_robots: params.ignore_robots.unwrap_or(false),
             },
@@ -494,6 +503,110 @@ impl InjektServer {
 
         Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
     }
+
+    #[tool(
+        description = "Build the offline execution plan for a target: ordered probes (param, technique, EVI, cost, score, seed, budget) with 0 requests sent. Dry-run is forced."
+    )]
+    async fn plan(
+        &self,
+        Parameters(params): Parameters<PlanParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // C11: dry-run forcé — ce tool ne construit jamais de `HttpClient`
+        // et n'appelle jamais `send` (plan lexical + contexte passif + scores).
+        let target = params.target.clone();
+        let mut cli = Self::base_cli();
+        cli.dry_run = true;
+        cli.techniques = params.techniques.unwrap_or_default();
+        cli.params = params.params.unwrap_or_default();
+        cli.data = params.data;
+        cli.dbms = params.dbms;
+        cli.seed = params.seed;
+        if let Some(level) = params.level {
+            cli.level = Some(level.clamp(1, 5));
+        }
+        if let Some(threads) = params.threads {
+            cli.threads = Some(threads);
+        }
+        cli.headers = params.headers.unwrap_or_default();
+        cli.cookies.clone_from(&params.cookies);
+        cli.allow_private = params.allow_private.unwrap_or(false);
+        cli.no_redact = params.no_redact.unwrap_or(false);
+        Self::warn_no_redact(cli.no_redact);
+        let cfg = scan::engine_config(&cli);
+        let plan = crate::cli::plan::build_plan(&target, &cfg)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let scrubber = crate::session::scrubber::Scrubber::new(cli.no_redact);
+        let scrubbed = plan.scrubbed(&scrubber);
+        let mut json = serde_json::to_value(&scrubbed)
+            .map_err(|e| ErrorData::internal_error(format!("serialization failed: {e}"), None))?;
+        // Défense en profondeur : même en `no_redact`, le plan ne porte que
+        // des noms de params (jamais de valeurs cookie/header), mais on
+        // vérifie qu'aucun secret d'entrée ne fuit dans la sortie.
+        if let Some(secret) = params.cookies.as_deref()
+            && !secret.trim().is_empty()
+            && let Ok(text) = serde_json::to_string(&json)
+            && text.contains(secret)
+        {
+            return Err(ErrorData::internal_error(
+                "plan output would exfiltrate cookie material (bug)",
+                None,
+            ));
+        }
+        // Marqueur explicite dry-run pour les agents.
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert("requests_sent".to_owned(), serde_json::Value::from(0));
+        }
+        Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
+    }
+
+    #[tool(
+        description = "Explain a finding offline (0 requests): one-line reasoning verdict from evidence or a decrypted export snapshot. No secrets in output."
+    )]
+    async fn explain(
+        &self,
+        Parameters(params): Parameters<ExplainParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let no_redact = params.no_redact.unwrap_or(false);
+        Self::warn_no_redact(no_redact);
+        let scrubber = crate::session::scrubber::Scrubber::new(no_redact);
+        // Source 1 : snapshot/export JSON décrypté (offline, même matching
+        // que `replay --explain` : param exact, insensible à la casse).
+        let mut evidence = params.evidence.unwrap_or_default();
+        let mut confidence = params.confidence.unwrap_or(0.0);
+        let mut requests = params.requests.unwrap_or(0);
+        let mut seed = params.seed;
+        if let Some(export_json) = params.export_json.as_deref() {
+            let value: serde_json::Value = serde_json::from_str(export_json).map_err(|e| {
+                ErrorData::invalid_params(format!("invalid export_json: {e}"), None)
+            })?;
+            if let Some((ev, conf, req, sd)) =
+                crate::cli::plan::finding_from_export(&value, &params.param)
+            {
+                evidence = ev;
+                confidence = conf;
+                if params.requests.is_none() {
+                    requests = req;
+                }
+                if params.seed.is_none() {
+                    seed = sd;
+                }
+            }
+        }
+        let line = crate::cli::plan::explain_offline(
+            &params.param,
+            &evidence,
+            confidence,
+            requests,
+            seed,
+            no_redact,
+        );
+        let out = serde_json::json!({
+            "param": scrubber.scrub(&params.param),
+            "explain": scrubber.scrub(&line),
+            "requests_sent": 0,
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::json(out)?]))
+    }
 }
 
 #[tool_handler]
@@ -629,6 +742,9 @@ pub struct ReconCrawlParams {
     /// Max pages fetched per page template — path shape + query param names
     /// (default: 3), caps pagination/listing/calendar crawl traps
     pub max_per_template: Option<usize>,
+    /// Max discovered parameters kept (default: 500), redundant sink shapes
+    /// dropped first
+    pub max_candidates: Option<usize>,
     /// Include subdomains
     pub include_subdomains: Option<bool>,
     /// Ignore robots.txt
@@ -667,6 +783,9 @@ pub struct ReconScanParams {
     /// Max pages fetched per page template — path shape + query param names
     /// (default: 3), caps pagination/listing/calendar crawl traps
     pub max_per_template: Option<usize>,
+    /// Max discovered parameters kept (default: 500), redundant sink shapes
+    /// dropped first
+    pub max_candidates: Option<usize>,
     /// Include subdomains
     pub include_subdomains: Option<bool>,
     /// Ignore robots.txt
@@ -773,3 +892,52 @@ pub struct ReconScanParams {
 /// Parameters for the info tool (no parameters).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct InfoParams {}
+
+/// Parameters for the `plan` tool (C11 offline dry-run, 0 requests).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PlanParams {
+    /// Target URL to plan (e.g. <https://example.com/?id=1>)
+    pub target: String,
+    /// Techniques to plan: boolean, time, error, union, stacked, oob, json, all
+    pub techniques: Option<Vec<String>>,
+    /// Test only these parameters (e.g. `["id"]` or `["body:user"]`)
+    pub params: Option<Vec<String>>,
+    /// POST body to test (e.g. "id=1&user=admin")
+    pub data: Option<String>,
+    /// Force specific DBMS: mysql, postgres, mssql, oracle
+    pub dbms: Option<String>,
+    /// Deterministic run seed (same seed => same plan order)
+    pub seed: Option<u64>,
+    /// Aggressiveness level 1-5
+    pub level: Option<u8>,
+    /// Concurrency (plan display only)
+    pub threads: Option<usize>,
+    /// Custom headers as ["Name: value", ...] (names only in output, never values)
+    pub headers: Option<Vec<String>>,
+    /// Cookie header value (never echoed in output)
+    pub cookies: Option<String>,
+    /// Allow private/loopback targets (lab only, default: false)
+    pub allow_private: Option<bool>,
+    /// Disable redaction in output (local debugging only)
+    pub no_redact: Option<bool>,
+}
+
+/// Parameters for the `explain` tool (C11 offline, 0 requests).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExplainParams {
+    /// Finding parameter key (e.g. "id@query")
+    pub param: String,
+    /// Evidence string (e.g. `boolean` `true_sim=0.91` `false_sim=0.22` `trials=3/3`)
+    pub evidence: Option<String>,
+    /// Detector confidence in [0.0, 1.0]
+    pub confidence: Option<f64>,
+    /// Total run requests to report
+    pub requests: Option<u64>,
+    /// Effective run seed
+    pub seed: Option<u64>,
+    /// Decrypted export snapshot JSON (findings + `request_count` + seed);
+    /// when it contains `param`, its evidence/confidence win over the direct fields
+    pub export_json: Option<String>,
+    /// Disable redaction in output (local debugging only)
+    pub no_redact: Option<bool>,
+}

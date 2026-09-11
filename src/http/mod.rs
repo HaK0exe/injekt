@@ -7,3 +7,4 @@ pub mod proxy;
 pub mod rate_limit;
 pub mod redirects;
 pub mod retry;
+pub mod timeouts;

@@ -21,9 +21,9 @@ fn test_client() -> HttpClient {
 
 fn bulk_cfg() -> EngineConfig {
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     cfg
 }

@@ -47,7 +47,18 @@ struct Snapshot {
     extracted: Vec<String>,
     request_count: u64,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Reasoning trace (C6): hashes only, never clear payload/body/secrets.
+    /// `#[serde(default)]` keeps v1/v2 exports readable (empty trace).
+    #[serde(default)]
+    trace: Vec<crate::reasoning::ProbeRecord>,
+    /// Effective run seed (`--seed`) for replay determinism.
+    #[serde(default)]
+    seed: Option<u64>,
 }
+
+/// Current encrypted-export blob version (C6: trace + seed added).
+/// Readers accept v1 (legacy), v2 (argon2id explicit) and v3 (trace).
+pub const EXPORT_BLOB_VERSION: u8 = 3;
 
 /// Encrypted export (OPT-IN only). Snapshot XChaCha20-Poly1305, key derived Argon2id.
 #[derive(Debug)]
@@ -70,11 +81,18 @@ impl EncryptedExport {
             extracted: state.extracted_exposed(),
             request_count: state.request_count(),
             started_at: state.started_at(),
+            trace: state.trace().records().to_vec(),
+            seed: state.seed(),
         };
         let json = Zeroizing::new(
             serde_json::to_vec(&snapshot).map_err(|e| ExportError::Serialization(e.to_string()))?,
         );
 
+        // SECURITY: salt/nonce MUST stay on OS randomness (`rand::random`) and
+        // must NEVER be routed through the seeded run RNG
+        // (`crate::seeded_rng::make_rng`): a deterministic salt/nonce from
+        // `--seed` would reuse keystream material across runs and break the
+        // XChaCha20-Poly1305 security contract.
         let salt: [u8; 16] = rand::random();
         let key = Zeroizing::new(Self::derive_key_argon2id(passphrase, &salt)?);
 
@@ -90,7 +108,7 @@ impl EncryptedExport {
             salt_b64: BASE64.encode(salt),
             nonce_b64: BASE64.encode(nonce_bytes),
             ciphertext_b64: BASE64.encode(ciphertext),
-            v: 2,
+            v: EXPORT_BLOB_VERSION,
             kdf: Some("argon2id-m65536-t3-p1-v19".to_owned()),
         };
         let out = serde_json::to_vec_pretty(&blob)
@@ -122,7 +140,7 @@ impl EncryptedExport {
         let data = std::fs::read(path).map_err(|e| ExportError::Io(e.to_string()))?;
         let blob: EncryptedBlob =
             serde_json::from_slice(&data).map_err(|e| ExportError::Serialization(e.to_string()))?;
-        if blob.v != 1 && blob.v != 2 {
+        if blob.v != 1 && blob.v != 2 && blob.v != EXPORT_BLOB_VERSION {
             return Err(ExportError::Serialization(
                 "unsupported blob version".to_owned(),
             ));
@@ -208,6 +226,8 @@ mod tests {
     }
 
     fn temp_path() -> String {
+        // Test-only temp filename: stays on OS randomness so parallel test
+        // workers never collide; never seeded (uniqueness, not determinism).
         let path = std::env::temp_dir()
             .join(format!("injekt_test_export_{}.enc", rand::random::<u64>()))
             .to_string_lossy()

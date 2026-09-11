@@ -83,9 +83,9 @@ async fn error_with_fragment_pushes_direct_without_confirm() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["error".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -123,9 +123,9 @@ async fn error_without_fragment_confirmed_upgrades_to_09() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["error".to_owned(), "boolean".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -159,9 +159,9 @@ async fn error_without_fragment_denied_degrades_to_055_unconfirmed() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["error".to_owned(), "boolean".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -211,9 +211,9 @@ async fn blocking_waf_baseline_downgrades_fragment_hit_to_06() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["error".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -262,9 +262,9 @@ async fn cloudflare_presence_does_not_auto_tamper_or_downgrade() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["error".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let engine = Engine::new(cfg, client, CancellationToken::new());
     let target = format!("{}/?id=1", server.uri());

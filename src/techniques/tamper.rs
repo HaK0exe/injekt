@@ -1,6 +1,5 @@
 #![deny(unsafe_code)]
 
-use rand::Rng as _;
 use regex::Regex;
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -153,8 +152,22 @@ impl Tamper {
     /// trailing SQL line comment (`-- ...` / `#...`): mangling the space in
     /// `-- -` into `--/**/-` is not a comment in MySQL and would break every
     /// payload that relies on the terminator.
+    ///
+    /// OS-random convenience wrapper around [`Self::apply_with_rng`];
+    /// seeded runs must use `apply_with_rng` with
+    /// [`crate::seeded_rng::make_rng`] so `--seed` is deterministic.
+    /// Routed through `make_rng(None)` (OS randomness) so every RNG in the
+    /// crate shares the single seeded entry point (`--seed` never leaks in).
     #[must_use]
     pub fn apply(&self, payload: &str) -> String {
+        let mut rng = crate::seeded_rng::make_rng(None);
+        self.apply_with_rng(payload, &mut rng)
+    }
+
+    /// Seeded variant of [`Self::apply`]: all randomness is drawn from `rng`.
+    /// Pass `&mut crate::seeded_rng::make_rng(seed)` for deterministic runs.
+    #[must_use]
+    pub fn apply_with_rng(&self, payload: &str, rng: &mut impl rand::Rng) -> String {
         match self {
             Self::Space2Comment => {
                 let (body, tail) = split_trailing_comment(payload);
@@ -165,7 +178,6 @@ impl Tamper {
             Self::Space2Newline => payload.replace(' ', "%0a"),
             Self::Space2RandomBlank => {
                 let blanks = ["%09", "%0a", "%0c", "%0d", "%a0", "+"];
-                let mut rng = rand::rng();
                 let mut out = String::with_capacity(payload.len() * 2);
                 for ch in payload.chars() {
                     if ch == ' ' {
@@ -177,23 +189,20 @@ impl Tamper {
                 }
                 out
             }
-            Self::RandomCase => {
-                let mut rng = rand::rng();
-                payload
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphabetic() && rng.random_bool(0.5) {
-                            if c.is_ascii_lowercase() {
-                                c.to_ascii_uppercase()
-                            } else {
-                                c.to_ascii_lowercase()
-                            }
+            Self::RandomCase => payload
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphabetic() && rng.random_bool(0.5) {
+                        if c.is_ascii_lowercase() {
+                            c.to_ascii_uppercase()
                         } else {
-                            c
+                            c.to_ascii_lowercase()
                         }
-                    })
-                    .collect()
-            }
+                    } else {
+                        c
+                    }
+                })
+                .collect(),
             Self::VersionedComment => apply_versioned_comment(payload),
             Self::BetweenComment => apply_between_comment(payload),
             Self::CharEncode => char_encode(payload),
@@ -213,7 +222,6 @@ impl Tamper {
             Self::Space2Dash => payload.replace(' ', "--%0A"),
             Self::Space2MssqlBlank => {
                 let blanks = ["%09", "%0A", "%0B", "%0C", "%0D"];
-                let mut rng = rand::rng();
                 let mut out = String::with_capacity(payload.len() * 2);
                 for ch in payload.chars() {
                     if ch == ' ' {
@@ -227,7 +235,6 @@ impl Tamper {
             }
             Self::RandomComments => {
                 let (body, tail) = split_trailing_comment(payload);
-                let mut rng = rand::rng();
                 let mut out = String::with_capacity(payload.len() * 2);
                 for ch in body.chars() {
                     if ch == ' ' {
@@ -280,11 +287,26 @@ pub fn parse_tamper_list(input: Option<&str>) -> Vec<Tamper> {
 }
 
 /// Apply a sequence of tampers in order. Empty slice returns `payload` unchanged.
+///
+/// OS-random wrapper around [`apply_tampers_with_rng`]; seeded runs must use
+/// the `_with_rng` variant with [`crate::seeded_rng::make_rng`].
+/// Routed through `make_rng(None)` so the seeded entry point stays unique.
 #[must_use]
 pub fn apply_tampers(payload: &str, tampers: &[Tamper]) -> String {
+    let mut rng = crate::seeded_rng::make_rng(None);
+    apply_tampers_with_rng(payload, tampers, &mut rng)
+}
+
+/// Seeded variant of [`apply_tampers`]: randomness is drawn from `rng`.
+#[must_use]
+pub fn apply_tampers_with_rng(
+    payload: &str,
+    tampers: &[Tamper],
+    rng: &mut impl rand::Rng,
+) -> String {
     let mut out = payload.to_owned();
     for t in tampers {
-        out = t.apply(&out);
+        out = t.apply_with_rng(&out, rng);
     }
     out
 }
@@ -294,20 +316,36 @@ pub fn apply_tampers(payload: &str, tampers: &[Tamper]) -> String {
 /// - With tampers → original + each single tamper + full chain. Deduped.
 ///
 /// This bounds explosion to `t.len()+2` variants instead of `2^t`.
+///
+/// OS-random wrapper around [`expand_with_tampers_with_rng`]; seeded runs
+/// must use the `_with_rng` variant.
+/// Routed through `make_rng(None)` so the seeded entry point stays unique.
 #[must_use]
 pub fn expand_with_tampers(payload: &str, tampers: &[Tamper]) -> Vec<String> {
+    let mut rng = crate::seeded_rng::make_rng(None);
+    expand_with_tampers_with_rng(payload, tampers, &mut rng)
+}
+
+/// Seeded variant of [`expand_with_tampers`]: randomness is drawn from `rng`
+/// in single-then-chain order, so the same seed yields identical variants.
+#[must_use]
+pub fn expand_with_tampers_with_rng(
+    payload: &str,
+    tampers: &[Tamper],
+    rng: &mut impl rand::Rng,
+) -> Vec<String> {
     if tampers.is_empty() {
         return vec![payload.to_owned()];
     }
     let mut variants = Vec::with_capacity(tampers.len() + 2);
     variants.push(payload.to_owned());
     for t in tampers {
-        let v = t.apply(payload);
+        let v = t.apply_with_rng(payload, rng);
         if !variants.contains(&v) {
             variants.push(v);
         }
     }
-    let chained = apply_tampers(payload, tampers);
+    let chained = apply_tampers_with_rng(payload, tampers, rng);
     if !variants.contains(&chained) {
         variants.push(chained);
     }
@@ -1050,5 +1088,54 @@ mod tests {
         assert_eq!(sets.len(), tampers.len() + 2);
         let safe = boolean_safe_transformation_sets(&tampers);
         assert_eq!(safe.len(), tampers.len() + 2);
+    }
+
+    #[test]
+    fn seeded_tamper_same_seed_identical() {
+        use crate::seeded_rng::make_rng;
+        let payload = "' OR SELECT * FROM users WHERE name = 'admin' -- -";
+        let tampers = vec![
+            Tamper::RandomCase,
+            Tamper::Space2RandomBlank,
+            Tamper::RandomComments,
+            Tamper::Space2MssqlBlank,
+        ];
+        let mut a = make_rng(Some(7));
+        let mut b = make_rng(Some(7));
+        assert_eq!(
+            apply_tampers_with_rng(payload, &tampers, &mut a),
+            apply_tampers_with_rng(payload, &tampers, &mut b)
+        );
+        // Fresh RNG from the same seed replays the same output.
+        let mut c = make_rng(Some(7));
+        let mut d = make_rng(Some(7));
+        assert_eq!(
+            expand_with_tampers_with_rng(payload, &tampers, &mut c),
+            expand_with_tampers_with_rng(payload, &tampers, &mut d)
+        );
+    }
+
+    #[test]
+    fn seeded_tamper_different_seeds_likely_differ() {
+        use crate::seeded_rng::make_rng;
+        // Long alphabetic payload: randomcase has 2^N outcomes, collision
+        // across seeds is negligible.
+        let payload = "SELECT * FROM users WHERE name = 'administrator'";
+        let tampers = vec![Tamper::RandomCase];
+        let mut a = make_rng(Some(1));
+        let mut b = make_rng(Some(2));
+        assert_ne!(
+            apply_tampers_with_rng(payload, &tampers, &mut a),
+            apply_tampers_with_rng(payload, &tampers, &mut b)
+        );
+    }
+
+    #[test]
+    fn unseeded_tamper_path_works() {
+        use crate::seeded_rng::make_rng;
+        let mut rng = make_rng(None);
+        let out = Tamper::RandomCase.apply_with_rng("select", &mut rng);
+        assert_eq!(out.to_ascii_lowercase(), "select");
+        assert_eq!(out.len(), 6);
     }
 }

@@ -8,13 +8,20 @@ use crate::http::{
     rate_limit::RateLimiter,
     redirects::RedirectPolicy,
     retry::RetryPolicy,
+    timeouts::{ClassTimeouts, RequestClass, TIME_POOL_SLOTS},
 };
 use crate::target::url::TargetUrl;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use reqwest::{Client, RequestBuilder};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error)]
@@ -61,6 +68,11 @@ pub struct HasTimeout;
 #[derive(Debug)]
 pub struct ClientBuilder<State> {
     timeout: Option<Duration>,
+    /// Per-class overrides (C10): unset = derived from `timeout` via
+    /// [`ClassTimeouts::from_default`] (`boolean` ≤10s, `time` ≤15s).
+    boolean_timeout: Option<Duration>,
+    time_timeout: Option<Duration>,
+    oob_timeout: Option<Duration>,
     connect_timeout: Option<Duration>,
     proxy: Option<ProxyConfig>,
     identity: Option<Identity>,
@@ -74,6 +86,9 @@ pub struct ClientBuilder<State> {
     /// cannot leak `Authorization` / `Cookie` to the redirect target.
     user_headers: HeaderMap,
     allow_private: bool,
+    /// Deterministic run seed (`--seed`): `None` preserves historical
+    /// OS-random jitter/retry. Threaded into the shared run RNG at `build()`.
+    seed: Option<u64>,
     _state: core::marker::PhantomData<State>,
 }
 
@@ -82,6 +97,9 @@ impl ClientBuilder<NeedTimeout> {
     pub fn new() -> Self {
         Self {
             timeout: None,
+            boolean_timeout: None,
+            time_timeout: None,
+            oob_timeout: None,
             connect_timeout: None,
             proxy: None,
             identity: None,
@@ -92,6 +110,7 @@ impl ClientBuilder<NeedTimeout> {
             extra_headers: HeaderMap::new(),
             user_headers: HeaderMap::new(),
             allow_private: false,
+            seed: None,
             _state: core::marker::PhantomData,
         }
     }
@@ -100,6 +119,9 @@ impl ClientBuilder<NeedTimeout> {
     pub fn timeout(self, d: Duration) -> ClientBuilder<HasTimeout> {
         ClientBuilder {
             timeout: Some(d),
+            boolean_timeout: self.boolean_timeout,
+            time_timeout: self.time_timeout,
+            oob_timeout: self.oob_timeout,
             connect_timeout: self.connect_timeout,
             proxy: self.proxy,
             identity: self.identity,
@@ -110,6 +132,7 @@ impl ClientBuilder<NeedTimeout> {
             extra_headers: self.extra_headers,
             user_headers: self.user_headers,
             allow_private: self.allow_private,
+            seed: self.seed,
             _state: core::marker::PhantomData,
         }
     }
@@ -119,6 +142,27 @@ impl<State> ClientBuilder<State> {
     #[must_use]
     pub fn connect_timeout(mut self, d: Duration) -> Self {
         self.connect_timeout = Some(d);
+        self
+    }
+
+    /// Override the derived `boolean`-class timeout (default: `min(base, 10s)`).
+    #[must_use]
+    pub fn boolean_timeout(mut self, d: Duration) -> Self {
+        self.boolean_timeout = Some(d);
+        self
+    }
+
+    /// Override the derived `time`-class timeout (default: `min(base, 15s)`).
+    #[must_use]
+    pub fn time_timeout(mut self, d: Duration) -> Self {
+        self.time_timeout = Some(d);
+        self
+    }
+
+    /// Override the `oob`-class timeout (default: the base `timeout`).
+    #[must_use]
+    pub fn oob_timeout(mut self, d: Duration) -> Self {
+        self.oob_timeout = Some(d);
         self
     }
 
@@ -165,6 +209,15 @@ impl<State> ClientBuilder<State> {
     #[must_use]
     pub fn allow_private(mut self, allow: bool) -> Self {
         self.allow_private = allow;
+        self
+    }
+
+    /// Deterministic run seed (`--seed`): seeds the shared run RNG used for
+    /// jitter sleeps and retry backoff. `None` (default) preserves historical
+    /// OS-random behaviour.
+    #[must_use]
+    pub fn seed(mut self, seed: Option<u64>) -> Self {
+        self.seed = seed;
         self
     }
 
@@ -230,6 +283,17 @@ impl ClientBuilder<HasTimeout> {
 
         let inner = builder.build()?;
 
+        let mut timeouts = ClassTimeouts::from_default(timeout);
+        if let Some(b) = self.boolean_timeout {
+            timeouts.boolean = b;
+        }
+        if let Some(t) = self.time_timeout {
+            timeouts.time = t;
+        }
+        if let Some(o) = self.oob_timeout {
+            timeouts.oob = o;
+        }
+
         Ok(HttpClient {
             inner: Arc::new(inner),
             jitter: self.jitter.unwrap_or_default(),
@@ -239,10 +303,17 @@ impl ClientBuilder<HasTimeout> {
             cookies: Arc::new(RwLock::new(CookieJar::new())),
             retry: self.retry,
             timeout,
+            timeouts,
+            time_slots: Arc::new(Semaphore::new(TIME_POOL_SLOTS)),
+            throttle_403: Arc::new(AtomicU64::new(0)),
+            throttle_429: Arc::new(AtomicU64::new(0)),
             redirect_policy: self.redirect_policy,
             allow_private: self.allow_private,
             user_headers: self.user_headers,
             remote_dns,
+            rng: Arc::new(std::sync::Mutex::new(crate::seeded_rng::make_rng(
+                self.seed,
+            ))),
         })
     }
 }
@@ -263,10 +334,30 @@ pub struct HttpClient {
     cookies: Arc<RwLock<CookieJar>>,
     retry: RetryPolicy,
     timeout: Duration,
+    /// Per-class timeouts (C10): `boolean` 10s, `time` 15s, `oob`/default 30s.
+    timeouts: ClassTimeouts,
+    /// Isolated `time`-class pool (C10, [`TIME_POOL_SLOTS`] permits): only
+    /// [`RequestClass::Time`] probes acquire it, so a slow `pg_sleep` can
+    /// never saturate the `buffer_unordered` lanes used by `boolean`/`error`.
+    /// The permit is RAII-held for the whole probe (jitter + retries
+    /// included) and released on drop — including on cancellation, so no
+    /// orphaned permit can wedge the pool.
+    time_slots: Arc<Semaphore>,
+    /// Detectability counters (C10, bench Annexe A): every `403`/`429`
+    /// response observed on any hop, including responses consumed by a retry.
+    /// Drained per run by the orchestrator via
+    /// [`Self::take_detectability_counts`].
+    throttle_403: Arc<AtomicU64>,
+    throttle_429: Arc<AtomicU64>,
     redirect_policy: RedirectPolicy,
     allow_private: bool,
     user_headers: HeaderMap,
     remote_dns: bool,
+    /// Shared run RNG for jitter sleeps and retry backoff, seeded from
+    /// `--seed` (`None` = OS randomness, historical behaviour). Shared via
+    /// `Arc` so cloned clients draw from one sequence; the lock is held only
+    /// to draw a delay value, never across `.await`.
+    rng: Arc<std::sync::Mutex<rand::rngs::StdRng>>,
 }
 
 impl core::fmt::Debug for HttpClient {
@@ -276,6 +367,9 @@ impl core::fmt::Debug for HttpClient {
             .field("rate_limiter", &self.rate_limiter)
             .field("retry", &self.retry)
             .field("timeout", &self.timeout)
+            .field("timeouts", &self.timeouts)
+            .field("throttle_403", &self.throttle_403.load(Ordering::Relaxed))
+            .field("throttle_429", &self.throttle_429.load(Ordering::Relaxed))
             .field("redirect_policy", &self.redirect_policy)
             .field("allow_private", &self.allow_private)
             .field("user_headers", &"[REDACTED]")
@@ -339,6 +433,37 @@ impl HttpClient {
         self.timeout
     }
 
+    /// Per-class timeout (C10): `boolean` 10s, `time` 15s, `oob`/default base.
+    #[must_use]
+    pub fn timeout_for(&self, class: RequestClass) -> Duration {
+        self.timeouts.for_class(class)
+    }
+
+    #[must_use]
+    pub const fn timeouts(&self) -> ClassTimeouts {
+        self.timeouts
+    }
+
+    fn record_throttle(&self, status: u16) {
+        if status == 403 {
+            self.throttle_403.fetch_add(1, Ordering::Relaxed);
+        } else if status == 429 {
+            self.throttle_429.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Drain the per-run detectability counters as `(403, 429)` (C10, bench
+    /// Annexe A `detectability`). Take-semantics (`swap(0)`) so the
+    /// orchestrator absorbs each run exactly once, even when the client is
+    /// reused across runs.
+    #[must_use]
+    pub fn take_detectability_counts(&self) -> (u64, u64) {
+        (
+            self.throttle_403.swap(0, Ordering::Relaxed),
+            self.throttle_429.swap(0, Ordering::Relaxed),
+        )
+    }
+
     #[must_use]
     pub fn redirect_policy(&self) -> RedirectPolicy {
         self.redirect_policy
@@ -358,6 +483,9 @@ impl HttpClient {
     }
 
     /// Generic send with jitter, rate-limit, retry, timeout and cancellation.
+    ///
+    /// Default-class overload of [`Self::send_with_retry_for_class`]
+    /// (baseline, context, `error`/`union`/`stacked`/`json` probes).
     ///
     /// SSRF hardening (OWASP): the initial URL and **every** redirect hop are
     /// re-validated lexically via [`TargetUrl`] before connecting, plus
@@ -379,6 +507,46 @@ impl HttpClient {
         spec: RequestSpec,
         cancel: &CancellationToken,
     ) -> Result<reqwest::Response, ClientError> {
+        self.send_with_retry_for_class(spec, RequestClass::Default, cancel)
+            .await
+    }
+
+    /// Class-aware send (C10): `boolean`/`time`/`oob` probes pass their
+    /// [`RequestClass`] so the matching per-class timeout applies, and
+    /// [`RequestClass::Time`] additionally holds one of the
+    /// [`TIME_POOL_SLOTS`] isolated pool permits for the whole probe —
+    /// `boolean`/`error` traffic never waits on a slow `pg_sleep`.
+    ///
+    /// The permit acquisition itself is cancellable (`select!` on `cancel`),
+    /// and the permit is RAII-released on every return path, so a mid-scan
+    /// `Ctrl+C` leaves zero orphaned permits (the pool stays reusable).
+    ///
+    /// # Errors
+    /// Returns an error if the request is cancelled, times out, targets a
+    /// private host without `allow_private`, exceeds the redirect limit, or
+    /// fails after retries.
+    pub async fn send_with_retry_for_class(
+        &self,
+        spec: RequestSpec,
+        class: RequestClass,
+        cancel: &CancellationToken,
+    ) -> Result<reqwest::Response, ClientError> {
+        // Isolated time pool: at most `TIME_POOL_SLOTS` slow probes in
+        // flight. Non-time classes skip this entirely (no starvation).
+        let _time_permit = if matches!(class, RequestClass::Time) {
+            let owned = self.time_slots.clone();
+            let acquired = tokio::select! {
+                () = cancel.cancelled() => return Err(ClientError::Cancelled),
+                p = owned.acquire_owned() => p,
+            };
+            match acquired {
+                Ok(permit) => Some(permit),
+                // The semaphore is never closed; treat shutdown as cancel.
+                Err(_) => return Err(ClientError::Cancelled),
+            }
+        } else {
+            None
+        };
         TargetUrl::validate_redirect_location_with_remote_dns(
             &spec.url,
             self.allow_private,
@@ -388,10 +556,24 @@ impl HttpClient {
         .map_err(|e| map_url_error(&spec.url, &e))?;
         // Cancellable jitter + rate-limit: internal sleeps are themselves
         // wrapped in `select!` so Ctrl+C aborts promptly (official tokio pattern).
+        // The delay is drawn from the shared run RNG (seeded via `--seed`;
+        // `None` = OS randomness) under a short lock, then slept without
+        // holding the lock.
         if !self.rate_limiter.acquire_cancellable(cancel).await {
             return Err(ClientError::Cancelled);
         }
-        if !self.jitter.sleep_cancellable(cancel).await {
+        let jitter_delay = {
+            let mut guard = self
+                .rng
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.jitter.next_delay_with_rng(&mut *guard)
+        };
+        let jitter_done = tokio::select! {
+            () = cancel.cancelled() => false,
+            () = tokio::time::sleep(jitter_delay) => true,
+        };
+        if !jitter_done {
             return Err(ClientError::Cancelled);
         }
 
@@ -402,7 +584,7 @@ impl HttpClient {
         let mut hops = 0_usize;
         loop {
             let resp = self
-                .send_single_with_retry(&current, include_user, cancel)
+                .send_single_with_retry(&current, class, include_user, cancel)
                 .await?;
             let status = resp.status();
             if !is_redirect_status(status) {
@@ -454,13 +636,17 @@ impl HttpClient {
 
     /// Single-hop send with retry (no redirect following).
     /// Every retry re-acquires the rate limiter so 429/5xx/timeout storms
-    /// cannot exceed the configured RPS ceiling.
+    /// cannot exceed the configured RPS ceiling. The per-class timeout
+    /// (`boolean` 10s, `time` 15s, `oob`/default base) bounds both the send
+    /// and the retry sleeps are cancellable.
     async fn send_single_with_retry(
         &self,
         spec: &RequestSpec,
+        class: RequestClass,
         include_user: bool,
         cancel: &CancellationToken,
     ) -> Result<reqwest::Response, ClientError> {
+        let class_timeout = self.timeouts.for_class(class);
         let mut attempt = 0usize;
         loop {
             if cancel.is_cancelled() {
@@ -472,10 +658,10 @@ impl HttpClient {
             let send_fut = req.send();
             let resp_res: Result<reqwest::Response, ClientError> = tokio::select! {
                 () = cancel.cancelled() => return Err(ClientError::Cancelled),
-                r = tokio::time::timeout(self.timeout, send_fut) => match r {
+                r = tokio::time::timeout(class_timeout, send_fut) => match r {
                     Ok(Ok(resp)) => Ok(resp),
                     Ok(Err(e)) => Err(e.into()),
-                    Err(_) => Err(ClientError::Timeout(self.timeout)),
+                    Err(_) => Err(ClientError::Timeout(class_timeout)),
                 }
             };
 
@@ -493,16 +679,37 @@ impl HttpClient {
                             }
                         }
                     }
-                    if self
-                        .retry
-                        .should_retry(attempt, Some(resp.status().as_u16()))
-                    {
+                    // Detectability (C10): every 403/429 counts, including
+                    // ones consumed below by a retry.
+                    let status_u16 = resp.status().as_u16();
+                    self.record_throttle(status_u16);
+                    if self.retry.should_retry(attempt, Some(status_u16)) {
                         attempt += 1;
                         let retry_after = resp
                             .headers()
                             .get(reqwest::header::RETRY_AFTER)
                             .and_then(|v| v.to_str().ok());
-                        let delay = self.retry.delay_for_retry_after(attempt, retry_after);
+                        // Honor the server's ask twice, on throttling
+                        // statuses only (429/503): pace the shared limiter
+                        // (no immediate re-burst into an A3-style 5/s gate)
+                        // AND sleep this request's backoff.
+                        // `parse_retry_after_secs` caps at 60s (no parking).
+                        let parsed_penalty =
+                            retry_after.and_then(crate::http::retry::parse_retry_after_secs);
+                        if matches!(status_u16, 429 | 503) {
+                            self.rate_limiter.notify_rate_limited(parsed_penalty).await;
+                        }
+                        let delay = {
+                            let mut guard = self
+                                .rng
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            self.retry.delay_for_retry_after_with_rng(
+                                attempt,
+                                retry_after,
+                                &mut *guard,
+                            )
+                        };
                         // Rate-limit retries: sleep the backoff AND take a token.
                         tokio::select! {
                             () = cancel.cancelled() => return Err(ClientError::Cancelled),
@@ -523,7 +730,13 @@ impl HttpClient {
                     } && self.retry.should_retry(attempt, None);
                     if retryable {
                         attempt += 1;
-                        let delay = self.retry.delay_for(attempt);
+                        let delay = {
+                            let mut guard = self
+                                .rng
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            self.retry.delay_for_with_rng(attempt, &mut *guard)
+                        };
                         tokio::select! {
                             () = cancel.cancelled() => return Err(ClientError::Cancelled),
                             () = tokio::time::sleep(delay) => {},
@@ -631,6 +844,8 @@ impl HttpClient {
     /// `send_with_retry`; body-read timeouts are surfaced here for the same
     /// treatment (retry/skip, never a finding).
     ///
+    /// Default-class overload of [`Self::read_body_with_timeout_for_class`].
+    ///
     /// # Errors
     /// Returns an error if reading the body times out or the underlying stream fails.
     ///
@@ -642,8 +857,23 @@ impl HttpClient {
         &self,
         resp: reqwest::Response,
     ) -> Result<Vec<u8>, ClientError> {
+        self.read_body_with_timeout_for_class(resp, RequestClass::Default)
+            .await
+    }
+
+    /// Class-aware body read (C10): the same per-class timeout that bounded
+    /// the send bounds the body stream, so a `time` probe cannot linger on a
+    /// dripping body past its 15s class budget.
+    ///
+    /// # Errors
+    /// Returns an error if reading the body times out or the stream fails.
+    pub async fn read_body_with_timeout_for_class(
+        &self,
+        resp: reqwest::Response,
+        class: RequestClass,
+    ) -> Result<Vec<u8>, ClientError> {
         use futures::StreamExt as _;
-        let timeout = self.timeout;
+        let timeout = self.timeouts.for_class(class);
         let fut = async {
             let mut buf = Vec::new();
             let mut stream = resp.bytes_stream();
@@ -667,13 +897,28 @@ impl HttpClient {
     /// bound and `unwrap_or_default()` turns transport errors into `""`,
     /// which scores as similarity ~0 / confidence 0.75 (false positive).
     ///
+    /// Default-class overload of [`Self::read_body_string_for_class`].
+    ///
     /// # Errors
     /// Returns an error if reading the body times out or the stream fails.
     pub async fn read_body_string_with_timeout(
         &self,
         resp: reqwest::Response,
     ) -> Result<String, ClientError> {
-        let bytes = self.read_body_with_timeout(resp).await?;
+        self.read_body_string_for_class(resp, RequestClass::Default)
+            .await
+    }
+
+    /// Class-aware bounded `String` body read (C10).
+    ///
+    /// # Errors
+    /// Returns an error if reading the body times out or the stream fails.
+    pub async fn read_body_string_for_class(
+        &self,
+        resp: reqwest::Response,
+        class: RequestClass,
+    ) -> Result<String, ClientError> {
+        let bytes = self.read_body_with_timeout_for_class(resp, class).await?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 

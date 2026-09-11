@@ -51,9 +51,9 @@ async fn active_probe_confirms_mysql_when_passive_signals_are_absent() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);

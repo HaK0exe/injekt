@@ -71,9 +71,9 @@ fn json_responder(with_json_errors: bool) -> impl Fn(&wiremock::Request) -> Resp
 fn json_engine(techniques: Vec<String>) -> (Engine, CancellationToken) {
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = techniques;
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel.clone());

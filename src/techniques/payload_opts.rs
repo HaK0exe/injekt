@@ -8,7 +8,7 @@
 //! Percent-encoding happens at the injection point (see
 //! [`encode_with_safe_chars`]), never inside [`build_final_payload`].
 
-use super::tamper::{Tamper, apply_tampers};
+use super::tamper::{Tamper, apply_tampers_with_rng};
 use std::fmt::Write as _;
 
 /// How an extracted value is fetched (oracle hint, no behaviour by itself).
@@ -71,9 +71,25 @@ impl PayloadOpts {
 ///
 /// URL-encoding is deliberately *not* applied here; it happens at the
 /// injection point via [`encode_with_safe_chars`].
+///
+/// OS-random wrapper around [`build_final_payload_with_rng`]; seeded runs
+/// must use the `_with_rng` variant with [`crate::seeded_rng::make_rng`].
+/// Routed through `make_rng(None)` so the seeded entry point stays unique.
 #[must_use]
 pub fn build_final_payload(base: &str, tampers: &[Tamper], opts: &PayloadOpts) -> String {
-    let tampered = apply_tampers(base, tampers);
+    let mut rng = crate::seeded_rng::make_rng(None);
+    build_final_payload_with_rng(base, tampers, opts, &mut rng)
+}
+
+/// Seeded variant of [`build_final_payload`]: tamper randomness comes from `rng`.
+#[must_use]
+pub fn build_final_payload_with_rng(
+    base: &str,
+    tampers: &[Tamper],
+    opts: &PayloadOpts,
+    rng: &mut impl rand::Rng,
+) -> String {
+    let tampered = apply_tampers_with_rng(base, tampers, rng);
     let prefix = opts.prefix.as_deref().unwrap_or("");
     let suffix = opts.suffix.as_deref().unwrap_or("");
     let mut out = String::with_capacity(prefix.len() + tampered.len() + suffix.len());
@@ -122,7 +138,7 @@ fn truncate_24(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::techniques::tamper::Tamper;
+    use crate::techniques::tamper::{Tamper, apply_tampers};
 
     fn opts_with(prefix: &str, suffix: &str) -> PayloadOpts {
         PayloadOpts {
@@ -247,5 +263,34 @@ mod tests {
     fn fetch_using_default_is_direct() {
         assert_eq!(FetchUsing::default(), FetchUsing::Direct);
         assert_eq!(PayloadOpts::default().fetch_using, FetchUsing::Direct);
+    }
+
+    #[test]
+    fn seeded_build_same_seed_identical() {
+        use crate::seeded_rng::make_rng;
+        use crate::techniques::tamper::Tamper;
+        let tampers = [Tamper::RandomCase, Tamper::Space2RandomBlank];
+        let opts = PayloadOpts::default();
+        let mut a = make_rng(Some(5));
+        let mut b = make_rng(Some(5));
+        assert_eq!(
+            build_final_payload_with_rng("' OR SELECT 1", &tampers, &opts, &mut a),
+            build_final_payload_with_rng("' OR SELECT 1", &tampers, &opts, &mut b)
+        );
+    }
+
+    #[test]
+    fn seeded_build_different_seeds_likely_differ() {
+        use crate::seeded_rng::make_rng;
+        use crate::techniques::tamper::Tamper;
+        let tampers = [Tamper::RandomCase];
+        let opts = PayloadOpts::default();
+        let base = "SELECT * FROM users WHERE name = 'administrator'";
+        let mut a = make_rng(Some(1));
+        let mut b = make_rng(Some(2));
+        assert_ne!(
+            build_final_payload_with_rng(base, &tampers, &opts, &mut a),
+            build_final_payload_with_rng(base, &tampers, &opts, &mut b)
+        );
     }
 }

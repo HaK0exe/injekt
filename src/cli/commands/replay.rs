@@ -82,10 +82,16 @@ fn print_snapshot_summary(plain: &[u8], cli: &crate::cli::args::Cli) -> anyhow::
         .get("started_at")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("-");
+    let seed = v.get("seed").and_then(serde_json::Value::as_u64);
+    let n_trace = v
+        .get("trace")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
     let n_findings = findings.map_or(0, Vec::len);
     let n_extracted = extracted.map_or(0, Vec::len);
     println!(
-        "replay: decrypted session ({n_findings} findings, {n_extracted} extracted, {request_count} requests, started {started_at})"
+        "replay: decrypted session ({n_findings} findings, {n_extracted} extracted, {request_count} requests, {n_trace} trace, seed {}, started {started_at})",
+        seed.map_or("none".to_owned(), |s| s.to_string()),
     );
     if let Some(list) = findings {
         for f in list.iter().take(50) {
@@ -121,6 +127,78 @@ fn print_snapshot_summary(plain: &[u8], cli: &crate::cli::args::Cli) -> anyhow::
             println!("  … ({} more)", n_findings - 50);
         }
     }
+    // `--explain <param>`: one-line verdict from the exported snapshot
+    // (evidence + trace hashes, no re-sonde, offline). Trace is hashes-only
+    // so the render goes through the `Scrubber` like findings.
+    if let Some(wanted) = cli.explain.as_deref() {
+        print_snapshot_explain(&v, wanted, request_count, seed);
+    }
     println!("note: replay inspects the export; re-run `scan --target <url>` to resume testing");
     Ok(())
+}
+
+/// Offline `--explain` from a decrypted snapshot value.
+///
+/// Rebuilds the minimal inputs for [`crate::reasoning::explain_line`]:
+/// evidence + confidence of the matching finding, an empty
+/// [`crate::reasoning::ReasoningTrace`] hydrated with the exported hashes
+/// (counts only, hashes never rendered in clear), total `request_count` and
+/// `seed`. Prints `explain <param>: <line>` or a no-match notice.
+fn print_snapshot_explain(
+    v: &serde_json::Value,
+    wanted: &str,
+    request_count: u64,
+    seed: Option<u64>,
+) {
+    let want_l = wanted.trim().to_ascii_lowercase();
+    let findings = v.get("findings").and_then(serde_json::Value::as_array);
+    let mut matched: Option<(&str, f64)> = None;
+    if let Some(list) = findings {
+        for f in list {
+            let param = f
+                .get("parameter")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if param.to_ascii_lowercase() == want_l {
+                let ev = f
+                    .get("evidence")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let conf = f
+                    .get("confidence")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                matched = Some((ev, conf));
+                break;
+            }
+        }
+    }
+    let Some((evidence, confidence)) = matched else {
+        println!("explain {wanted}: no finding matches in this export");
+        return;
+    };
+    // Hydrate trace counts only (hashes opaque, never printed in clear).
+    let mut trace = crate::reasoning::ReasoningTrace::new();
+    if let Some(records) = v.get("trace").and_then(serde_json::Value::as_array) {
+        for r in records {
+            if let Ok(rec) = serde_json::from_value::<crate::reasoning::ProbeRecord>(r.clone()) {
+                trace.push(rec);
+            }
+        }
+    }
+    // Reconstruct the finding's canonical param for per-param attribution.
+    let param = findings
+        .and_then(|l| {
+            l.iter().find(|f| {
+                f.get("parameter")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|p| p.to_ascii_lowercase() == want_l)
+            })
+        })
+        .and_then(|f| f.get("parameter"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(wanted);
+    let line =
+        crate::reasoning::explain_line(evidence, confidence, param, &trace, request_count, seed);
+    println!("explain {wanted}: {line}");
 }
