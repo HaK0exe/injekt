@@ -4,8 +4,11 @@
 # Group B (UNION/JSON/OOB) and Oracle are Phase 2 — not in this file.
 
 [defaults]
-repeats = 3
+repeats = 5
 timeout_s = 600
+# Base deterministic seed for `run.py run --seed` (repeat i uses seed+i).
+# Recorded in every history.jsonl line; passed as injekt --seed when supported.
+seed = 42
 
 [[scenario]]
 id = "A1"
