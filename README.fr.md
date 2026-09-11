@@ -199,7 +199,8 @@ Options:
       --code <N>                  Le statut réponse doit égaler N, sinon veto
       --text-only                 Strip tags/entités HTML avant matching
       --level <1-5>               Agressivité [défaut: 1]
-      --confirm                   Confirmation stricte second passage (~2x requêtes, OOB exclu)
+      --seed <N>                  Seed RNG déterministe (enregistré dans le rapport)
+      --confirm                   Confirmation stricte second passage (planifié C6 ; actuellement warning seul)
       --ignore-code <LISTE>       Statuts traités comme sondes négatives (ex. 429,503)
       --oob-domain <DOMAINE>      Domaine collaborateur (active sondes OOB, OPT-IN)
       --oob-poll-url <URL>        URL de polling avec placeholder {token} (auto-confirmation)

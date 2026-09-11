@@ -214,7 +214,8 @@ Options:
       --code <N>                  Response status must equal N, else veto finding
       --text-only                 Strip HTML tags/entities before matching
       --level <1-5>               Aggressiveness [default: 1]
-      --confirm                   Strict second-pass confirmation (~2x requests, OOB skipped)
+      --seed <N>                  Deterministic RNG seed (recorded in report)
+      --confirm                   Strict second-pass confirmation (planned C6; currently warning-only)
       --ignore-code <LIST>        Status codes treated as negative probes (e.g. 429,503)
       --oob-domain <DOMAIN>       Collaborator base domain (enables OOB probes, OPT-IN)
       --oob-poll-url <URL>        Poll URL with {token} placeholder (auto-confirm callbacks)

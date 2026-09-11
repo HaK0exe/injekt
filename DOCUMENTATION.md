@@ -118,7 +118,8 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--code <N>` | Response status **must equal** this code, otherwise veto finding | — |
 | `--text-only` | Strip HTML tags/entities before matching and detection | `false` |
 | `--level <1-5>` | Aggressiveness: L1 = historical payload budget, L2 doubles it, L3+ tries every payload and widens ORDER BY enumeration | `1` |
-| `--confirm` | Strict second-pass confirmation: replay each finding's technique on that single parameter in a fresh session, keep only re-confirmed (OOB skipped, ~2× request cost) | `false` |
+| `--seed <N>` | Deterministic run seed, recorded in the report as `seed` (C1 metrology). Seeds all non-cryptographic RNG (tamper scripts, request jitter, UA rotation, retry backoff): runs with the same seed are deterministic. Crypto randomness (export salt/nonce) always stays OS-random | — |
+| `--confirm` | Strict second-pass confirmation (planned C6; **currently warning-only, not implemented** — in-detection 3-trial confirmation still applies regardless of this flag) | `false` |
 | `--ignore-code <LIST>` | Status codes treated as negative probes (e.g. `--ignore-code 429,503`); never yields a finding. Baseline/WAF detection runs **before** this filter and is never ignored | — |
 | `--raw-file <PATH>` | Raw HTTP request file (Burp/ZAP export) — **takes priority over `--target`** (see [Target resolution](#target-resolution)) | — |
 | `--tamper <LIST>` | WAF tampers (19 total, see [Tamper scripts](#tamper-scripts)): `space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,randomcase,versionedcomment,versionedmorekeywords,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,base64encode` (opt-in: breaks boolean differentials) | auto `space2comment` on active WAF blocking |
@@ -129,7 +130,8 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--oob-wait-secs <N>` | Seconds to wait for async DB-side OOB query before polling | `5` |
 | `--dbms <KIND>` | Force DBMS: `mysql`, `postgres`, `mssql`, `oracle` | auto-fingerprint |
 | `--extract` | Enable data extraction (opt-in, uses `SecretString`) | `false` |
-| `--output <PATH>` | Write JSON report to file (0o600 on Unix, relative path, never overwrites an existing file) | stdout |
+| `--output <PATH>` | Write report to file in `--format` serialization (0o600 on Unix, relative path, never overwrites an existing file) | stdout |
+| `--format <FMT>` | Report serialization: `json` (default), `sarif`, `junit`, `md` — all scrubbed | `json` |
 | `--rate-limit <RPS>` | Token-bucket requests/second | `10` (always enforced; there is no "unlimited" mode via CLI) |
 | `--jitter <MEAN,STD>` | **Milliseconds**, e.g. `"750,250"` (750±250ms, floor 200ms) | `750,250` (human jitter is **on by default**, even without the flag) |
 | `--marker <STR>` | Injection marker: `*`, `§`, `{{}}` | auto-detect |
@@ -250,6 +252,7 @@ injekt recon import --file discovered.json --test --enumerate
 | `--depth <N>` | Crawl depth (max 16) | `2` |
 | `--max-pages <N>` | Maximum pages to crawl (max 100,000) | `100` |
 | `--max-per-template <N>` | Max pages per path shape + query params (anti-trap) | `3` |
+| `--max-candidates <N>` | Max discovered params kept, redundant sink shapes dropped first | `500` |
 | `--include-subdomains` | Follow subdomain links | `false` |
 | `--ignore-robots` | Ignore `robots.txt` | `false` |
 
@@ -335,6 +338,7 @@ injekt mcp
   "depth": 2,
   "max_pages": 100,
   "max_per_template": 3,
+  "max_candidates": 500,
   "include_subdomains": false,
   "ignore_robots": false,
   "threads": 5,
@@ -380,7 +384,7 @@ injekt mcp
 | `--method` override | Same as above |
 | `--import` / `replay` / `--export-encrypted` | No TTY for passphrase; `export_encrypted` is rejected with `invalid_params` |
 | `--bulk-file` | Multi-target orchestration stays CLI-side |
-| `--level` / `--confirm` / `--ignore-code` | Not in the tool schema — MCP runs at **level 1, no second-pass confirm** |
+| `--level` / `--confirm` / `--seed` / `--ignore-code` | Not in the tool schema — MCP runs at **level 1, no second-pass confirm, unseeded** |
 | `-v/--verbose`, `--no-banner` | Transport-level concerns (stderr is logs, stdout is JSON-RPC) |
 
 Notes:
@@ -503,6 +507,7 @@ src/
 │   └── export.rs                    # Encrypted export/import (XChaCha20 + Argon2id)
 ├── reporting/
 │   ├── console.rs json.rs evidence.rs bulk.rs
+│   ├── verdict.rs (C7 calibrated buckets) sarif.rs junit.rs markdown.rs render.rs (`--format`)
 ├── mcp/                             # MCP stdio server (server.rs, tools.rs)
 └── engine/
     ├── orchestrator.rs              # State machine: parse → baseline → detection → fingerprint → extraction
@@ -711,7 +716,9 @@ INJEKT_PASSPHRASE='...' injekt replay --file session.enc
 | `INJEKT_CONFIG` | Config file path (same as `--config`) |
 | `INJEKT_THREADS`, `INJEKT_TIMEOUT`, `INJEKT_RETRIES`, `INJEKT_DELAY` | Perf knobs (same as CLI flags) |
 | `INJEKT_RATE_LIMIT`, `INJEKT_JITTER`, `INJEKT_TECHNIQUES`, `INJEKT_LEVEL` | Detection knobs |
+| `INJEKT_SEED` | Deterministic RNG seed (same as `--seed`) |
 | `INJEKT_PROXY`, `INJEKT_DBMS`, `INJEKT_TAMPER`, `INJEKT_TARGET` | Target/evasion |
+| `INJEKT_FORMAT` | Report serialization (same as `--format`) |
 | `INJEKT_OOB_DOMAIN`, `INJEKT_OOB_POLL_URL`, `INJEKT_OOB_WAIT_SECS` | OOB collaborator |
 
 ### Presets (`--profile`)
@@ -736,6 +743,7 @@ timeout = 30
 retries = 3
 delay = 800
 level = 1
+seed = 42
 techniques = ["boolean", "error"]
 proxy = "socks5h://127.0.0.1:9050"
 oob_wait_secs = 5
@@ -803,12 +811,70 @@ are replayed on every target (a warning is logged).
 ```jsonc
 {
   "target": "https://example.com/?id=1",   // scrubbed unless --no-redact
-  "findings": [ /* Finding: parameter, technique, dbms, confidence, evidence */ ],
+  "findings": [
+    {
+      "target": "https://example.com/?id=1",
+      "parameter": "id@query",
+      "technique": "Boolean",
+      "confidence": 0.95,
+      // C7 calibrated verdict (buckets: high → precision ≥95%, medium → ≥80%):
+      "false_positive_prob": 0.02,          // measured (confirmation trials) or 1-confidence
+      "severity": "high",                   // high|medium|low, recomputed live at render
+      "remediation": {
+        "summary": "Use parameterized queries / prepared statements; …",
+        "parameterized_example": "db.query(\"SELECT * FROM users WHERE id = ?\", [user_input])"
+      },
+      "evidence_detail": {
+        "hashes": [],                       // SHA-256 hex (traceability, no secrets)
+        "diff": "TRUE≈baseline FALSE≠baseline",
+        "trace_ref": "trace:9f2c41aa07bd3e55" // C6 reasoning trace, null until trace lands
+      },
+      "waf": {"vendor": "cloudflare", "blocking": true},
+      "dbms": "mysql",
+      "evidence": "boolean true_sim=0.95 …", // scrubbed proof snippet
+      "timestamp": "2026-01-15T12:00:00Z"
+    }
+  ],
   "evidences": [ /* scrubbed proof snippets */ ],
   "extracted": [ /* strings pulled via --dbs/--tables/--columns/--dump/--banner/etc, NOT scrubbed */ ],
-  "request_count": 123
+  "request_count": 123,
+  // C1 provenance (top-level, additive):
+  "version": "0.3.0",
+  "git_sha": null,        // set when built with GIT_SHA (release/CI)
+  "seed": 42,             // null = nondeterministic run
+  "profile": "stealth",   // null = no preset
+  "techniques": ["boolean", "error"],
+  "level": 1,
+  "tampers": ["space2comment"]
 }
 ```
+Pre-C7 minimal findings (`target,parameter,technique,confidence,dbms,evidence,timestamp`)
+still deserialize: every C7 field is `#[serde(default)]` (`false_positive_prob`
+defaults to `1.0`, `severity` is recomputed live from `(confidence, fp)` at
+render time, so stale exports can never inflate a report).
+
+### Report formats (`--format`)
+
+`--format` selects the `--output` serialization (console output unchanged,
+default `json`). Every format is scrubbed — `--output` files never carry
+secrets regardless of format.
+
+| Format | Content | Consumer |
+|--------|---------|----------|
+| `json` (default) | `JsonReport` schema above | `bench/runner`, `jq`, MCP |
+| `sarif` | SARIF 2.1.0 (`injekt/sqli-<technique>` rules, `error|warning|note` levels, `security-severity` from the calibrated bucket, remediation + `trace_ref` + WAF in `properties`) | GitHub code scanning, CI |
+| `junit` | One `<testcase>` + `<failure>` per finding (every finding fails the build, triage by severity in the dashboard); clean scan = single passing `no-injection` case | CI test dashboards |
+| `md` | Summary table + per-finding section with remediation, scrubbed evidence, WAF context, trace ref | Human-sendable report |
+
+```bash
+injekt --target "https://example.com/?id=1" --output report.sarif --format sarif
+injekt --target "https://example.com/?id=1" --output report.xml --format junit
+injekt --target "https://example.com/?id=1" --output report.md --format md
+# INJEKT_FORMAT=sarif works too (env fallback)
+```
+Bulk mode (`--bulk-file`) writes JSON per target as before; with
+`--format sarif|junit|md` it aggregates every per-target finding into one
+CI-ready document instead.
 Bulk mode wraps this per target (`BulkReport`: `targets_ok`, `targets_failed`,
 `request_count_total`, `per_target[]`) — `per_target[]` does not currently carry
 `extracted` (single-target and `auto` reports do). All other fields pass through
