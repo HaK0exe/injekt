@@ -151,7 +151,7 @@ impl ExecutionPlan {
 /// Canonical technique creation order (matches the orchestrator default
 /// `detection_order` else-branch): priors carry the JSON/`ORDER BY` context,
 /// the scheduler score decides execution afterwards.
-const fn canonical_order() -> [crate::session::state::TechniqueKind; 7] {
+const fn canonical_order() -> [crate::session::state::TechniqueKind; 8] {
     use crate::session::state::TechniqueKind as K;
     [
         K::Boolean,
@@ -160,11 +160,12 @@ const fn canonical_order() -> [crate::session::state::TechniqueKind; 7] {
         K::Union,
         K::Stacked,
         K::Json,
+        K::Nosql,
         K::Oob,
     ]
 }
 
-/// Expand CLI technique names to kinds (`all` = 7 kinds, case-insensitive).
+/// Expand CLI technique names to kinds (`all` = 8 kinds, case-insensitive).
 /// Unknown names are ignored (the engine warns at runtime; the plan stays
 /// offline and total).
 #[must_use]
@@ -183,6 +184,7 @@ pub fn technique_kinds_for_names(names: &[String]) -> Vec<crate::session::state:
             "union" => Some(K::Union),
             "stacked" => Some(K::Stacked),
             "json" => Some(K::Json),
+            "nosql" => Some(K::Nosql),
             "oob" => Some(K::Oob),
             _ => None,
         };
@@ -224,7 +226,11 @@ pub fn effective_marker_set(target_str: &str, marker_flag: Option<&str>) -> Mark
 
 /// Offline parameter list for `target_str` (lexical parse only, no DNS, no
 /// HTTP): marker synthetics + URL query + raw-request body/cookie/headers,
-/// synthetic `id` fallback, then `-p` filtering via [`filter_params`].
+/// exotic headers (L2+ : UA/Referer/XFF), synthetic `id` fallback, then `-p`
+/// filtering via [`filter_params`].
+///
+/// `level` mirrors the orchestrator gate : `< 2` = historique byte-identique
+/// (aucun synthétique), `>= 2` = exotiques ajoutés quand absents.
 ///
 /// # Errors
 /// Returns a message when the target URL fails lexical parsing.
@@ -234,6 +240,7 @@ pub fn params_for_target_offline(
     test_params: &[String],
     raw: Option<&RawRequest>,
     marker_flag: Option<&str>,
+    level: u8,
 ) -> Result<(MarkerSet, Vec<TargetParameter>), String> {
     let target =
         TargetUrl::parse(target_str, allow_private).map_err(|e| format!("invalid target: {e}"))?;
@@ -263,6 +270,9 @@ pub fn params_for_target_offline(
     params.extend(crate::target::parameters::collect_from_url_query(&target));
     if let Some(r) = raw {
         params.extend(collect_from_raw_request(r));
+    }
+    if level >= 2 {
+        params.extend(crate::target::parameters::synthetic_exotic_headers(&params));
     }
     let mut to_test = if params.is_empty() {
         vec![TargetParameter::new("id", ParameterLocation::Query, "1")]
@@ -317,6 +327,7 @@ pub fn build_plan(target_str: &str, cfg: &EngineConfig) -> Result<ExecutionPlan,
         &cfg.test_params,
         raw.as_ref(),
         cfg.marker.as_deref(),
+        cfg.budget.level,
     )?;
     let kinds = technique_kinds_for_names(&cfg.techniques);
     let seed = cfg.seed;
@@ -557,17 +568,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_techniques_means_all_seven() {
+    fn empty_techniques_means_all_eight() {
         let kinds = technique_kinds_for_names(&[]);
-        assert_eq!(kinds.len(), 7);
+        assert_eq!(kinds.len(), 8);
         let all = technique_kinds_for_names(&["all".to_owned()]);
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
     }
 
     #[test]
     fn unknown_techniques_fall_back_to_all() {
         let kinds = technique_kinds_for_names(&["nope".to_owned()]);
-        assert_eq!(kinds.len(), 7);
+        assert_eq!(kinds.len(), 8);
     }
 
     #[test]
@@ -579,7 +590,7 @@ mod tests {
         assert_eq!(plan.budget_spent, 0);
         assert!(!plan.is_empty());
         assert_eq!(plan.params.len(), 1);
-        assert_eq!(plan.ordered.len(), 7);
+        assert_eq!(plan.ordered.len(), 8);
         // `error` leads on a bare numeric param (highest EVI/cost: 0.765 vs
         // 0.74 for `boolean` at calibrated priors), and scores never rise.
         assert_eq!(plan.ordered[0].technique, "error");
@@ -591,6 +602,29 @@ mod tests {
                 probe.score
             );
             prev = probe.score;
+        }
+    }
+
+    #[test]
+    fn exotic_headers_gated_by_level() {
+        // L1 : byte-identique historique (query seule, 0 synthétique).
+        let (_, l1) =
+            params_for_target_offline("http://example.com/?id=1", true, &[], None, None, 1)
+                .expect("plan l1");
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l1[0].key(), "id@query");
+        // L2+ : UA/Referer/XFF/X-Real-IP ajoutés (second-order via header).
+        let (_, l2) =
+            params_for_target_offline("http://example.com/?id=1", true, &[], None, None, 2)
+                .expect("plan l2");
+        assert_eq!(l2.len(), 5);
+        for name in ["User-Agent", "Referer", "X-Forwarded-For", "X-Real-IP"] {
+            assert!(
+                l2.iter()
+                    .any(|p| p.key() == format!("{name}@header:{name}")),
+                "missing {name}: {:?}",
+                l2.iter().map(TargetParameter::key).collect::<Vec<_>>()
+            );
         }
     }
 

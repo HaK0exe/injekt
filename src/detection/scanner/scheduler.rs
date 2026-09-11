@@ -24,7 +24,7 @@ pub const fn base_evi_for(kind: TechniqueKind) -> f64 {
     match kind {
         TechniqueKind::Boolean => 1.0,
         TechniqueKind::Error => 0.9,
-        TechniqueKind::Union | TechniqueKind::Json => 0.8,
+        TechniqueKind::Union | TechniqueKind::Json | TechniqueKind::Nosql => 0.8,
         TechniqueKind::Time => 0.7,
         TechniqueKind::Stacked => 0.5,
         TechniqueKind::Oob => 0.4,
@@ -37,7 +37,7 @@ pub const fn base_evi_for(kind: TechniqueKind) -> f64 {
 pub const fn latency_secs_for(kind: TechniqueKind) -> f64 {
     match kind {
         TechniqueKind::Boolean | TechniqueKind::Error => 0.0,
-        TechniqueKind::Union | TechniqueKind::Json => 0.3,
+        TechniqueKind::Union | TechniqueKind::Json | TechniqueKind::Nosql => 0.3,
         TechniqueKind::Stacked | TechniqueKind::Oob => 0.5,
         TechniqueKind::Time => 1.5,
     }
@@ -48,7 +48,7 @@ pub const fn latency_secs_for(kind: TechniqueKind) -> f64 {
 pub const fn waf_risk_for(kind: TechniqueKind) -> f64 {
     match kind {
         TechniqueKind::Boolean | TechniqueKind::Error => 0.0,
-        TechniqueKind::Union | TechniqueKind::Json => 0.2,
+        TechniqueKind::Union | TechniqueKind::Json | TechniqueKind::Nosql => 0.2,
         TechniqueKind::Stacked | TechniqueKind::Time | TechniqueKind::Oob => 0.5,
     }
 }
@@ -56,7 +56,7 @@ pub const fn waf_risk_for(kind: TechniqueKind) -> f64 {
 /// Estimated cost in requests, latency weight, and WAF exposure risk:
 /// `1 + latency_secs + waf_risk`.
 ///
-/// Totals: `boolean` 1.0, `error` 1.0, `union` 1.5, `json` 1.5,
+/// Totals: `boolean` 1.0, `error` 1.0, `union` 1.5, `json` 1.5, `nosql` 1.5,
 /// `stacked` 2.0, `oob` 2.0, `time` 3.0.
 #[must_use]
 pub const fn cost_for(kind: TechniqueKind) -> f64 {
@@ -223,7 +223,7 @@ impl RequestBudget {
 ///
 /// Counts consecutive negative technique **outcomes** (one unit per
 /// `record_outcome`, whatever the request cost): the v0.5 loop runs each
-/// enabled technique once per parameter (7 max), so a per-parameter counter
+/// enabled technique once per parameter (8 max), so a per-parameter counter
 /// never trips mid-pass and cannot starve a late technique (`union`,
 /// `stacked`, `json`) on single-channel-vulnerable targets. The N1/N2 bound
 /// comes from inter-param isolation: every parameter starts from a fresh
@@ -419,7 +419,7 @@ impl Scheduler {
     /// The [`RequestBudget`] (global `--request-budget` envelope, seeded with
     /// the `<=8` context probes by the orchestrator) advances by the spent
     /// requests; the [`EarlyStop`] outcome counter advances by one unit per
-    /// technique so a single pass over the 7 techniques can never trip the
+    /// technique so a single pass over the 8 techniques can never trip the
     /// 25-negatives veto mid-pass (no starvation of late techniques on
     /// single-channel targets). `budget_spent`, `next_best_probe` and the
     /// N1/N2 wiring stay consistent.
@@ -586,6 +586,7 @@ mod tests {
         assert!((cost_for(TechniqueKind::Error) - 1.0).abs() < 1e-12);
         assert!((cost_for(TechniqueKind::Union) - 1.5).abs() < 1e-12);
         assert!((cost_for(TechniqueKind::Json) - 1.5).abs() < 1e-12);
+        assert!((cost_for(TechniqueKind::Nosql) - 1.5).abs() < 1e-12);
         assert!((cost_for(TechniqueKind::Stacked) - 2.0).abs() < 1e-12);
         assert!((cost_for(TechniqueKind::Oob) - 2.0).abs() < 1e-12);
         assert!((cost_for(TechniqueKind::Time) - 3.0).abs() < 1e-12);
@@ -636,6 +637,7 @@ mod tests {
             (K::Union, 0.05),
             (K::Stacked, 0.05),
             (K::Json, 0.45),
+            (K::Nosql, 0.05),
             (K::Oob, 0.02),
         ];
         let first = ordered_techniques_by_score(&candidates, None, Some(42));

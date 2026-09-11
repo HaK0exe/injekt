@@ -105,7 +105,7 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--timeout <SEC>` | Request timeout (mandatory for HTTP client build) | `30` |
 | `--retries <N>` | Max retries for failed requests | `3` |
 | `--delay <MS>` | Base retry delay (exponential backoff + jitter) | `500` |
-| `--techniques <LIST>` | Comma-separated: `boolean,time,error,union,stacked,oob,json,all` | `all` |
+| `--techniques <LIST>` | Comma-separated: `boolean,time,error,union,stacked,oob,json,nosql,all` | `all` |
 | `-p, --params <LIST>` | Test only these parameters: bare name (`-p id`), or scoped (`-p body:user,cookie:PHPSESSID`, `query:`, `header:`) | all discovered params |
 | `--data <STR>` | POST body to test (e.g. `"id=1&user=admin"`) — alternative to `--raw-file` | — |
 | `--prefix <STR>` | Payload prefix prepended **after** tampers (e.g. `"')"`) | — |

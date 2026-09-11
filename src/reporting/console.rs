@@ -41,8 +41,15 @@ fn severity(confidence: f64, false_positive_prob: f64) -> Severity {
 }
 
 pub fn print_findings(findings: &[Finding], scrubber: &Scrubber) {
+    // Results go to stdout (pipeable); colors follow NO_COLOR/TERM=dumb
+    // and stdout TTY — never force ANSI into a pipe or CI log.
+    let color = crate::cli::output::console::stdout_colors_enabled();
     if findings.is_empty() {
-        println!("{} {}", "✓".green().bold(), "No findings.".yellow());
+        if color {
+            println!("{} {}", "✓".green().bold(), "No findings.".yellow());
+        } else {
+            println!("✓ No findings.");
+        }
         return;
     }
 
@@ -66,17 +73,29 @@ pub fn print_findings(findings: &[Finding], scrubber: &Scrubber) {
         .count();
     let low = findings.len() - high - medium;
 
-    println!(
-        "{} {} across {} parameter(s)  {}",
-        "⚠".red().bold(),
-        format!("{} finding(s)", findings.len()).bold(),
-        findings
-            .iter()
-            .map(|f| f.parameter.as_str())
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        format!("[{high} high · {medium} medium · {low} low]").dimmed()
-    );
+    if color {
+        println!(
+            "{} {} across {} parameter(s)  {}",
+            "⚠".red().bold(),
+            format!("{} finding(s)", findings.len()).bold(),
+            findings
+                .iter()
+                .map(|f| f.parameter.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            format!("[{high} high · {medium} medium · {low} low]").dimmed()
+        );
+    } else {
+        println!(
+            "⚠ {} finding(s) across {} parameter(s) [{high} high · {medium} medium · {low} low]",
+            findings.len(),
+            findings
+                .iter()
+                .map(|f| f.parameter.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+        );
+    }
     println!();
 
     let rows: Vec<Row> = findings
@@ -93,21 +112,34 @@ pub fn print_findings(findings: &[Finding], scrubber: &Scrubber) {
         })
         .collect();
     let table = Table::new(rows).with(Style::rounded()).to_string();
-    println!("{}", table.bright_white());
+    if color {
+        println!("{}", table.bright_white());
+    } else {
+        println!("{table}");
+    }
     println!();
 
     for f in findings {
         let sf = f.scrubbed(scrubber);
-        let (icon, label) = match severity(f.confidence, f.false_positive_prob) {
-            Severity::High => ("●".red().to_string(), "HIGH".red().bold().to_string()),
-            Severity::Medium => ("●".yellow().to_string(), "MED".yellow().bold().to_string()),
-            Severity::Low => ("●".dimmed().to_string(), "LOW".dimmed().to_string()),
-        };
-        println!(
-            "{icon} {label} {} — {}",
-            sf.parameter.cyan().bold(),
-            sf.evidence.dimmed()
-        );
+        if color {
+            let (icon, label) = match severity(f.confidence, f.false_positive_prob) {
+                Severity::High => ("●".red().to_string(), "HIGH".red().bold().to_string()),
+                Severity::Medium => ("●".yellow().to_string(), "MED".yellow().bold().to_string()),
+                Severity::Low => ("●".dimmed().to_string(), "LOW".dimmed().to_string()),
+            };
+            println!(
+                "{icon} {label} {} — {}",
+                sf.parameter.cyan().bold(),
+                sf.evidence.dimmed()
+            );
+        } else {
+            let label = match severity(f.confidence, f.false_positive_prob) {
+                Severity::High => "HIGH",
+                Severity::Medium => "MED",
+                Severity::Low => "LOW",
+            };
+            println!("● {label} {} — {}", sf.parameter, sf.evidence);
+        }
     }
 }
 
@@ -120,13 +152,20 @@ pub fn print_extracted(extracted: &[String]) {
         return;
     }
     println!();
-    println!(
-        "{} {}",
-        "⛏".bright_green().bold(),
-        format!("{} extracted value(s)", extracted.len()).bold()
-    );
-    for e in extracted {
-        println!("  {} {e}", "•".bright_green());
+    if crate::cli::output::console::stdout_colors_enabled() {
+        println!(
+            "{} {}",
+            "⛏".bright_green().bold(),
+            format!("{} extracted value(s)", extracted.len()).bold()
+        );
+        for e in extracted {
+            println!("  {} {e}", "•".bright_green());
+        }
+    } else {
+        println!("⛏ {} extracted value(s)", extracted.len());
+        for e in extracted {
+            println!("  • {e}");
+        }
     }
 }
 

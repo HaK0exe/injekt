@@ -260,6 +260,38 @@ pub fn is_nontestable_header(name: &str) -> bool {
     )
 }
 
+/// Emplacements exotiques souvent oubliés : `User-Agent`, `Referer` et
+/// `X-Forwarded-For` (plus `X-Real-IP` en bonus) sont parfois loggés
+/// directement en base sans sanitisation → second-order via header.
+///
+/// Ces synthétiques ne sont ajoutés qu'à partir du `--level 2` (comportement
+/// L1 byte-identique : aucune requête extra par défaut) quand le header
+/// correspondant est absent des params déjà collectés (comparaison
+/// insensible à la casse). Valeur d'origine bénigne (`injekt`), jamais
+/// loggée en clair dans les findings (seul le nom `header:<Nom>` apparaît).
+pub const EXOTIC_HEADERS: &[&str] = &["User-Agent", "Referer", "X-Forwarded-For", "X-Real-IP"];
+
+/// Complète `existing` avec les [`EXOTIC_HEADERS`] manquants (comparaison
+/// insensible à la casse sur les params `Header`). Pure, jamais de doublon.
+#[must_use]
+pub fn synthetic_exotic_headers(existing: &[TargetParameter]) -> Vec<TargetParameter> {
+    let mut out = Vec::new();
+    for name in EXOTIC_HEADERS {
+        let present = existing.iter().any(|p| match &p.location {
+            ParameterLocation::Header(h) => h.eq_ignore_ascii_case(name),
+            _ => false,
+        });
+        if !present {
+            out.push(TargetParameter::new(
+                (*name).to_owned(),
+                ParameterLocation::Header((*name).to_owned()),
+                "injekt",
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -335,5 +367,42 @@ mod tests {
         assert!(is_nontestable_header("Authorization"));
         assert!(is_nontestable_header("CONTENT-TYPE"));
         assert!(!is_nontestable_header("x-user-id"));
+    }
+
+    #[test]
+    fn exotic_headers_cover_ua_referer_xff() {
+        assert!(EXOTIC_HEADERS.contains(&"User-Agent"));
+        assert!(EXOTIC_HEADERS.contains(&"Referer"));
+        assert!(EXOTIC_HEADERS.contains(&"X-Forwarded-For"));
+    }
+
+    #[test]
+    fn synthetic_exotic_skips_present_case_insensitive() {
+        let existing = vec![TargetParameter::new(
+            "user-agent",
+            ParameterLocation::Header("user-agent".to_owned()),
+            "bench",
+        )];
+        let synth = synthetic_exotic_headers(&existing);
+        assert!(
+            !synth
+                .iter()
+                .any(|p| p.name.eq_ignore_ascii_case("user-agent")),
+            "got {synth:?}"
+        );
+        assert!(
+            synth.iter().any(|p| p.name == "X-Forwarded-For"),
+            "got {synth:?}"
+        );
+        assert_eq!(synth.len(), EXOTIC_HEADERS.len() - 1);
+    }
+
+    #[test]
+    fn synthetic_exotic_empty_gives_all() {
+        let synth = synthetic_exotic_headers(&[]);
+        assert_eq!(synth.len(), EXOTIC_HEADERS.len());
+        for p in &synth {
+            assert!(matches!(p.location, ParameterLocation::Header(_)));
+        }
     }
 }

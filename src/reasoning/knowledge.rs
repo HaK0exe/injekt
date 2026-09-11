@@ -18,7 +18,7 @@
 //! ```
 //!
 //! Clé d'agrégat : `(technique, dbms, context_class)` — vocabulaire fermé :
-//! - `technique`: `boolean|time|error|union|stacked|oob|json`
+//! - `technique`: `boolean|time|error|union|stacked|oob|json|nosql`
 //! - `dbms`: `mysql|postgres|mssql|oracle|unknown`
 //! - `context_class`: `numeric|single-quote|double-quote|parenthesis|json|order_by|generic`
 //!
@@ -484,6 +484,7 @@ pub fn parse_technique(raw: &str) -> Option<TechniqueKind> {
         "stacked" => Some(TechniqueKind::Stacked),
         "oob" => Some(TechniqueKind::Oob),
         "json" => Some(TechniqueKind::Json),
+        "nosql" => Some(TechniqueKind::Nosql),
         _ => None,
     }
 }
@@ -499,10 +500,11 @@ pub fn all_techniques() -> Vec<TechniqueKind> {
         TechniqueKind::Stacked,
         TechniqueKind::Oob,
         TechniqueKind::Json,
+        TechniqueKind::Nosql,
     ]
 }
 
-/// Expansion de la liste CLI (`all` → 7 techniques, inconnues ignorées).
+/// Expansion de la liste CLI (`all` → 8 techniques, inconnues ignorées).
 #[must_use]
 pub fn expand_enabled_techniques(enabled: &[String]) -> Vec<TechniqueKind> {
     if enabled.iter().any(|t| t.trim().eq_ignore_ascii_case("all")) {
@@ -793,8 +795,8 @@ mod tests {
             "evidence Authorization: Bearer SECRET",
         )];
         learn_from_run(&mut ks, &findings, &["all".to_owned()], Some("mysql"), 70);
-        // 7 techniques => 7 clés, la gagnante en succès.
-        assert_eq!(ks.len(), 7);
+        // 8 techniques => 8 clés, la gagnante en succès.
+        assert_eq!(ks.len(), 8);
         let win = KnowledgeKey::new(TechniqueKind::Boolean, "mysql", "generic");
         assert_eq!(ks.entries.get(&win).map(|e| e.success), Some(1));
         let lose = KnowledgeKey::new(TechniqueKind::Time, "mysql", "generic");

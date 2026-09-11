@@ -130,7 +130,7 @@ fn on_two_simulated_runs_boost_winner_bounded() {
         Some("mysql"),
         70,
     );
-    assert_eq!(delta.len(), 7);
+    assert_eq!(delta.len(), 8);
 }
 
 #[test]

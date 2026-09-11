@@ -25,6 +25,11 @@ async fn main() -> anyhow::Result<()> {
     let filter = if cli.verbose { "debug" } else { "info" };
     fmt()
         .event_format(injekt::cli::output::console::SqlmapStyle)
+        // Logs → stderr only so stdout stays pipeable (reports, MCP
+        // JSON-RPC on stdio). ANSI is gated inside `SqlmapStyle` via
+        // `colors_enabled()` (NO_COLOR/TERM=dumb/TTY); no `with_ansi`
+        // here — that setter only exists for the default formatter.
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
         )

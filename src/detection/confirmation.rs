@@ -34,7 +34,12 @@ impl ConfirmationResult {
 }
 
 /// Re-test TRUE/FALSE inverted payload pairs. Requires 3 trials minimum.
-/// Confirmation requires majority of trials with `true_conf` > 0.6 AND `false_conf` < 0.4.
+/// Confirmation requires majority of trials with `true_conf` > 0.6 AND
+/// (`false_conf` < 0.4 OR a decisive gap: `true_conf` > 0.9 with
+/// `true_conf - false_conf` > 0.5). The gap clause covers small JSON
+/// envelopes whose boilerplate tokens (`request_id`, …) floor the FALSE
+/// similarity above 0.4 even for a textbook oracle (TRUE == baseline,
+/// FALSE = empty set — live bench A1: 1.0 vs 0.4375).
 #[must_use]
 // Trial counts are small (single-digit confirmation retries); usize->f64 precision loss is not reachable.
 #[allow(clippy::cast_precision_loss)]
@@ -47,7 +52,11 @@ pub fn confirm(trials: &[Trial]) -> ConfirmationResult {
     let mut score_sum = 0.0;
     for t in trials {
         let true_ok = t.true_conf > 0.6;
-        let false_ok = t.false_conf < 0.4;
+        // Gap clause: a TRUE branch locked on the baseline (> 0.9) with a
+        // decisive differential (> 0.5) confirms even when envelope
+        // boilerplate keeps the FALSE similarity at/above 0.4.
+        let false_ok =
+            t.false_conf < 0.4 || (t.true_conf > 0.9 && t.true_conf - t.false_conf > 0.5);
         if true_ok && false_ok {
             pass_count += 1;
         }
@@ -202,6 +211,50 @@ mod tests {
             Trial {
                 true_conf: 0.52,
                 false_conf: 0.27,
+            },
+        ];
+        let (r, _) = confirm_either(&trials);
+        assert!(!r.confirmed);
+    }
+    #[test]
+    fn confirms_locked_baseline_with_decisive_gap() {
+        // Live bench A1 shape: TRUE == baseline (1.0), FALSE = empty `data`
+        // set (0.4375 — envelope boilerplate floors it above the 0.4 bar).
+        // The gap clause (1.0 - 0.4375 = 0.5625 > 0.5) must confirm.
+        let trials = [
+            Trial {
+                true_conf: 1.0,
+                false_conf: 0.4375,
+            },
+            Trial {
+                true_conf: 1.0,
+                false_conf: 0.4375,
+            },
+            Trial {
+                true_conf: 1.0,
+                false_conf: 0.4375,
+            },
+        ];
+        let (r, inverted) = confirm_either(&trials);
+        assert!(r.confirmed);
+        assert!(!inverted);
+    }
+    #[test]
+    fn rejects_small_gap_near_threshold() {
+        // TRUE locked but gap indecisive (0.95 - 0.5 = 0.45 < 0.5):
+        // stays rejected so the gap clause cannot launder weak oracles.
+        let trials = [
+            Trial {
+                true_conf: 0.95,
+                false_conf: 0.5,
+            },
+            Trial {
+                true_conf: 0.95,
+                false_conf: 0.5,
+            },
+            Trial {
+                true_conf: 0.95,
+                false_conf: 0.5,
             },
         ];
         let (r, _) = confirm_either(&trials);

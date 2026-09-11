@@ -187,7 +187,7 @@ Options:
       --delay <MS>                Délai retry de base, backoff exponentiel [défaut: 500]
       --rate-limit <RPS>          Token-bucket req/s [défaut: 10]
       --jitter <MOY,ECART>        Millisecondes, ex. "750,250" [défaut: 750,250 — actif même sans le flag]
-      --techniques <LISTE>        boolean,time,error,union,stacked,oob,json,all [défaut: all]
+      --techniques <LISTE>        boolean,time,error,union,stacked,oob,json,nosql,all [défaut: all]
       --fetch-using <MODE>        Oracle forcé : direct, boolean ou time
       --tamper <LISTE>            Tampers WAF : space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,randomcase,versionedcomment,versionedmorekeywords,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,base64encode(opt-in) [défaut: aucun, auto space2comment sur blocage WAF actif]
       --hpp                       Pollution paramètres : duplique ?id=1&id=PAYLOAD (Query/Body)
@@ -278,7 +278,7 @@ src/
 ├── target/{url,raw_request,parameters,markers}
 ├── http/{client,identity,proxy,cookies,redirects,retry,jitter,rate_limit}
 ├── detection/{baseline,response_diff,confirmation,scanner/{engine,scheduler}}
-├── techniques/{boolean,time,error,union,stacked,oob,json}/{detector,payloads} (+oob/verifier) + tamper (évasion WAF) + request_tamper (HPP/chunked)
+├── techniques/{boolean,time,error,union,stacked,oob,json,nosql}/{detector,payloads} (+oob/verifier) + tamper (évasion WAF) + request_tamper (HPP/chunked)
 ├── dbms/{common,mysql,postgres,mssql,oracle}/{fingerprint,payloads,queries}
 ├── extraction/{engine,inference,verification}
 ├── recon/{crawler,discovery,filters,parameter}

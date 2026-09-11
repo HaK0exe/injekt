@@ -471,6 +471,12 @@ fn engine_config(cli: &Cli, enumerate: bool) -> EngineConfig {
             cli.knowledge_enabled(),
             cli.knowledge_path.as_deref(),
         ),
+        second_order: crate::engine::orchestrator::SecondOrderConfig {
+            enabled: cli.second_order,
+            revisit_url: cli.second_order_revisit_url.clone(),
+            max_stores: cli.effective_second_order_max_stores(),
+            ..crate::engine::orchestrator::SecondOrderConfig::default()
+        },
     }
 }
 

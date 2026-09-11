@@ -187,6 +187,9 @@ impl InjektServer {
             // C13: MCP = RAM-only, knowledge jamais activé (surface stdio minimale).
             allow_knowledge: false,
             knowledge_path: None,
+            second_order: false,
+            second_order_revisit_url: None,
+            second_order_max_stores: 8,
             raw_file: None,
             raw_dir: None,
             stdin: false,
@@ -635,7 +638,7 @@ pub struct ScanParams {
     pub target: String,
     /// Number of concurrent threads (default: 5)
     pub threads: Option<usize>,
-    /// Techniques to use: boolean, time, error, union, stacked, oob, all (default: all)
+    /// Techniques to use: boolean, time, error, union, stacked, oob, json, nosql, all (default: all)
     pub techniques: Option<Vec<String>>,
     /// Test only these parameters (e.g. `["id"]` or `["body:user"]`)
     pub params: Option<Vec<String>>,
@@ -794,7 +797,7 @@ pub struct ReconScanParams {
     pub auto_enumerate: Option<bool>,
     /// Number of concurrent threads (default: 5)
     pub threads: Option<usize>,
-    /// Techniques to use: boolean, time, error, union, stacked, oob, all
+    /// Techniques to use: boolean, time, error, union, stacked, oob, json, nosql, all
     pub techniques: Option<Vec<String>>,
     /// Test only these parameters
     pub params: Option<Vec<String>>,
@@ -898,7 +901,7 @@ pub struct InfoParams {}
 pub struct PlanParams {
     /// Target URL to plan (e.g. <https://example.com/?id=1>)
     pub target: String,
-    /// Techniques to plan: boolean, time, error, union, stacked, oob, json, all
+    /// Techniques to plan: boolean, time, error, union, stacked, oob, json, nosql, all
     pub techniques: Option<Vec<String>>,
     /// Test only these parameters (e.g. `["id"]` or `["body:user"]`)
     pub params: Option<Vec<String>>,

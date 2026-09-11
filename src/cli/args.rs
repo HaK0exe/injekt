@@ -14,6 +14,7 @@ pub enum TechniqueOpt {
     Stacked,
     Oob,
     Json,
+    Nosql,
     All,
 }
 
@@ -312,6 +313,33 @@ pub struct Cli {
     #[arg(long, global = true, env = "INJEKT_KNOWLEDGE_PATH")]
     pub knowledge_path: Option<String>,
 
+    /// Second-order actif borné (Option B, lab only, même-origine) : stocke
+    /// un marqueur bénin `u+8hex` (payload `'<marker>'` style union, jamais
+    /// de RCE/stacked) puis revisite `--second-order-revisit-url` (ex:
+    /// `/admin`, max 2 GET séquentiels). OFF par défaut = 0 requête extra,
+    /// chemin byte-identique.
+    #[arg(long = "second-order", global = true, env = "INJEKT_SECOND_ORDER")]
+    pub second_order: bool,
+
+    /// URL de revisit second-order : chemin même-origine (ex: `/admin`) ou
+    /// URL absolue même-origine que la cible. Schéma/host/port différent =
+    /// erreur. Requis quand `--second-order` est actif.
+    #[arg(long, global = true, env = "INJEKT_SECOND_ORDER_REVISIT_URL")]
+    pub second_order_revisit_url: Option<String>,
+
+    /// Nombre max de params Body/Query/Header stockés en second-order [default: 8, range 1..=32].
+    /// 1 store + max 2 revisits GET par param, séquentiel, `RequestClass::Default`.
+    /// Les headers exotiques (User-Agent/X-Forwarded-For/Referer, souvent loggés
+    /// en base) sont couverts comme les Body/Query.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u8).range(1..=32),
+        env = "INJEKT_SECOND_ORDER_MAX_STORES"
+    )]
+    pub second_order_max_stores: u8,
+
     /// Raw HTTP request file (Burp/ZAP) — alternative to --target
     #[arg(long, global = true)]
     pub raw_file: Option<String>,
@@ -426,6 +454,9 @@ impl core::fmt::Debug for Cli {
             .field("allow_private", &self.allow_private)
             .field("allow_knowledge", &self.allow_knowledge)
             .field("knowledge_path", &self.knowledge_path)
+            .field("second_order", &self.second_order)
+            .field("second_order_revisit_url", &self.second_order_revisit_url)
+            .field("second_order_max_stores", &self.second_order_max_stores)
             .field("raw_file", &self.raw_file)
             .field("raw_dir", &self.raw_dir)
             .field("stdin", &self.stdin)
@@ -742,6 +773,20 @@ impl Cli {
     #[must_use]
     pub const fn knowledge_enabled(&self) -> bool {
         self.allow_knowledge
+    }
+
+    /// Borne effective second-order `1..=32` (clap garantit déjà la range ;
+    /// clamp défensif pour les constructions manuelles). Défaut 8.
+    #[must_use]
+    pub const fn effective_second_order_max_stores(&self) -> usize {
+        let v = self.second_order_max_stores as usize;
+        if v < 1 {
+            1
+        } else if v > 32 {
+            32
+        } else {
+            v
+        }
     }
 
     /// Chemin effectif du store (`--knowledge-path` > `INJEKT_KNOWLEDGE_PATH` >
@@ -1129,6 +1174,9 @@ mod tests {
             allow_private: false,
             allow_knowledge: false,
             knowledge_path: None,
+            second_order: false,
+            second_order_revisit_url: None,
+            second_order_max_stores: 8,
             raw_file: None,
             raw_dir: None,
             stdin: false,

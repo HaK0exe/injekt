@@ -16,6 +16,7 @@ pub enum TechniqueKind {
     Stacked,
     Oob,
     Json,
+    Nosql,
 }
 
 impl core::fmt::Display for TechniqueKind {
@@ -28,6 +29,7 @@ impl core::fmt::Display for TechniqueKind {
             Self::Stacked => write!(f, "stacked"),
             Self::Oob => write!(f, "oob"),
             Self::Json => write!(f, "json"),
+            Self::Nosql => write!(f, "nosql"),
         }
     }
 }
@@ -87,6 +89,12 @@ impl Remediation {
             TechniqueKind::Json => {
                 "Validate and schema-check JSON input before use; bind extracted values as \
                  parameters instead of interpolating them into SQL/JSON-path expressions."
+                    .to_owned()
+            }
+            TechniqueKind::Nosql => {
+                "Reject MongoDB operators ($gt/$ne/$where/...) in client input; enforce a \
+                 strict allow-list schema (deny unknown keys starting with `$`), never pass \
+                 raw JSON bodies to the driver."
                     .to_owned()
             }
             TechniqueKind::Oob => {
@@ -345,6 +353,47 @@ impl Detectability {
     }
 }
 
+/// Second-order candidate (Option A passive, 0 requête extra).
+///
+/// Marqueur bénin injecté via le chemin existant (union / stacked) et
+/// potentiellement persisté côté serveur. Aucun revisit automatique :
+/// l'opérateur vérifie manuellement sur la 2e page. Le marqueur reste
+/// `SecretString` + `Zeroize`, la trace ne garde que des hashes.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct StoredProbe {
+    /// Clé param `name@location` (ex: `user@body`), déjà scrubbed à l'affichage.
+    pub store_param: String,
+    /// Marqueur bénin jetable (ex: `u<8hex>`), jamais loggé en clair.
+    pub marker: SecretString,
+    /// `sha256 hex` de l'URL de stockage, pas l'URL claire en trace.
+    pub store_url_hash: String,
+}
+
+impl StoredProbe {
+    #[must_use]
+    pub fn new(
+        store_param: impl Into<String>,
+        marker: SecretString,
+        store_url_hash: impl Into<String>,
+    ) -> Self {
+        Self {
+            store_param: store_param.into(),
+            marker,
+            store_url_hash: store_url_hash.into(),
+        }
+    }
+}
+
+impl Zeroize for StoredProbe {
+    fn zeroize(&mut self) {
+        self.store_param.zeroize();
+        // `SecretString` zeroizes on drop; explicit wipe via replace.
+        self.marker = SecretString::from(String::new());
+        self.store_url_hash.zeroize();
+    }
+}
+
 /// Session state — RAM only, zeroized on drop.
 ///
 /// ```rust
@@ -359,6 +408,8 @@ pub struct SessionState {
     findings: Vec<Finding>,
     // SecretString already zeroizes; we keep count and wipe on drop.
     extracted: Vec<SecretString>,
+    /// Second-order candidates passifs (marqueurs stockés, 0 revisit auto).
+    stored: Vec<StoredProbe>,
     request_count: u64,
     /// Throttle detectability (C10): `403`/`429` observed this run.
     detectability: Detectability,
@@ -398,6 +449,10 @@ impl Zeroize for SessionState {
         self.findings.clear();
         self.extracted.zeroize();
         self.extracted.clear();
+        for probe in &mut self.stored {
+            probe.zeroize();
+        }
+        self.stored.clear();
         self.request_count.zeroize();
         self.detectability = Detectability::default();
         self.started_at = None;
@@ -420,6 +475,7 @@ impl SessionState {
         Self {
             findings: Vec::new(),
             extracted: Vec::new(),
+            stored: Vec::new(),
             request_count: 0,
             detectability: Detectability::default(),
             started_at: Some(Utc::now()),
@@ -488,6 +544,22 @@ impl SessionState {
 
     pub fn push_extracted(&mut self, s: SecretString) {
         self.extracted.push(s);
+    }
+
+    /// Track a stored second-order candidate (passive, 0 revisit auto).
+    /// Bounded by caller (`max_stores`); hashes only in trace, never clair.
+    pub fn push_stored(&mut self, probe: StoredProbe) {
+        self.stored.push(probe);
+    }
+
+    #[must_use]
+    pub fn stored(&self) -> &[StoredProbe] {
+        &self.stored
+    }
+
+    #[must_use]
+    pub fn stored_count(&self) -> usize {
+        self.stored.len()
     }
 
     #[must_use]
@@ -591,6 +663,10 @@ impl SessionState {
         self.findings.clear();
         self.extracted.zeroize();
         self.extracted.clear();
+        for probe in &mut self.stored {
+            probe.zeroize();
+        }
+        self.stored.clear();
         self.request_count = 0;
         self.detectability = Detectability::default();
         self.trace.zeroize();
@@ -607,6 +683,17 @@ impl Clone for SessionState {
                 .extracted
                 .iter()
                 .map(|s| SecretString::from(s.expose_secret().to_owned()))
+                .collect(),
+            stored: self
+                .stored
+                .iter()
+                .map(|p| {
+                    StoredProbe::new(
+                        p.store_param.clone(),
+                        SecretString::from(p.marker.expose_secret().to_owned()),
+                        p.store_url_hash.clone(),
+                    )
+                })
                 .collect(),
             request_count: self.request_count,
             detectability: self.detectability,

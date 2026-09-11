@@ -29,6 +29,7 @@ use crate::{
         boolean::{detector::BooleanDetector, payloads::boolean_payloads_for},
         error::detector::ErrorDetector,
         json::{detector::JsonDetector, payloads::json_payloads_for},
+        nosql::{detector::NosqlDetector, payloads::nosql_payloads},
         oob::{
             detector::OobDetector,
             payloads::{is_valid_oob_domain, new_token, oob_payloads_for},
@@ -245,6 +246,43 @@ impl Default for OobConfig {
     }
 }
 
+/// Option B second-order actif borné (lab only, même-origine).
+///
+/// `enabled=false` (défaut) = 0 requête extra, chemin byte-identique.
+/// `enabled=true` = `run_second_order()` stocke un marqueur bénin
+/// (`u+8hex`, payload `'<marker>'` style union, jamais de RCE/stacked)
+/// sur ≤`max_stores` params Body/Query/Header puis revisite `revisit_url`
+/// (même-origine uniquement, max 2 GET séquentiels, `RequestClass::Default`).
+/// Les headers (`User-Agent`/`X-Forwarded-For`/`Referer`, souvent loggés en
+/// base sans sanitisation) sont couverts comme les Body/Query.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct SecondOrderConfig {
+    pub enabled: bool,
+    pub revisit_url: Option<String>,
+    pub max_stores: usize,
+}
+
+impl Default for SecondOrderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            revisit_url: None,
+            max_stores: 8,
+        }
+    }
+}
+
+impl SecondOrderConfig {
+    /// Borne effective `1..=32` (défense en profondeur si construit à la main).
+    /// `&self` (pas `const`): le struct porte des `String` (`Drop`), donc
+    /// `const fn` par valeur est rejeté par le compilateur.
+    #[must_use]
+    pub fn effective_max_stores(&self) -> usize {
+        self.max_stores.clamp(1, 32)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
 #[non_exhaustive]
@@ -274,6 +312,7 @@ pub struct EngineConfig {
     pub net: NetConfig,
     pub oob: OobConfig,
     pub enumeration: EnumConfig,
+    pub second_order: SecondOrderConfig,
 
     pub techniques: Vec<String>,
     pub test_params: Vec<String>,
@@ -352,6 +391,7 @@ impl Default for EngineConfig {
             net: NetConfig::default(),
             oob: OobConfig::default(),
             enumeration: EnumConfig::default(),
+            second_order: SecondOrderConfig::default(),
             techniques: vec![
                 "boolean".to_owned(),
                 "time".to_owned(),
@@ -437,6 +477,7 @@ impl Engine {
         candidate: Option<&crate::recon::ParameterCandidate>,
     ) -> crate::error::Result<EngineState> {
         let mut current = EngineState::Parse;
+        let run_started = Instant::now();
         info!(target=%self.scrubber.scrub(target_str), state=?current, "engine start");
 
         // `--confirm` strict second-pass (C6): re-sonde every confirmed finding
@@ -498,6 +539,8 @@ impl Engine {
         let raw_request = Arc::new(raw_request);
 
         // Run adaptive context analysis (<=8 requests bound, 0 DBMS probes if --dbms)
+        let context_started = Instant::now();
+        let context_req_before = self.state.read().await.request_count();
         let primary_param = to_test.first();
         let context_result = if let Some(param) = primary_param {
             crate::dbms::context::analyze_context(
@@ -523,11 +566,21 @@ impl Engine {
             }
         };
 
+        let context_elapsed = context_started.elapsed().as_secs_f64();
+        let context_req_delta = self
+            .state
+            .read()
+            .await
+            .request_count()
+            .saturating_sub(context_req_before);
         info!(
             target=%self.scrubber.scrub(target_str),
             context=%context_result.context.summary(),
             probes=context_result.probes_sent,
-            "context analysis complete"
+            elapsed_s=context_elapsed,
+            requests=context_req_delta,
+            "context done in {context_elapsed:.1}s ({context_req_delta} req) — {}",
+            context_result.context.summary(),
         );
 
         let (top_dbms, prob) = context_result.dbms_belief.top_candidate();
@@ -543,6 +596,12 @@ impl Engine {
             "phase detection"
         );
 
+        let detection_started = Instant::now();
+        let detection_req_before = self.state.read().await.request_count();
+        // Clone borné pour Option B second-order (Body/Query, ≤max_stores) :
+        // `run_detection` consomme `to_test`, le clone préserve la liste
+        // filtrée `-p` pour `run_second_order` sans refaire `select_params`.
+        let to_test_for_second_order = to_test.clone();
         self.run_detection(
             &target,
             target_str,
@@ -556,6 +615,22 @@ impl Engine {
             to_test,
         )
         .await;
+        {
+            let detection_elapsed = detection_started.elapsed().as_secs_f64();
+            let detection_req_delta = self
+                .state
+                .read()
+                .await
+                .request_count()
+                .saturating_sub(detection_req_before);
+            let detection_findings = self.state.read().await.findings().len();
+            info!(
+                elapsed_s = detection_elapsed,
+                requests = detection_req_delta,
+                findings = detection_findings,
+                "detection done in {detection_elapsed:.1}s ({detection_req_delta} req, {detection_findings} findings)"
+            );
+        }
 
         // C6 `--confirm` second-pass: re-sonde every confirmed finding with
         // fresh payloads + derived seed (OOB excluded, ~2x req documented).
@@ -575,6 +650,21 @@ impl Engine {
             .await;
         }
 
+        // Option B second-order actif borné (lab only, même-origine) :
+        // APRÈS `run_confirm_second_pass`, AVANT `run_fingerprint`.
+        // OFF par défaut = 0 requête extra (chemin byte-identique).
+        if self.config.second_order.enabled {
+            self.run_second_order(
+                &target,
+                target_str,
+                &to_test_for_second_order,
+                &marker_set,
+                &raw_request,
+                &baseline,
+            )
+            .await?;
+        }
+
         // `--explain <param>`: one-line reasoning verdict after the run.
         if let Some(wanted) = self.config.explain.clone() {
             let st = self.state.read().await;
@@ -591,6 +681,8 @@ impl Engine {
             state=?current,
             "phase fingerprint"
         );
+        let fingerprint_started = Instant::now();
+        let fingerprint_req_before = self.state.read().await.request_count();
         self.run_fingerprint(
             &target,
             target_str,
@@ -601,6 +693,24 @@ impl Engine {
             effective_opts,
         )
         .await;
+        {
+            let fingerprint_elapsed = fingerprint_started.elapsed().as_secs_f64();
+            let fingerprint_req_delta = self
+                .state
+                .read()
+                .await
+                .request_count()
+                .saturating_sub(fingerprint_req_before);
+            if fingerprint_req_delta == 0 {
+                info!("fingerprint skipped (no confirmed findings, 0 req)");
+            } else {
+                info!(
+                    elapsed_s = fingerprint_elapsed,
+                    requests = fingerprint_req_delta,
+                    "fingerprint done in {fingerprint_elapsed:.1}s ({fingerprint_req_delta} req)"
+                );
+            }
+        }
 
         if self.config.enumeration.extract {
             // Gate early (same rule as enumeration): no finding => no oracle.
@@ -689,14 +799,57 @@ impl Engine {
         self.absorb_detectability().await;
         let requests = self.state.read().await.request_count();
         let detectability = self.state.read().await.detectability();
-        info!(
-            target=%self.scrubber.scrub(target_str),
-            state=?current,
-            requests,
-            count_403 = detectability.count_403,
-            count_429 = detectability.count_429,
-            "engine done"
-        );
+        let findings_snapshot = self.state.read().await.findings().to_vec();
+        let total_elapsed = run_started.elapsed().as_secs_f64();
+        // Findings per technique for the one-line summary (e.g. `boolean×1,
+        // error×1`). Sorted for deterministic output.
+        let mut by_technique: HashMap<String, usize> = HashMap::new();
+        for finding in &findings_snapshot {
+            *by_technique
+                .entry(finding.technique.to_string())
+                .or_insert(0) += 1;
+        }
+        let mut technique_parts: Vec<String> = by_technique
+            .iter()
+            .map(|(tech, count)| format!("{tech}×{count}"))
+            .collect();
+        technique_parts.sort();
+        let findings_detail = if technique_parts.is_empty() {
+            "no findings".to_owned()
+        } else {
+            format!(
+                "{} finding(s) ({})",
+                findings_snapshot.len(),
+                technique_parts.join(", ")
+            )
+        };
+        if findings_snapshot.is_empty() {
+            info!(
+                target=%self.scrubber.scrub(target_str),
+                state=?current,
+                requests,
+                findings = 0,
+                elapsed_s = total_elapsed,
+                count_403 = detectability.count_403,
+                count_429 = detectability.count_429,
+                "scan done: {findings_detail}, {requests} req in {total_elapsed:.1}s (403×{} 429×{})",
+                detectability.count_403,
+                detectability.count_429,
+            );
+        } else {
+            info!(
+                target=%self.scrubber.scrub(target_str),
+                state=?current,
+                requests,
+                findings = findings_snapshot.len(),
+                elapsed_s = total_elapsed,
+                count_403 = detectability.count_403,
+                count_429 = detectability.count_429,
+                "scan done: {findings_detail}, {requests} req in {total_elapsed:.1}s (403×{} 429×{}) — try --explain <param> for reasoning",
+                detectability.count_403,
+                detectability.count_429,
+            );
+        }
         Ok(current)
     }
 
@@ -862,8 +1015,11 @@ impl Engine {
         target: &TargetUrl,
         raw_request: Option<&RawRequest>,
     ) -> crate::error::Result<Option<(baseline::Baseline, Vec<Tamper>, ProbeOpts)>> {
-        // Baseline: 3-5 requests (hidden when stderr is not a TTY: MCP/CI).
+        // Baseline: 3 requests (hidden when stderr is not a TTY: MCP/CI).
+        // `indicatif` draws to stderr only, so stdout JSON-RPC stays clean.
         let pb = spinner("collecting baseline…");
+        let phase_started = Instant::now();
+        let req_before = self.state.read().await.request_count();
 
         let mut samples = Vec::new();
         // Retry samples on body-read failure instead of pushing `Vec::new()`:
@@ -922,7 +1078,9 @@ impl Engine {
             }
         }
         if samples.is_empty() {
-            pb.finish_with_message("baseline failed");
+            // Clear the spinner line so the log stays clean (`ing` → `ed`
+            // is reported via the `warn!`/`Err` below, not a stale bar).
+            pb.finish_and_clear();
             if self.cancel.is_cancelled() {
                 return Ok(None);
             }
@@ -932,8 +1090,18 @@ impl Engine {
                 ),
             )));
         }
-        pb.finish_with_message("baseline done");
+        pb.finish_and_clear();
         let baseline = baseline::Baseline::new(&samples);
+        {
+            let req_done = self.state.read().await.request_count();
+            let req_delta = req_done.saturating_sub(req_before);
+            info!(
+                elapsed_s = phase_started.elapsed().as_secs_f64(),
+                requests = req_delta,
+                "baseline done in {:.1}s, {req_delta} req",
+                phase_started.elapsed().as_secs_f64(),
+            );
+        }
         // C6 trace: baseline samples as hashes only (never clear body/headers).
         // Guarantees a non-empty RAM-only trace even on clean targets.
         {
@@ -966,13 +1134,24 @@ impl Engine {
                 "possible WAF detected (repeated 403/406)"
             );
         }
-        if baseline.is_waf_suspected() {
+        // Blocking WAF = actionable warn; mere CDN presence (e.g. `cf-ray`
+        // on a normal 200, `blocking=false`) = informational `info!` so a
+        // `cloudflare` fingerprint doesn't read as an attack blocked.
+        if baseline.is_waf_blocking() {
             warn!(
                 target=%self.scrubber.scrub(target.as_str()),
                 vendor=%baseline.waf_vendor.as_deref().unwrap_or("unknown"),
                 hits=%baseline.waf_hits.join(","),
-                blocking=%baseline.is_waf_blocking(),
-                "WAF/CDN fingerprinted from baseline headers/body"
+                blocking=true,
+                "WAF blocking signals detected (challenge/deny/rate-limit)"
+            );
+        } else if baseline.is_waf_suspected() {
+            info!(
+                target=%self.scrubber.scrub(target.as_str()),
+                vendor=%baseline.waf_vendor.as_deref().unwrap_or("unknown"),
+                hits=%baseline.waf_hits.join(","),
+                blocking=false,
+                "CDN/WAF fingerprinted (informational, no block)"
             );
         }
         // Effective tampers: only an active WAF block auto-enables a bypass.
@@ -1004,6 +1183,13 @@ impl Engine {
 
     /// Builds the marker-synthetic + real parameter list to test, applying
     /// `-p` filtering (skipped when a recon `candidate_param` is already fixed).
+    ///
+    /// Emplacements exotiques (`User-Agent` / `Referer` / `X-Forwarded-For` /
+    /// `X-Real-IP`, souvent loggés en base sans sanitisation → second-order
+    /// via header) : ajoutés comme synthétiques à partir du `--level 2`
+    /// quand absents des params déjà collectés. L1 reste byte-identique
+    /// (aucune requête extra par défaut, même philosophie que sqlmap qui ne
+    /// teste UA/Referer qu'à haut niveau).
     fn select_params(
         &self,
         target_str: &str,
@@ -1041,6 +1227,17 @@ impl Engine {
         if let Some(raw) = raw_request {
             params.extend(crate::target::parameters::collect_from_raw_request(raw));
         }
+        // Exotic headers (L2+) : UA/Referer/XFF souvent oubliés, loggés en base.
+        if self.config.budget.level >= 2 && candidate_param.is_none() {
+            let exotic = crate::target::parameters::synthetic_exotic_headers(&params);
+            if !exotic.is_empty() {
+                info!(
+                    count = exotic.len(),
+                    "exotic header params added (level>=2: User-Agent/Referer/X-Forwarded-For)"
+                );
+                params.extend(exotic);
+            }
+        }
         let mut to_test: Vec<TargetParameter> = if let Some(param) = candidate_param.cloned() {
             vec![param]
         } else if params.is_empty() {
@@ -1065,7 +1262,7 @@ impl Engine {
         (marker_set, to_test)
     }
 
-    /// Runs boolean/error/time/union/stacked/json/oob detection for every
+    /// Runs boolean/error/time/union/stacked/json/nosql/oob detection for every
     /// candidate parameter with bounded concurrency (respects `--threads`).
     /// Minimal C3 loop: one [`Hypothesis`] per (param, technique) seeded by
     /// `compute_calibrated_prior(context, dbms_belief)`; each
@@ -1132,7 +1329,11 @@ impl Engine {
             .buffer_unordered(concurrency);
 
         stream.collect::<Vec<()>>().await;
-        pb2.finish_with_message("detection done");
+        // Clear the bar so the `detection done in …` summary logged by the
+        // caller stays on a clean line (no `████ 1/1 …` glued to logs).
+        // Single global bar (X/Y over blind spinner); hidden when stderr
+        // is not a TTY (MCP/CI), where it would only spam + burn CPU.
+        pb2.finish_and_clear();
     }
 
     /// C6 `--confirm` strict second-pass (real, not a `warn!`).
@@ -1271,6 +1472,353 @@ impl Engine {
         }
         info!("--confirm second-pass done");
     }
+
+    /// Option B second-order actif borné (lab only, même-origine).
+    ///
+    /// Stocke un marqueur bénin jetable (`u+8hex`, payload `'<marker>'`
+    /// style union — jamais de RCE, jamais de stacked exec) sur
+    /// ≤`max_stores` params Body/Query/Header, puis revisite `revisit_url`
+    /// (1 store + max 2 GET séquentiels par param, `RequestClass::Default`).
+    /// Les headers exotiques (`User-Agent`/`X-Forwarded-For`/`Referer`,
+    /// souvent loggés en base) suivent le même chemin que Body/Query.
+    /// `TechniqueKind::Union` réutilisé (pas de nouveau kind → reporting
+    /// inchangé) ; `push_stored()` systématique même sans confirmation
+    /// (audit passif) ; trace = hashes seuls (`hash_str_hex`), jamais de
+    /// marqueur en clair dans les logs.
+    ///
+    /// Gates anti-FP : même-origine stricte (schéma/host/port), abort si le
+    /// body baseline contient déjà le marqueur, finding seulement si 2/2
+    /// revisits en 200 non-ignoré reflètent le marqueur (confidence 0.85,
+    /// FP 0.15, evidence `second-order stored marker reflected
+    /// confirm=second-pass`).
+    ///
+    /// # Errors
+    /// Retourne `InjektError::Other` si `--second-order-revisit-url` est
+    /// absent/vide, si le revisit n'est pas même-origine que la cible, ou si
+    /// sa résolution DNS-time échoue (même garde que `run_internal`).
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn run_second_order(
+        &self,
+        target: &TargetUrl,
+        target_str: &str,
+        to_test: &[TargetParameter],
+        marker_set: &MarkerSet,
+        raw_request: &Arc<Option<RawRequest>>,
+        baseline: &baseline::Baseline,
+    ) -> crate::error::Result<()> {
+        if !self.config.second_order.enabled {
+            return Ok(());
+        }
+        let revisit_raw = self
+            .config
+            .second_order
+            .revisit_url
+            .clone()
+            .unwrap_or_default();
+        let revisit_raw = revisit_raw.trim().to_owned();
+        if revisit_raw.is_empty() {
+            return Err(crate::error::InjektError::Other(Box::new(
+                std::io::Error::other(
+                    "--second-order requires --second-order-revisit-url (same-origin path, e.g. /admin)",
+                ),
+            )));
+        }
+        // Résolution contre le host cible : chemin (`/admin`) → absolu
+        // même-origine ; URL absolue → vérifiée même-origine ci-dessous.
+        let revisit_absolute = if revisit_raw.contains("://") {
+            revisit_raw.clone()
+        } else {
+            let path = if revisit_raw.starts_with('/') {
+                revisit_raw.clone()
+            } else {
+                format!("/{revisit_raw}")
+            };
+            let Some(host) = target.inner().host_str() else {
+                return Err(crate::error::InjektError::Other(Box::new(
+                    std::io::Error::other("second-order: target has no host"),
+                )));
+            };
+            let port_part = target
+                .inner()
+                .port()
+                .map_or_else(String::new, |p| format!(":{p}"));
+            format!("{}://{host}{port_part}{path}", target.inner().scheme())
+        };
+        // Même-origine stricte : schéma + host (insensible à la casse) +
+        // port effectif identiques, sinon erreur (pas de SSRF inter-host).
+        let revisit_target = TargetUrl::parse(&revisit_absolute, self.config.net.allow_private)
+            .map_err(|e| {
+                crate::error::InjektError::Other(Box::new(std::io::Error::other(format!(
+                    "second-order revisit parse failed: {e}"
+                ))))
+            })?;
+        let same_scheme = revisit_target.inner().scheme() == target.inner().scheme();
+        let same_host = revisit_target
+            .inner()
+            .host_str()
+            .zip(target.inner().host_str())
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
+        let same_port = revisit_target.inner().port_or_known_default()
+            == target.inner().port_or_known_default();
+        if !(same_scheme && same_host && same_port) {
+            return Err(crate::error::InjektError::Other(Box::new(
+                std::io::Error::other(
+                    "second-order revisit must be same-origin as target (scheme/host/port)",
+                ),
+            )));
+        }
+        // Même garde DNS-time que `run_internal` : sauf `remote_dns`
+        // (`socks5h://`, le proxy résout à distance), on résout localement.
+        if !self.config.net.allow_private
+            && !self.config.net.remote_dns
+            && let Some(host) = revisit_target.inner().host_str()
+        {
+            TargetUrl::resolve_and_check(host, false)
+                .await
+                .map_err(|e| crate::error::InjektError::Other(Box::new(e)))?;
+        }
+        // WAF bloquant : 0 requête extra (même règle que la détection).
+        if baseline.is_waf_blocking() {
+            warn!(
+                target=%self.scrubber.scrub(target_str),
+                "second-order skipped (WAF blocking baseline)"
+            );
+            return Ok(());
+        }
+        let max_stores = self.config.second_order.max_stores.clamp(1, 32);
+        // Body/Query + Header (UA/XFF/Referer souvent loggés en base sans
+        // sanitisation → second-order via header). `Cookie` exclu : le jar
+        // persistant rejouerait le marqueur sur les revisits et fausserait
+        // le 2/2 (auto-réflexion, pas stockage serveur).
+        let candidates: Vec<TargetParameter> = to_test
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.location,
+                    ParameterLocation::Query
+                        | ParameterLocation::Body
+                        | ParameterLocation::Header(_)
+                )
+            })
+            .take(max_stores)
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            debug!("second-order: no Body/Query/Header params to store, 0 extra requests");
+            return Ok(());
+        }
+        info!(
+            count = candidates.len(),
+            revisit = %self.scrubber.scrub(&revisit_absolute),
+            "second-order active start (lab only, same-origin, benign marker)"
+        );
+        let baseline_body = baseline.representative_body_str();
+        let ignore_codes = self.config.net.ignore_codes.clone();
+        let store_url_hash = crate::reasoning::trace::hash_str_hex(target.as_str());
+        let revisit_hash = crate::reasoning::trace::hash_str_hex(&revisit_absolute);
+        for param in &candidates {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+            if baseline.is_waf_blocking() {
+                break;
+            }
+            // Marqueur bénin jetable `u+8hex` (même format que les payloads
+            // union existants) ; jamais loggé en clair, hashes seuls en trace.
+            let hex8: String = uuid::Uuid::new_v4()
+                .simple()
+                .to_string()
+                .chars()
+                .take(8)
+                .collect();
+            let marker_clear = format!("u{hex8}");
+            // Gate anti-FP : marqueur déjà présent au baseline → on saute ce
+            // param (écho naturel, pas une réflexion stockée).
+            if baseline_body.contains(&marker_clear) {
+                continue;
+            }
+            // Audit passif systématique, même si la confirmation échoue.
+            {
+                let mut st = self.state.write().await;
+                st.push_stored(crate::session::state::StoredProbe::new(
+                    param.key(),
+                    secrecy::SecretString::from(marker_clear.clone()),
+                    store_url_hash.clone(),
+                ));
+            }
+            // Store : payload bénin `'<marker>'` style union (pas de RCE,
+            // pas de stacked exec), chemin d'injection existant.
+            let payload = format!("'{marker_clear}'");
+            let store_spec = build_injection_spec_with_raw(
+                target,
+                target_str,
+                param,
+                &payload,
+                marker_set,
+                raw_request.as_ref().as_ref(),
+                ProbeOpts::new(false, false),
+                &self.config.evasion.payload_opts,
+            );
+            let start = Instant::now();
+            let store_resp = self
+                .client
+                .send_with_retry_for_class(store_spec, RequestClass::Default, &self.cancel)
+                .await;
+            let store_ms = start.elapsed().as_secs_f64() * 1000.0;
+            self.state.write().await.increment_requests();
+            let store_ok = match store_resp {
+                Ok(r) => {
+                    match self
+                        .client
+                        .read_body_string_for_class(r, RequestClass::Default)
+                        .await
+                    {
+                        Ok(body) => {
+                            let mut st = self.state.write().await;
+                            let seq = st.next_trace_seq();
+                            st.push_trace(crate::reasoning::ProbeRecord::new(
+                                seq,
+                                param.key(),
+                                "union",
+                                "second-order:store",
+                                self.config.seed,
+                                crate::reasoning::trace::hash_str_hex(&payload),
+                                crate::reasoning::trace::hash_str_hex(&body),
+                                0.0,
+                                store_ms,
+                            ));
+                            true
+                        }
+                        Err(e) => {
+                            warn!(error=%e, "second-order store body read failed");
+                            let mut st = self.state.write().await;
+                            let seq = st.next_trace_seq();
+                            st.push_trace(crate::reasoning::ProbeRecord::new(
+                                seq,
+                                param.key(),
+                                "union",
+                                "second-order:store",
+                                self.config.seed,
+                                crate::reasoning::trace::hash_str_hex(&payload),
+                                crate::reasoning::trace::hash_str_hex(""),
+                                0.0,
+                                store_ms,
+                            ));
+                            false
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error=%e, "second-order store request failed");
+                    let mut st = self.state.write().await;
+                    let seq = st.next_trace_seq();
+                    st.push_trace(crate::reasoning::ProbeRecord::new(
+                        seq,
+                        param.key(),
+                        "union",
+                        "second-order:store",
+                        self.config.seed,
+                        crate::reasoning::trace::hash_str_hex(&payload),
+                        crate::reasoning::trace::hash_str_hex(""),
+                        0.0,
+                        store_ms,
+                    ));
+                    false
+                }
+            };
+            if !store_ok {
+                continue;
+            }
+            // Revisits : max 2 GET séquentiels, `RequestClass::Default`.
+            // Exige 2/2 hits (status 200 + non-ignoré + reflet marqueur).
+            let mut hits = 0usize;
+            for _ in 0..2 {
+                if self.cancel.is_cancelled() {
+                    break;
+                }
+                if baseline.is_waf_blocking() {
+                    break;
+                }
+                let start = Instant::now();
+                let resp = self
+                    .client
+                    .send_with_retry_for_class(
+                        RequestSpec::get(revisit_absolute.clone()),
+                        RequestClass::Default,
+                        &self.cancel,
+                    )
+                    .await;
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                self.state.write().await.increment_requests();
+                match resp {
+                    Ok(r) => {
+                        let status = r.status().as_u16();
+                        match self
+                            .client
+                            .read_body_string_for_class(r, RequestClass::Default)
+                            .await
+                        {
+                            Ok(body) => {
+                                let hit = status == 200
+                                    && !is_ignored(status, &ignore_codes)
+                                    && body.contains(&marker_clear);
+                                if hit {
+                                    hits += 1;
+                                }
+                                let mut st = self.state.write().await;
+                                let seq = st.next_trace_seq();
+                                st.push_trace(crate::reasoning::ProbeRecord::new(
+                                    seq,
+                                    param.key(),
+                                    "union",
+                                    "second-order:revisit",
+                                    self.config.seed,
+                                    crate::reasoning::trace::hash_str_hex(&revisit_absolute),
+                                    crate::reasoning::trace::hash_str_hex(&body),
+                                    f64::from(u8::from(hit)),
+                                    ms,
+                                ));
+                            }
+                            Err(e) => {
+                                warn!(error=%e, "second-order revisit body read failed");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error=%e, "second-order revisit request failed");
+                    }
+                }
+            }
+            if hits >= 2 {
+                let evidence = format!(
+                    "second-order: second-order stored marker reflected confirm=second-pass param={} revisit_hash={revisit_hash} store_hash={store_url_hash}",
+                    param.key(),
+                );
+                let finding = Finding::new(
+                    target.as_str(),
+                    param.key(),
+                    TechniqueKind::Union,
+                    0.85,
+                    evidence,
+                )
+                .with_false_positive_prob(0.15)
+                .with_waf(baseline.waf_vendor.clone(), baseline.is_waf_blocking());
+                self.state.write().await.push_finding(finding);
+                info!(
+                    param=%self.scrubber.scrub(&param.key()),
+                    "second-order stored marker reflected (2/2 revisits)"
+                );
+            } else {
+                debug!(
+                    param=%self.scrubber.scrub(&param.key()),
+                    hits,
+                    "second-order revisit miss"
+                );
+            }
+        }
+        info!("second-order active done");
+        Ok(())
+    }
 }
 
 /// Shared immutable detection inputs cloned once per `run_detection`.
@@ -1297,6 +1845,7 @@ const fn technique_config_name(kind: TechniqueKind) -> &'static str {
         TechniqueKind::Union => "union",
         TechniqueKind::Stacked => "stacked",
         TechniqueKind::Json => "json",
+        TechniqueKind::Nosql => "nosql",
         TechniqueKind::Oob => "oob",
     }
 }
@@ -1321,14 +1870,15 @@ fn mutation_plan_label(tampers: &[Tamper]) -> String {
 }
 
 /// Context-aware creation order (simple `if`s): JSON context seeds `json`
-/// first, ORDER BY context seeds `union` early. This only shapes priors via
-/// `compute_calibrated_prior` (EVI input); execution order is decided by the
-/// scheduler score afterwards, never by this fixed order.
-fn detection_order(context: &InjectionContext) -> [TechniqueKind; 7] {
+/// then `nosql` first, ORDER BY context seeds `union` early. This only shapes
+/// priors via `compute_calibrated_prior` (EVI input); execution order is
+/// decided by the scheduler score afterwards, never by this fixed order.
+fn detection_order(context: &InjectionContext) -> [TechniqueKind; 8] {
     use TechniqueKind as K;
     if context.json {
         [
             K::Json,
+            K::Nosql,
             K::Boolean,
             K::Error,
             K::Time,
@@ -1344,6 +1894,7 @@ fn detection_order(context: &InjectionContext) -> [TechniqueKind; 7] {
             K::Time,
             K::Stacked,
             K::Json,
+            K::Nosql,
             K::Oob,
         ]
     } else {
@@ -1354,6 +1905,7 @@ fn detection_order(context: &InjectionContext) -> [TechniqueKind; 7] {
             K::Union,
             K::Stacked,
             K::Json,
+            K::Nosql,
             K::Oob,
         ]
     }
@@ -1873,7 +2425,7 @@ async fn dispatch_probe_first_half(
     }
 }
 
-/// Second half of the technique dispatch (stacked/json/oob).
+/// Second half of the technique dispatch (stacked/json/nosql/oob).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn dispatch_probe_second_half(
     client: &HttpClient,
@@ -1931,6 +2483,28 @@ async fn dispatch_probe_second_half(
                 config.seed,
                 &shared.context,
                 &shared.dbms_belief,
+            )
+            .await;
+        }
+        TechniqueKind::Nosql => {
+            test_nosql_bounded(
+                client,
+                state,
+                cancel,
+                &shared.target,
+                &shared.target_str,
+                param,
+                &shared.baseline,
+                &shared.marker_set,
+                raw,
+                &shared.tampers,
+                opts,
+                &config.evasion.payload_opts,
+                &config.matcher,
+                config.budget.level,
+                &config.net.ignore_codes,
+                config.seed,
+                &shared.context,
             )
             .await;
         }
@@ -2025,7 +2599,7 @@ fn infer_signal_and_trials(
         TechniqueKind::Boolean | TechniqueKind::Error => (0.9, 1),
         TechniqueKind::Time | TechniqueKind::Stacked => (0.8, 1),
         TechniqueKind::Union => (0.85, 1),
-        TechniqueKind::Json => {
+        TechniqueKind::Json | TechniqueKind::Nosql => {
             let boolean_channel = new_findings
                 .iter()
                 .any(|f| f.evidence.contains("channel=boolean"));
@@ -3995,7 +4569,7 @@ fn parse_union_columns(evidence: &str) -> Option<usize> {
 
 /// C5-tardif base payload for mutation: one raw base string per technique.
 ///
-/// - `boolean`/`json` : le côté `TRUE` de la première paire (la mutation
+/// - `boolean`/`json`/`nosql` : le côté `TRUE` de la première paire (la mutation
 ///   vérifie que `TRUE` reste `≈baseline`, 1 requête par variante).
 /// - `error`/`time`/`union`/`stacked` : le premier core DBMS-aware.
 /// - `oob` : `None` (jamais muté).
@@ -4008,6 +4582,9 @@ fn mutation_base_payload(finding: &Finding) -> Option<String> {
             .first()
             .map(|p| p.true_payload.clone()),
         TechniqueKind::Json => crate::techniques::json::payloads::json_payloads_for(label)
+            .first()
+            .map(|p| p.true_payload.clone()),
+        TechniqueKind::Nosql => crate::techniques::nosql::payloads::nosql_payloads()
             .first()
             .map(|p| p.true_payload.clone()),
         TechniqueKind::Error => crate::techniques::error::payloads::error_payloads_for(label)
@@ -4133,11 +4710,13 @@ async fn mutate_and_trace(
         .cloned()
         .collect();
     let tampers_for_variant: &[Tamper] = match finding.technique {
-        TechniqueKind::Boolean | TechniqueKind::Json => &boolean_safe,
+        TechniqueKind::Boolean | TechniqueKind::Json | TechniqueKind::Nosql => &boolean_safe,
         _ => effective_tampers,
     };
     let class = match finding.technique {
-        TechniqueKind::Boolean | TechniqueKind::Json => RequestClass::Boolean,
+        TechniqueKind::Boolean | TechniqueKind::Json | TechniqueKind::Nosql => {
+            RequestClass::Boolean
+        }
         TechniqueKind::Time => RequestClass::Time,
         _ => RequestClass::Default,
     };
@@ -4221,7 +4800,7 @@ fn mutation_diff_signal(
     _status: u16,
 ) -> f64 {
     match finding.technique {
-        TechniqueKind::Boolean | TechniqueKind::Json => {
+        TechniqueKind::Boolean | TechniqueKind::Json | TechniqueKind::Nosql => {
             crate::detection::response_diff::adaptive_similarity(baseline_body, body)
                 .clamp(0.0, 1.0)
         }
@@ -4301,7 +4880,7 @@ async fn confirm_finding_second_pass(
     level: u8,
 ) -> bool {
     match finding.technique {
-        TechniqueKind::Boolean | TechniqueKind::Json => {
+        TechniqueKind::Boolean | TechniqueKind::Json | TechniqueKind::Nosql => {
             confirm_boolean_second_pass(
                 client,
                 state,
@@ -4455,9 +5034,17 @@ async fn confirm_boolean_second_pass(
     let mut rng = crate::seeded_rng::make_rng(seed);
     let label = dbms_label_from_finding(finding);
     // Candidate TRUE/FALSE bases in first-pass order (quote-aware for
-    // boolean; JSON keeps catalogue order — no quote-ordering helper there).
+    // boolean; JSON/NoSQL keep catalogue order — no quote-ordering there).
     let candidates: Vec<(String, String)> = if finding.technique == TechniqueKind::Json {
         let payloads = crate::techniques::json::payloads::json_payloads_for(label);
+        let take = payload_budget(level, 2, payloads.len()).clamp(1, 3);
+        payloads
+            .iter()
+            .take(take)
+            .map(|p| (p.true_payload.clone(), p.false_payload.clone()))
+            .collect()
+    } else if finding.technique == TechniqueKind::Nosql {
+        let payloads = crate::techniques::nosql::payloads::nosql_payloads();
         let take = payload_budget(level, 2, payloads.len()).clamp(1, 3);
         payloads
             .iter()
@@ -4530,6 +5117,15 @@ async fn confirm_boolean_second_pass(
         let false_body = matcher.pre_process(&false_raw);
         let res = if finding.technique == TechniqueKind::Json {
             crate::techniques::json::detector::JsonDetector::new().evaluate_boolean(
+                &baseline_body,
+                &true_body,
+                &false_body,
+                baseline.mean_ms,
+                true_ms,
+                false_ms,
+            )
+        } else if finding.technique == TechniqueKind::Nosql {
+            crate::techniques::nosql::detector::NosqlDetector::new().evaluate_boolean(
                 &baseline_body,
                 &true_body,
                 &false_body,
@@ -5408,7 +6004,12 @@ async fn enumerate_columns_via_order_by(
             return Some(inferred);
         }
     }
-    info!("ORDER BY enumeration found no error up to {max_order_by_cols} — undetermined");
+    // Undetermined is actionable (yellow warn, not a drowned `info!`): the
+    // operator can widen the enumeration with `--level 2` (15 cols) or
+    // `--level 3` (20 cols) instead of assuming "not injectable".
+    warn!(
+        "ORDER BY enumeration inconclusive: no error up to {max_order_by_cols} columns — try --level 2 (15 cols) or --level 3 (20 cols)"
+    );
     None
 }
 
@@ -6007,6 +6608,434 @@ async fn test_json_bounded(
         }
         if found {
             break;
+        }
+    }
+}
+
+/// `NoSQL` (MongoDB) operator injection: boolean differential over `$gt`/`$ne`/
+/// `$regex` operator pairs (3-trial confirmation) plus a single-shot error
+/// probe (`$where` JS invalide / opérateur inconnu → messages MongoDB).
+///
+/// Deux chemins d'injection :
+/// - bodies JSON (`param` Body + corps JSON) : la feuille
+///   `{"user":"admin"}` devient un **objet** `{"user":{"$gt":""}}` via
+///   `inject_json_operator` (bypass `{"user": {"$gt": ""}}` sans identifiants).
+///   Les tampers chaîne ne s'appliquent pas ici (un opérateur doit rester du
+///   JSON valide) ;
+/// - Query / Form / Header / Cookie : les mêmes opérateurs sont envoyés comme
+///   **chaînes** (`{"$gt": ""}` en valeur de param) via le chemin générique
+///   (tampers boolean-safe + `--prefix`/`--suffix` honorés).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::similar_names)]
+#[allow(clippy::too_many_lines)]
+async fn test_nosql_bounded(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    baseline: &baseline::Baseline,
+    marker_set: &MarkerSet,
+    raw: Option<&RawRequest>,
+    tampers: &[Tamper],
+    opts: ProbeOpts,
+    popts: &PayloadOpts,
+    matcher: &crate::detection::matcher::MatcherConfig,
+    level: u8,
+    ignore_codes: &[u16],
+    seed: Option<u64>,
+    context: &InjectionContext,
+) {
+    if context.json {
+        debug!(
+            param = param.key(),
+            "nosql: json context, nosql priors boosted"
+        );
+    }
+    debug!(
+        param = param.key(),
+        context = context.summary(),
+        "nosql: context-aware detection"
+    );
+    let mut rng = crate::seeded_rng::make_rng(seed);
+    let detector = NosqlDetector::new();
+    let payloads = nosql_payloads();
+    let baseline_body = matcher.pre_process(&baseline.representative_body_str());
+    let tamper_sets = boolean_safe_transformation_sets(tampers);
+    // Chemin opérateur JSON ? Body + corps JSON + feuille scalaire.
+    let json_operator_path: Option<String> = match &param.location {
+        ParameterLocation::Body => {
+            let body_opt = raw.and_then(|r| r.body.as_deref());
+            let ct = raw.and_then(|r| r.content_type());
+            body_opt
+                .filter(|body| {
+                    crate::target::structured::sniff_kind(ct, body)
+                        == crate::target::structured::StructuredKind::Json
+                })
+                .map(str::to_owned)
+        }
+        _ => None,
+    };
+    for p in payloads
+        .iter()
+        .take(payload_budget(level, 2, payloads.len()))
+    {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let mut found = false;
+        // Tampers chaîne uniquement pour le chemin non-JSON ; le chemin
+        // opérateur envoie du JSON valide tel quel (1 seul set `none`).
+        let tamper_rounds: usize = if json_operator_path.is_some() {
+            1
+        } else {
+            tamper_sets.len().max(1)
+        };
+        for round in 0..tamper_rounds {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let trans: &[Tamper] = if json_operator_path.is_some() {
+                &[]
+            } else {
+                tamper_sets.get(round).map_or(&[], Vec::as_slice)
+            };
+            let tamper_label = if trans.is_empty() {
+                "none".to_owned()
+            } else {
+                trans
+                    .iter()
+                    .map(super::super::techniques::tamper::Tamper::name)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            // Channel 1 — boolean differential with confirmation (3 trials)
+            let mut trials: Vec<crate::detection::confirmation::Trial> = Vec::with_capacity(3);
+            let mut last_res: Option<crate::techniques::boolean::detector::BooleanResult> = None;
+            let mut last_true = String::new();
+            let mut last_false = String::new();
+            let mut last_t_status: u16 = 0;
+            #[allow(clippy::similar_names)]
+            let mut last_f_status: u16 = 0;
+            for _ in 0..3 {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let (true_raw, true_ms, true_status) = fetch_nosql_boolean(
+                    client,
+                    state,
+                    cancel,
+                    target,
+                    target_str,
+                    param,
+                    raw,
+                    json_operator_path.as_deref(),
+                    &p.true_operator,
+                    &p.true_payload,
+                    trans,
+                    marker_set,
+                    opts,
+                    popts,
+                    &mut rng,
+                )
+                .await;
+                let true_body = matcher.pre_process(&true_raw);
+                let (false_raw, false_ms, false_status) = fetch_nosql_boolean(
+                    client,
+                    state,
+                    cancel,
+                    target,
+                    target_str,
+                    param,
+                    raw,
+                    json_operator_path.as_deref(),
+                    &p.false_operator,
+                    &p.false_payload,
+                    trans,
+                    marker_set,
+                    opts,
+                    popts,
+                    &mut rng,
+                )
+                .await;
+                let false_body = matcher.pre_process(&false_raw);
+                if is_ignored(true_status, ignore_codes) || is_ignored(false_status, ignore_codes) {
+                    trials.push(crate::detection::confirmation::Trial {
+                        true_conf: 0.0,
+                        false_conf: 1.0,
+                    });
+                    last_true = true_body;
+                    last_false = false_body;
+                    last_t_status = true_status;
+                    last_f_status = false_status;
+                    continue;
+                }
+                let res = detector.evaluate_boolean(
+                    &baseline_body,
+                    &true_body,
+                    &false_body,
+                    baseline.mean_ms,
+                    true_ms,
+                    false_ms,
+                );
+                trials.push(crate::detection::confirmation::Trial {
+                    true_conf: res.true_similarity,
+                    false_conf: res.false_similarity,
+                });
+                last_res = Some(res);
+                last_true = true_body;
+                last_false = false_body;
+                last_t_status = true_status;
+                last_f_status = false_status;
+            }
+            let (conf, inverted) = crate::detection::confirmation::confirm_either(&trials);
+            if conf.confirmed {
+                if matcher.gate_boolean(&last_true, &last_false, last_t_status, last_f_status)
+                    == Some(false)
+                {
+                    continue;
+                }
+                let res = last_res.unwrap_or_else(|| {
+                    detector.evaluate_boolean(&baseline_body, "", "", baseline.mean_ms, 0.0, 0.0)
+                });
+                let mut finding = Finding::new(
+                    target.as_str(),
+                    param.key(),
+                    TechniqueKind::Nosql,
+                    conf.score,
+                    format!(
+                        "nosql channel=boolean vector={} dbms=mongodb true_sim={:.2} false_sim={:.2} trials={}/3 fp={:.2} tamper={}{}{}{}{}",
+                        p.vector,
+                        res.true_similarity,
+                        res.false_similarity,
+                        conf.trials,
+                        conf.false_positive_prob,
+                        tamper_label,
+                        opts.evidence_suffix(),
+                        popts.evidence_suffix(),
+                        matcher.evidence_suffix(),
+                        if inverted { " inverted" } else { "" }
+                    ),
+                )
+                .with_false_positive_prob(conf.false_positive_prob)
+                .with_waf(baseline.waf_vendor.clone(), baseline.is_waf_blocking());
+                finding.dbms = Some("mongodb".to_owned());
+                state.write().await.push_finding(finding);
+                found = true;
+                break;
+            }
+            // Channel 2 — single-shot NoSQL error probe
+            let (raw_body, _ms, status) = fetch_nosql_error(
+                client,
+                state,
+                cancel,
+                target,
+                target_str,
+                param,
+                raw,
+                json_operator_path.as_deref(),
+                &p.error_payload,
+                trans,
+                marker_set,
+                opts,
+                popts,
+                &mut rng,
+            )
+            .await;
+            let body = matcher.pre_process(&raw_body);
+            if is_ignored(status, ignore_codes) {
+                continue;
+            }
+            let r = detector.evaluate_error(&body);
+            if r.is_vulnerable {
+                if matcher.matches(&body, status) == Some(false) {
+                    continue;
+                }
+                let mut finding = Finding::new(
+                    target.as_str(),
+                    param.key(),
+                    TechniqueKind::Nosql,
+                    r.confidence,
+                    format!(
+                        "nosql channel=error vector={} pattern={:?} tamper={}{}{}{}",
+                        p.vector,
+                        r.matched_pattern,
+                        tamper_label,
+                        opts.evidence_suffix(),
+                        popts.evidence_suffix(),
+                        matcher.evidence_suffix()
+                    ),
+                );
+                finding.dbms = Some("mongodb".to_owned());
+                state.write().await.push_finding(finding);
+                found = true;
+                break;
+            }
+        }
+        if found {
+            break;
+        }
+    }
+}
+
+/// Fetch du bras TRUE/FALSE `NoSQL` : objet opérateur sur bodies JSON,
+/// chaîne tamperisée ailleurs. Retourne `(body, ms, status)` comme
+/// `fetch_for_payload_with_class` (classe `Boolean`, statut 0 = transport).
+#[allow(clippy::too_many_arguments)]
+async fn fetch_nosql_boolean(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    raw: Option<&RawRequest>,
+    json_body: Option<&str>,
+    operator: &serde_json::Value,
+    string_payload: &str,
+    trans: &[Tamper],
+    marker_set: &MarkerSet,
+    opts: ProbeOpts,
+    popts: &PayloadOpts,
+    rng: &mut rand::rngs::StdRng,
+) -> (String, f64, u16) {
+    if let Some(original) = json_body
+        && let Some(injected) =
+            crate::target::structured::inject_json_operator(original, &param.name, operator)
+    {
+        let spec = nosql_json_body_spec(target, raw, &injected);
+        return fetch_spec_boolean(client, state, cancel, spec).await;
+    }
+    let final_payload = build_final_payload_with_rng(string_payload, trans, popts, rng);
+    fetch_for_payload_with_class(
+        client,
+        state,
+        cancel,
+        target,
+        target_str,
+        param,
+        &final_payload,
+        marker_set,
+        raw,
+        opts,
+        popts,
+        RequestClass::Boolean,
+    )
+    .await
+}
+
+/// Fetch de la sonde d'erreur `NoSQL` : objet `$where`/opérateur inconnu sur
+/// bodies JSON (parsé depuis le littéral, repli chaîne), chaîne ailleurs.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_nosql_error(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    raw: Option<&RawRequest>,
+    json_body: Option<&str>,
+    error_payload: &str,
+    trans: &[Tamper],
+    marker_set: &MarkerSet,
+    opts: ProbeOpts,
+    popts: &PayloadOpts,
+    rng: &mut rand::rngs::StdRng,
+) -> (String, f64, u16) {
+    if let Some(original) = json_body
+        && let Ok(op) = serde_json::from_str::<serde_json::Value>(error_payload)
+        && op.is_object()
+        && let Some(injected) =
+            crate::target::structured::inject_json_operator(original, &param.name, &op)
+    {
+        let spec = nosql_json_body_spec(target, raw, &injected);
+        return fetch_spec_boolean(client, state, cancel, spec).await;
+    }
+    let final_payload = build_final_payload_with_rng(error_payload, trans, popts, rng);
+    fetch_for_payload(
+        client,
+        state,
+        cancel,
+        target,
+        target_str,
+        param,
+        &final_payload,
+        marker_set,
+        raw,
+        opts,
+        popts,
+    )
+    .await
+}
+
+/// `RequestSpec` POST JSON pour un body opérateur déjà injecté (headers
+/// préservés, `content-length` recalculé par la stack HTTP).
+fn nosql_json_body_spec(
+    target: &TargetUrl,
+    raw: Option<&RawRequest>,
+    injected_body: &str,
+) -> RequestSpec {
+    use http::Method;
+    let method = raw
+        .and_then(|r| Method::from_bytes(r.method.as_bytes()).ok())
+        .unwrap_or(Method::POST);
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    if let Some(r) = raw {
+        for (k, v) in &r.headers {
+            if k.eq_ignore_ascii_case("content-type") || k.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            if let (Ok(name), Ok(val)) = (
+                http::HeaderName::from_bytes(k.as_bytes()),
+                http::HeaderValue::from_str(v),
+            ) {
+                headers.insert(name, val);
+            }
+        }
+    }
+    RequestSpec::new(method, target.as_str().to_owned())
+        .with_headers(headers)
+        .with_body(injected_body.as_bytes().to_vec())
+}
+
+/// Envoi basse-niveau d'un `RequestSpec` `NoSQL` sous timeout booléen
+/// (`RequestClass::Boolean`), compté et borné comme les autres sondes.
+/// Transport/body-read en échec → `(String::new(), ms, 0)` (jamais scoré).
+async fn fetch_spec_boolean(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    spec: RequestSpec,
+) -> (String, f64, u16) {
+    let start = Instant::now();
+    let resp = client
+        .send_with_retry_for_class(spec, RequestClass::Boolean, cancel)
+        .await;
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    state.write().await.increment_requests();
+    match resp {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            match client
+                .read_body_string_for_class(r, RequestClass::Boolean)
+                .await
+            {
+                Ok(body) => (body, elapsed, status),
+                Err(e) => {
+                    warn!(error=%e, "nosql probe body read failed, skipping score");
+                    (String::new(), elapsed, 0)
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error=%e, "nosql probe request failed, skipping score");
+            (String::new(), elapsed, 0)
         }
     }
 }

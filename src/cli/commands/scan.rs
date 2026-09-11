@@ -11,7 +11,7 @@ use crate::{
 use anyhow::Result;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 /// Result of a scan operation containing all findings and metadata.
@@ -115,6 +115,12 @@ pub(crate) fn engine_config(cli: &Cli) -> EngineConfig {
         marker: cli.marker.clone(),
         raw_request: cli.merged_raw_request(),
         knowledge,
+        second_order: crate::engine::orchestrator::SecondOrderConfig {
+            enabled: cli.second_order,
+            revisit_url: cli.second_order_revisit_url.clone(),
+            max_stores: cli.effective_second_order_max_stores(),
+            ..crate::engine::orchestrator::SecondOrderConfig::default()
+        },
     }
 }
 
@@ -385,7 +391,7 @@ fn dry_run(cli: &Cli) {
             );
             if let Some(ks) = cfg.knowledge.as_ref() {
                 for tech in [
-                    "boolean", "error", "union", "time", "stacked", "oob", "json",
+                    "boolean", "error", "union", "time", "stacked", "oob", "json", "nosql",
                 ] {
                     if let Some(kind) = crate::reasoning::knowledge::parse_technique(tech) {
                         let b = ks.boost_for(kind, "unknown", "generic");
@@ -416,7 +422,10 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> Result<()> {
     let result = run_scan(&cli, cancel).await?;
 
     let scrubber = Scrubber::new(result.config.no_redact);
-    info!(
+    // Canonical human summary is the orchestrator `scan done` line (findings
+    // per technique, req, 403/429, `--explain` hint). Keep this at `debug!`
+    // so TTY output shows exactly one summary, not two.
+    debug!(
         target=%scrubber.scrub(&result.target),
         state=?result.engine_state,
         "scan finished"

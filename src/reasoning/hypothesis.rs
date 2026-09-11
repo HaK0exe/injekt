@@ -181,7 +181,10 @@ pub fn compute_calibrated_prior(
         TechniqueKind::Boolean => 0.20,
         TechniqueKind::Error => 0.15,
         TechniqueKind::Time => 0.10,
-        TechniqueKind::Union | TechniqueKind::Stacked | TechniqueKind::Json => 0.05,
+        TechniqueKind::Union
+        | TechniqueKind::Stacked
+        | TechniqueKind::Json
+        | TechniqueKind::Nosql => 0.05,
         TechniqueKind::Oob => 0.02,
     };
 
@@ -191,6 +194,9 @@ pub fn compute_calibrated_prior(
     if context.json {
         if technique == TechniqueKind::Json {
             prior = 0.45;
+        } else if technique == TechniqueKind::Nosql {
+            // REST JSON bodies → MongoDB operators : second prioritaire.
+            prior = 0.30;
         } else if technique == TechniqueKind::Stacked {
             prior *= 0.5;
         }

@@ -1138,4 +1138,69 @@ mod tests {
         assert_eq!(out.to_ascii_lowercase(), "select");
         assert_eq!(out.len(), 6);
     }
+
+    #[test]
+    fn boolean_safe_tampers_preserve_true_false_differential() {
+        use crate::seeded_rng::make_rng;
+        // Garde-fou contre futur ZWSP / split intra-mot qui effondrerait
+        // l'oracle : TRUE et FALSE doivent rester distincts après tamper.
+        let pairs = [
+            ("' OR 1=1 -- -", "' OR 1=2 -- -"),
+            ("' OR 'a'='a' -- -", "' OR 'a'='b' -- -"),
+        ];
+        for name in Tamper::all_names() {
+            let t = Tamper::from_name(name).expect("known tamper");
+            if !t.is_boolean_safe() {
+                continue;
+            }
+            let mut rng = make_rng(Some(42));
+            for (true_p, false_p) in &pairs {
+                let a = t.apply_with_rng(true_p, &mut rng);
+                let b = t.apply_with_rng(false_p, &mut rng);
+                assert_ne!(a, b, "{name} collapsed differential for {true_p}");
+            }
+        }
+    }
+
+    #[test]
+    fn double_encode_degrades_trailing_comment_needs_double_decode() {
+        // Documente l'exigence double-décodage serveur : après simple
+        // décodage, `-- -` ne revient pas (reste `%20`), donc le terminateur
+        // casse sans 2e passe. Verrouille la non-régression.
+        let out = Tamper::DoubleEncode.apply("' OR 1=1 -- -");
+        assert!(out.contains("%2520"), "got {out}");
+        assert!(!out.contains(' '), "got {out}");
+    }
+
+    #[test]
+    fn versioned_more_is_superset_of_versioned() {
+        let payload = "' UNION SELECT 1,2 -- -";
+        let base = Tamper::VersionedComment.apply(payload);
+        let more = Tamper::VersionedMoreKeywords.apply(payload);
+        assert!(base.contains("/*!50000UNION*/"), "got {base}");
+        assert!(more.contains("/*!50000UNION*/"), "got {more}");
+        // `CASE/WHEN` wrappé uniquement par more (disjoint MORE_KEYWORDS).
+        let extended = "SELECT CASE WHEN 1=1 ELSE 2 END";
+        assert!(
+            !Tamper::VersionedComment
+                .apply(extended)
+                .contains("/*!50000CASE*/")
+        );
+        assert!(
+            Tamper::VersionedMoreKeywords
+                .apply(extended)
+                .contains("/*!50000CASE*/")
+        );
+    }
+
+    #[test]
+    fn space2newline_only_replaces_inter_token_spaces() {
+        // `U\nNION` intra-mot ne doit jamais être produit : seuls les `' '`
+        // inter-tokens sont remplacés, pas de split dans le mot-clé.
+        let out = Tamper::Space2Newline.apply("UNION");
+        assert_eq!(out, "UNION");
+        let spaced = Tamper::Space2Newline.apply("' UNION SELECT 1 -- -");
+        assert!(!spaced.contains(' '), "got {spaced}");
+        assert!(spaced.contains("%0a"), "got {spaced}");
+    }
 }
