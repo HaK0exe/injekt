@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="injekt" tests="2" failures="2" errors="0" skipped="0" hostname="https://example.com/?id=1">
+  <testcase classname="injekt.boolean" name="id@query">
+
+    <failure message="[high] SQL injection via boolean on parameter &apos;id@query&apos; (confidence 0.95, fp 0.02)">target: https://example.com/?id=1
+dbms: -
+evidence: boolean true_sim=0.95 false_sim=0.10 trials=3/3
+remediation: Use parameterized queries / prepared statements; never concatenate input into SQL. Enforce least-privilege DB accounts and validate input server-side.
+fix example: db.query(&quot;SELECT * FROM users WHERE id = ?&quot;, [user_input])
+
+trace_ref: trace:9f2c41aa07bd3e55
+</failure>
+  </testcase>
+  <testcase classname="injekt.error" name="q@query">
+
+    <failure message="[medium] SQL injection via error on parameter &apos;q@query&apos; (confidence 0.78, fp 0.12)">target: https://example.com/?id=1
+dbms: postgres
+evidence: error pattern Xpath tamper=space2comment
+remediation: Use parameterized queries / prepared statements; never concatenate input into SQL. Enforce least-privilege DB accounts and validate input server-side.
+fix example: db.query(&quot;SELECT * FROM users WHERE id = ?&quot;, [user_input])
+
+waf: vendor=cloudflare blocking=true
+</failure>
+  </testcase>
+</testsuite>
