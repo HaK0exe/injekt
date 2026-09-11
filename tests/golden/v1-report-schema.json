@@ -1,0 +1,55 @@
+{
+  "detectability": [
+    "count_403",
+    "count_429"
+  ],
+  "evidence": [
+    "confidence",
+    "parameter",
+    "request",
+    "response",
+    "technique"
+  ],
+  "finding": [
+    "confidence",
+    "dbms",
+    "evidence",
+    "evidence_detail",
+    "false_positive_prob",
+    "parameter",
+    "remediation",
+    "severity",
+    "target",
+    "technique",
+    "timestamp",
+    "waf"
+  ],
+  "finding_evidence_detail": [
+    "diff",
+    "hashes",
+    "trace_ref"
+  ],
+  "finding_remediation": [
+    "parameterized_example",
+    "summary"
+  ],
+  "finding_waf": [
+    "blocking",
+    "vendor"
+  ],
+  "report_top_level": [
+    "detectability",
+    "evidences",
+    "extracted",
+    "findings",
+    "git_sha",
+    "level",
+    "profile",
+    "request_count",
+    "seed",
+    "tampers",
+    "target",
+    "techniques",
+    "version"
+  ]
+}

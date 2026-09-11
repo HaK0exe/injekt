@@ -839,4 +839,72 @@ mod tests {
             Some(1.0)
         );
     }
+
+    #[test]
+    fn missing_file_is_cold_start_neutral() {
+        // v1.0-rc: fichier absent (premier run opt-in) → `Ok(vide)` neutre,
+        // jamais d'erreur surfacing vers l'orchestrateur.
+        let dir = std::env::temp_dir().join(format!("injekt-k-missing-{}", rand::random::<u64>()));
+        let path = dir.join("knowledge.json");
+        assert!(!path.exists());
+        let store = KnowledgeStore::load_from(&path).expect("missing -> empty");
+        assert!(store.is_empty());
+        for kind in all_techniques() {
+            assert!((store.boost_for(kind, "mysql", "numeric") - 1.0).abs() < 1e-12);
+        }
+        // Porte opt-in ON + fichier absent → `Some(vide)` (pas de création).
+        let explicit = path.to_string_lossy().into_owned();
+        let loaded = load_if_enabled(true, Some(&explicit)).expect("missing -> neutral");
+        assert!(loaded.is_empty());
+        assert!(!path.exists(), "load must not create the file");
+    }
+
+    #[test]
+    fn evil_dbms_and_context_never_persisted() {
+        // `record` normalise vers le vocabulaire fermé : une valeur
+        // d'appel malicieuse (URL, token, cookie) devient `unknown`/`generic`
+        // et n'atteint jamais le fichier.
+        let mut ks = KnowledgeStore::empty();
+        ks.record(
+            TechniqueKind::Boolean,
+            "http://evil.local/?token=fakesecret123",
+            "id@query; Cookie: sess=fakesess999",
+            true,
+            11,
+        );
+        // 12 essais pour sortir du cold-start et rendre le boost observable.
+        for _ in 0..11 {
+            ks.record(
+                TechniqueKind::Boolean,
+                "http://evil.local/?token=fakesecret123",
+                "id@query",
+                true,
+                11,
+            );
+        }
+        let json = ks.to_file_string();
+        for needle in [
+            "evil.local",
+            "fakesecret123",
+            "fakesess999",
+            "http",
+            "://",
+            "id@query",
+            "cookie",
+            "token=",
+            "oastify",
+            "password",
+        ] {
+            assert!(
+                !json.to_ascii_lowercase().contains(needle),
+                "leak {needle}: {json}"
+            );
+        }
+        // La clé normalisée existe (`unknown`/`generic`), le boost est borné.
+        let boost = ks.boost_for(TechniqueKind::Boolean, "unknown", "generic");
+        assert!(boost > 1.0, "boost={boost}");
+        assert!(boost <= KNOWLEDGE_MAX_BOOST + 1e-12, "boost={boost}");
+        let sc = Scrubber::new(false);
+        assert_eq!(sc.scrub(&json), json);
+    }
 }
