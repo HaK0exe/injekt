@@ -16,7 +16,7 @@ detection → fingerprint → extraction (opt-in)`.
 | 1 | Installation, `info`, `init`, profils, config, `dry-run` | `01-installation-configuration.md` |
 | 2 | Reconnaissance : `recon crawl/scan/import`, ingest OpenAPI/Sitemap/Raw/Bulk | `02-reconnaissance.md` |
 | 3 | Scan & détection : techniques, `--level`, `--dbms`, matchers, baseline/WAF | `03-scan-detection.md` |
-| 4 | Évasion WAF : 19 tampers, `--hpp`, `--chunked`, `--prefix/suffix`, encoding | `04-evasion-waf.md` |
+| 4 | Évasion WAF : 24 tampers (+ presets `cloudflare-generic`/`aggressive`), `--hpp`, `--chunked`, `--prefix/suffix`, encoding | `04-evasion-waf.md` |
 | 5 | Fingerprint DBMS + exploitation : `--extract`, `--dbs/--tables/--columns/--dump`, identité | `05-exploitation-enumeration.md` |
 | 6 | OPSEC : proxy `socks5h`, jitter, rate-limit, scrubber, `--allow-private`, `--export-encrypted`/`replay` | `06-opsec.md` |
 | 7 | Automatisation : `auto` (escalade L1/L2/L3), bulk, `completions`/`man`, MCP | `07-automatisation.md` |
@@ -96,7 +96,7 @@ d'exécution **y compris "aucun finding"**. La vérité est dans `report.json`
 L1 budget historique, L2 double, L3+ tout + `ORDER BY` élargi.
 
 ### Évasion
-- 19 tampers (`--tamper`, voir chap. 4) + auto `space2comment` **uniquement sur blocage WAF actif**.
+- 24 tampers (`--tamper`, voir chap. 4) + presets `cloudflare-generic`/`aggressive` + auto `space2comment,randomcase` **uniquement sur blocage WAF actif**.
 - `--hpp` (pollution `?id=1&id=PAYLOAD`, Query/Body), `--chunked` (`Transfer-Encoding: chunked`, Body).
 - `--prefix/--suffix` (après tampers), `--safe-chars`, `--skip-urlencode`.
 

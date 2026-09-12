@@ -29,7 +29,7 @@ No CI workflows, no `deny.toml`, no rustfmt config — `cargo deny check` from R
 - Target resolution: `Cli::effective_target()` prefers `--raw-file` (Burp/ZAP raw request via `target/raw_request.rs`) over global `--target` over `scan --target`. `recon crawl/scan` take bare host or URL, not the global flag shape.
 - Anti-SSRF: private/loopback targets rejected unless `--allow-private` (lab only).
 - Proxy: `socks5://` is rejected with `DnsLeak` — always use `socks5h://` (remote DNS). See `src/http/proxy.rs`.
-- WAF: repeated 403/406 → `Baseline::is_waf_blocked()` + auto `space2comment` tamper.
+- WAF: repeated 403/406 → `Baseline::is_waf_blocked()` + auto `space2comment,randomcase` tampers.
 - OOB (`techniques/oob`, OPT-IN): without `--oob-poll-url` containing `{token}`, probes are sent but never auto-confirmed — no finding without collaborator proof. Egress originates from target DB server, not via `--proxy`; use self-hosted collaborator.
 - Concurrency: bounded `buffer_unordered(threads)` + `tokio::time::timeout` + `CancellationToken` (Ctrl+C graceful). Don't introduce unbounded spawns.
 

@@ -118,12 +118,13 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--code <N>` | Response status **must equal** this code, otherwise veto finding | — |
 | `--text-only` | Strip HTML tags/entities before matching and detection | `false` |
 | `--level <1-5>` | Aggressiveness: L1 = historical payload budget, L2 doubles it, L3+ tries every payload and widens ORDER BY enumeration | `1` |
+| `--max-duration <SECS>` | Global detection time budget (**OPT-IN**): detection stops cooperatively once the shared detection clock exceeds `SECS` (running technique finishes early, clean `Done`, no error, no new finding; the union starvation guard is skipped once spent). `None` = unlimited (default, historical behaviour) | — |
 | `--request-budget <N>` | Global request budget (**OPT-IN** calibration): detection stops cooperatively once total `request_count` reaches `N` (current technique finishes, clean `Done`, no error, no new finding; concurrent params may overshoot by one technique each). Per-param scheduler is seeded with the same value for visibility (`budget_total`). `None` = unlimited (default, historical behaviour — A1 evasion needs ~1032 req live, never cap by default) | — |
 | `--seed <N>` | Deterministic run seed, recorded in the report as `seed` (C1 metrology). Seeds all non-cryptographic RNG (tamper scripts, request jitter, UA rotation, retry backoff): runs with the same seed are deterministic. Crypto randomness (export salt/nonce) always stays OS-random | — |
 | `--confirm` | Strict second-pass confirmation (planned C6; **currently warning-only, not implemented** — in-detection 3-trial confirmation still applies regardless of this flag) | `false` |
 | `--ignore-code <LIST>` | Status codes treated as negative probes (e.g. `--ignore-code 429,503`); never yields a finding. Baseline/WAF detection runs **before** this filter and is never ignored | — |
 | `--raw-file <PATH>` | Raw HTTP request file (Burp/ZAP export) — **takes priority over `--target`** (see [Target resolution](#target-resolution)) | — |
-| `--tamper <LIST>` | WAF tampers (19 total, see [Tamper scripts](#tamper-scripts)): `space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,randomcase,versionedcomment,versionedmorekeywords,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,base64encode` (opt-in: breaks boolean differentials) | auto `space2comment` on active WAF blocking |
+| `--tamper <LIST>` | WAF tampers (24 total, see [Tamper scripts](#tamper-scripts)): `space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,randomcase,versionedcomment,versionedmorekeywords,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2paren,versionedfuzz,jsonunicodeescape,numericobfuscate,linecomment,base64encode` (opt-in: breaks boolean differentials). Presets: `cloudflare-generic` (=`randomcase,space2comment,versionedmorekeywords`), `aggressive` (=`randomcase,space2paren,versionedfuzz,equaltolike`) | auto `space2comment,randomcase` on active WAF blocking |
 | `--hpp` | HTTP Parameter Pollution: duplicate param `?id=1&id=PAYLOAD` (Query/Body) | `false` |
 | `--chunked` | Chunked transfer: streamed `Transfer-Encoding: chunked` body (Body only) | `false` |
 | `--oob-domain <DOMAIN>` | Collaborator base domain (enables OOB probes, **OPT-IN**) | — |
@@ -184,15 +185,18 @@ injekt --target "https://example.com/?id=1" --output report.json
 
 ### Tamper scripts
 
-19 tampers, composable with `--tamper a,b,c` (applied as original + each single + full chain).
+24 tampers, composable with `--tamper a,b,c` (applied as original + each single + full chain).
 Case-insensitive, with sqlmap-style aliases (`comment` → `space2comment`, `url` → `charencode`,
 `double` → `doubleurlencode`, `hex` → `hexencode`, … — unknown names are ignored with a warning).
-Boolean TRUE/FALSE pairs only try boolean-safe sets (`base64encode` excluded there; it stays
-available to single-payload techniques as explicit opt-in).
+Presets (expanded inline, never auto-applied): `cloudflare-generic` (=`randomcase,space2comment,versionedmorekeywords`),
+`aggressive` (=`randomcase,space2paren,versionedfuzz,equaltolike`).
+Boolean TRUE/FALSE pairs only try boolean-safe sets (`base64encode` and `jsonunicodeescape`
+excluded there — both escape/encode the injection quote itself, so both branches go inert;
+they stay available to single-payload techniques as explicit opt-in).
 
 | Tamper | Transformation | Typical use |
 |--------|---------------|-------------|
-| `space2comment` | ` ` → `/**/` (trailing `-- ...` / `#...` terminators preserved — mangling `-- -` into `--/**/-` would break the comment server-side) | Generic WAF bypass; **auto-applied on active WAF blocking** |
+| `space2comment` | ` ` → `/**/` (trailing `-- ...` / `#...` terminators preserved — mangling `-- -` into `--/**/-` would break the comment server-side) | Generic WAF bypass; **auto-applied with `randomcase` on active WAF blocking** |
 | `space2plus` | ` ` → `+` | Query-string contexts |
 | `space2tab` | ` ` → `%09` | Whitespace filters |
 | `space2newline` | ` ` → `%0a` | Whitespace filters |
@@ -213,6 +217,11 @@ available to single-payload techniques as explicit opt-in).
 | `randomcomments` | ` ` → random `/**/` or `/**/**/` | Signature rotation |
 | `equaltolike` | `=` → ` LIKE ` (`>=`/`<=`/`!=` kept) | `=`-signature WAFs; auto-added at L3 |
 | `versionedmorekeywords` | extended keyword set → `/*!50000KW*/` | **MySQL**, broader than `versionedcomment` |
+| `space2paren` | ` ` → `(` with balancing `)` (`' OR 1=1` → `'OR(1=1)`) | Parenthesis-separator bypass, deterministic |
+| `versionedfuzz` | seeded `/*!`/`/**!` + version (`0/32302/50000/80000/99999`) wrapping | Cloudflare/CRS signature diversity; auto-added at L2 |
+| `jsonunicodeescape` | `'" /` → `\uXXXX` (escapes the injection quote itself) | JSON contexts; explicit opt-in (not boolean-safe) |
+| `numericobfuscate` | seeded `1` → `1e0` or `0x31` (equality-preserving) | Numeric-literal signatures; auto-added at L3 |
+| `linecomment` | seeded trailing `-- -` → `--+`/`%23`/`;/*` | Terminator signatures; auto-added at L3 |
 | `base64encode` | whole payload → Base64 | Opt-in only: opaque, skipped for boolean pairs |
 
 **Enumeration/Extraction Flags** (require `--extract` or `--auto-enumerate` in recon):

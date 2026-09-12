@@ -77,10 +77,12 @@ INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
 `stealth` (2/3/1200,400/L1/bool+err) · `aggressive` (8/10/500,200/L3/all).
 Précédence : CLI > env > fichier > profil > défauts.
 
-**Tampers (19)** : `space2comment space2plus space2tab space2newline space2randomblank
+**Tampers (24)** : `space2comment space2plus space2tab space2newline space2randomblank
 space2dash space2mssqlblank randomcase versionedcomment versionedmorekeywords
 betweencomment randomcomments equaltolike charencode doubleurlencode hexencode
-unicodeencode overlongutf8 base64encode(opt-in)`.
+unicodeencode overlongutf8 space2paren versionedfuzz jsonunicodeescape
+numericobfuscate linecomment base64encode(opt-in)`
+(+ presets `cloudflare-generic`/`aggressive`).
 
 **DBMS** : `mysql postgres mssql oracle` (+ alias `mariadb/pg/sqlserver/ora`).
 

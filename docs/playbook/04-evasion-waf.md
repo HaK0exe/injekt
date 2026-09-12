@@ -1,6 +1,6 @@
 # 04 — Évasion WAF
 
-> Principe : **progressif**. Auto `space2comment` sur blocage actif → 1-2 tampers
+> Principe : **progressif**. Auto `space2comment,randomcase` sur blocage actif → 1-2 tampers
 > ciblés → chaîne courte → request-tampers. Jamais de `base64encode` en aveugle
 > (casse les différentiels boolean) ni de `--skip-urlencode` sans raison.
 
@@ -13,22 +13,26 @@ injekt --target "https://waf.example.com/?id=1" --profile stealth -v
 
 | Signal | Interprétation | Action |
 |---|---|---|
-| 403/406 répétés | Blocage actif → auto `space2comment` déjà tenté | `--tamper space2comment,randomcase` manuel + `--level 2` |
+| 403/406 répétés | Blocage actif → auto `space2comment,randomcase` déjà tenté | `--tamper space2comment,randomcase` manuel + `--level 2` |
 | Challenge JS/cookie | Bot-defense | `--profile stealth` + `--rate-limit 3`, pas de tamper magique |
 | 429/503 | Rate-limit/infra | `--ignore-code 429,503` + baisser `--rate-limit/--threads` |
 | Reset/timeout ciblés sur payloads | Signature WAF | Rotation espaces/casse/encoding (4.2) |
 | Diff nulle partout | Filtrage silencieux ou pas d'injection | `--text-only`, `--fetch-using`, `--hpp`, OOB |
 
-## 4.2 Les 19 tampers (`--tamper a,b,c`)
+## 4.2 Les 24 tampers (`--tamper a,b,c`)
 
 Sémantique : `original + chaque single + chaîne complète`. Insensible à la casse,
 alias sqlmap (`comment→space2comment`, `url→charencode`, `double→doubleurlencode`, `hex→hexencode`).
+Presets (étendus en ligne, jamais auto-appliqués) : `cloudflare-generic`
+(`=randomcase,space2comment,versionedmorekeywords`), `aggressive`
+(`=randomcase,space2paren,versionedfuzz,equaltolike`).
 Inconnus = warning + ignorés. Paires boolean TRUE/FALSE = sets boolean-safe
-(`base64encode` exclu là, opt-in pour techniques single-payload).
+(`base64encode` et `jsonunicodeescape` exclus là — ils encodent/échappent la quote
+d'injection elle-même, les deux branches deviennent inertes ; opt-in pour techniques single-payload).
 
 | Tamper | Transformation | Usage typique |
 |---|---|---|
-| `space2comment` | ` ` → `/**/` | **Bypass générique ; auto sur blocage actif** |
+| `space2comment` | ` ` → `/**/` | **Bypass générique ; auto avec `randomcase` sur blocage actif** |
 | `space2plus` | ` ` → `+` | Query-string |
 | `space2tab` | ` ` → `%09` | Filtres whitespace |
 | `space2newline` | ` ` → `%0a` | Filtres whitespace |
@@ -46,6 +50,11 @@ Inconnus = warning + ignorés. Paires boolean TRUE/FALSE = sets boolean-safe
 | `hexencode` | Hex `%xx` par octet | Filtres d'encoding |
 | `unicodeencode` | `%uXXXX` par char | Stacks IIS/ASP |
 | `overlongutf8` | `/` → `%c0%af` | Décodeurs overlong-UTF8 |
+| `space2paren` | ` ` → `(` + `)` d'équilibrage | Bypass séparateur parenthèse, déterministe |
+| `versionedfuzz` | `/*!`/`/**!` + version seedée (`0/32302/50000/80000/99999`) | Diversité signatures Cloudflare/CRS ; auto-ajouté en L2 |
+| `jsonunicodeescape` | `'" /` → `\uXXXX` (échappe la quote d'injection elle-même) | Contextes JSON ; opt-in explicite (non boolean-safe) |
+| `numericobfuscate` | `1` → `1e0` ou `0x31` seedé (égalité préservée) | Signatures sur littéraux numériques ; auto-ajouté en L3 |
+| `linecomment` | Terminateur `-- -` → `--+`/`%23`/`;/*` seedé | Signatures de terminateurs ; auto-ajouté en L3 |
 | `base64encode` | Payload entier → Base64 | **Opt-in : opaque, casse boolean** |
 
 ```bash
@@ -93,10 +102,10 @@ Ordre réel : **tampers → prefix/suffix → encoding** (`PayloadOpts{prefix,su
 ```
 L1 + boolean,error (référence)
  → + space2comment,randomcase
- → + charencode OU versionedcomment (si MySQL) OU space2mssqlblank (si MSSQL)
+ → + charencode OU versionedcomment/versionedfuzz (si MySQL) OU space2mssqlblank (si MSSQL)
  → --level 2
  → + --hpp
- → --level 3 + equaltolike + --text-only
+ → --level 3 + equaltolike,numericobfuscate,linecomment + --text-only
  → --chunked (si POST Body)
  → OOB (si blind total, chap. 3.6)
  → STOP : documenter l'échec (négatif WAF-hardené ≠ pas d'injection, mais fin de scope rentable)

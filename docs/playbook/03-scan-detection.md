@@ -24,7 +24,7 @@ injekt --target "https://example.com/?id=1" --profile stealth --dry-run
 4. **Confirmation** : paires TRUE/FALSE inversées, min 3 essais.
 
 Comportement WAF :
-- **Blocage actif** (403/406 répétés ou challenge) → `Baseline::is_waf_blocked()` + tamper auto `space2comment` + baisse de confiance.
+- **Blocage actif** (403/406 répétés ou challenge) → `Baseline::is_waf_blocked()` + tampers auto `space2comment,randomcase` + baisse de confiance.
 - **Simple présence CDN** → informative, pas de tamper auto.
 
 ```bash
@@ -35,7 +35,7 @@ injekt --target "https://example.com/?id=1" --ignore-code 429,503
 # Baseline/WAF tourne AVANT ce filtre et n'est jamais ignorée.
 ```
 
-## 3.3 Les 7 techniques (quoi, quand, comment)
+## 3.3 Les 8 techniques (quoi, quand, comment)
 
 ```bash
 # Rapide / discret (2 techniques, faible bruit) :
@@ -63,6 +63,7 @@ injekt --target "https://example.com/?id=1" --techniques all
 | `stacked` | Marqueur `; SELECT` (garde SELECT-only) | `; SELECT …` | Stacked queries suspectées (rare) |
 | `oob` | Callback DNS/HTTP collaborateur | DNS/HTTP par DBMS | Blind sans diff ni erreur (OPT-IN, voir 3.6) |
 | `json` | Dual boolean+error sur fonctions JSON | `JSON_EXTRACT/->>/JSON_VALUE/OPENJSON/JSON_EXISTS` | Endpoints API/configs/blobs JSON |
+| `nosql` | Dual boolean+error sur opérateurs MongoDB | `{"$gt":""}/$ne/$regex` + `$where` invalide | Logins REST / bodies JSON adossés à MongoDB |
 
 ```bash
 # Forcer l'oracle d'extraction (réduit le set de techniques) :
@@ -76,7 +77,7 @@ injekt --target "https://example.com/?id=1" --fetch-using direct
 ```bash
 injekt --target "https://example.com/?id=1" --level 1   # défaut : budget historique
 injekt --target "https://example.com/?id=1" --level 2   # double le budget
-injekt --target "https://example.com/?id=1" --level 3   # tout + ORDER BY élargi (+ equaltolike auto)
+injekt --target "https://example.com/?id=1" --level 3   # tout + ORDER BY élargi (+ equaltolike/numericobfuscate/linecomment auto)
 injekt --target "https://example.com/?id=1" --profile aggressive  # = level 3 par défaut
 ```
 

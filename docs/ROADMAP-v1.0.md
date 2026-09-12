@@ -44,7 +44,7 @@ Si un chantier ne rapproche pas de l'une de ces 5 lignes, il ne rentre pas en v1
 
 ### 1.1 Ce qui marche
 
-- Moteur d'évasion fonctionnel : 19 tampers (`src/techniques/tamper.rs`), borne `t.len()+2`, `is_boolean_safe`, préservation `-- -`, auto `space2comment` sur WAF block.
+- Moteur d'évasion fonctionnel : 24 tampers (`src/techniques/tamper.rs`, + presets `cloudflare-generic`/`aggressive`), borne `t.len()+2`, `is_boolean_safe`, préservation `-- -`, auto `space2comment,randomcase` sur WAF block.
 - Confirmation robuste : 3 trials, majorité, `confirm_either` normal/inversé pour login-bypass (`src/detection/confirmation.rs`).
 - Baseline + diff : 3 échantillons, `mean+σ`, SHA-256, WAF Cloudflare, Levenshtein 1024 + Jaccard 0.7/0.3, garde `""→conf 0.0` anti-FP.
 - Découverte headers/cookies, identity/UA câblée (`Sec-CH-UA` aligné, fix règle CRS 920320).
@@ -203,7 +203,7 @@ Ordre d'exécution : **C1 → C2 → C3 → C4 → C6 → C7 → C10 → C11 →
 ### C5 — Mutation Engine (AST, TARDIF — après le raisonnement)
 
 - **Pourquoi (revue lead, inversé) :** le moteur Phase 1 ne souffre pas des tampers — il souffre de ne pas décider quoi tester. L'AST SQL est énorme ; investi trop tôt, il arrive avant que le scheduler sache s'en servir. Il vient **en dernier**, branché sur un raisonnement mature.
-- **Problème résolu (alors seulement) :** `tamper.rs` string-level, aucune garantie "TRUE reste TRUE", aléatoire non seedé. En attendant, les 19 tampers + `is_boolean_safe` + borne `t.len()+2` suffisent (prouvé A1/A2 bras evasion).
+- **Problème résolu (alors seulement) :** `tamper.rs` string-level, aucune garantie "TRUE reste TRUE", aléatoire non seedé. En attendant, les 19 tampers d'alors (24 depuis la Phase 1) + `is_boolean_safe` + borne `t.len()+2` suffisent (prouvé A1/A2 bras evasion).
 - **Impact utilisateur :** `--tamper` déclaratif + sûr, mutation citée et rejouable. Aucun changement CLI visible en v1.0 (compat noms).
 - **Impact architecture :** nouveau `src/mutation/` (mini-AST ciblé : prédicats, whitespace, commentaires, encodages) : `Parse→Normalize→Mutate→Render(dialect)` avec preuve `render(parse(x))==x`. `Tamper` = couche rendu compat. `mutation_plans(context, dbms_belief, knowledge)` branché C2/C3/C4/C13. `sqlparser` en dev-dependency pour tests d'équivalence uniquement. Pas d'Oracle complet jour 1. Scope v1.0 volontairement réduit : familles whitespace/comment/case/predicate déjà couvertes, pas de parseur SQL général.
 - **Dépendances :** C2, C1 bras evasion (oracles), C4/C13 (qui choisissent les plans — d'où la position tardive).

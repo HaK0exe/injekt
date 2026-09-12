@@ -50,7 +50,7 @@ DBMS            mysql, postgres, mssql, oracle
 Docs            docs/OPSEC.md
 ```
 
-> Si `info` ne liste pas 7 techniques / 19 tampers / 4 DBMS → binaire périmé.
+> Si `info` ne liste pas 8 techniques / 24 tampers / 4 DBMS → binaire périmé.
 
 ## 1.3 Profils (`--profile`)
 

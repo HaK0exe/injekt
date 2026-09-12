@@ -22,8 +22,8 @@ Escalade (sauf `--no-escalate`), **arrêt à la 1re passe avec findings**
 | Passe | Label | Config |
 |---|---|---|
 | 1 | `L1-baseline` | Config telle quelle |
-| 2 | `L2-tamper` | `level ≥ 2` + `space2comment,randomcase` (si tampers vides) |
-| 3 | `L3-evasion` | `level ≥ 3` + `space2comment,randomcase,charencode,equaltolike` (si <4 tampers) + `text-only` + `hpp` |
+| 2 | `L2-tamper` | `level ≥ 2` + `space2comment,randomcase,versionedfuzz` (si tampers vides) |
+| 3 | `L3-evasion` | `level ≥ 3` + `space2comment,randomcase,charencode,equaltolike,numericobfuscate,linecomment` (si <6 tampers) + `text-only` + `hpp` |
 
 `base64encode` n'est **jamais** auto-activé (casse boolean). Tampers explicites
 conservés en L2/L3. `--auto-enumerate` force `extract=true`.

@@ -35,3 +35,7 @@ report*.json
 
 # Bench lab artefacts (local runs — never committed; versions.lock IS committed)
 bench/reports/
+
+# Python bytecode (bench runner selftest / tooling)
+__pycache__/
+*.pyc

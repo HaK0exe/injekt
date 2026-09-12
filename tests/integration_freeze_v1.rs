@@ -115,7 +115,7 @@ fn cli_flags_frozen() {
 }
 
 #[test]
-fn tamper_names_frozen_at_19() {
+fn tamper_names_frozen_at_24() {
     let names = injekt::techniques::tamper::Tamper::all_names();
     assert_eq!(names.len(), 24, "new tamper must break freeze deliberately");
     let expected = [
