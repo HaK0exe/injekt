@@ -34,7 +34,13 @@ const BODY_MARKERS: &[(&str, bool)] = &[
     ("managed challenge", true),
     ("cf-chl", true),
     ("challenges.cloudflare.com", true),
-    ("cloudflare ray id", true),
+    // NOTE: `cloudflare ray id` is WEAK on purpose — Cloudflare prints a
+    // `Ray ID` footer on every proxied page (even clean 200s), so it proves
+    // presence, not a challenge. Blocking still fires via strong markers
+    // (`just a moment`, `managed challenge`, `1020`/`1015`), the
+    // `captcha+cloudflare` rule, or corroboration (2nd weak hit / header /
+    // 403-503 status).
+    ("cloudflare ray id", false),
     ("error code: 1020", true),
     ("error 1020", true),
     ("error code: 1015", true),
@@ -43,11 +49,35 @@ const BODY_MARKERS: &[(&str, bool)] = &[
     ("__cf_bm", false),
 ];
 
+/// Generic / vendor-specific deny markers: `(needle, strong, vendor)`.
+/// Weak markers only corroborate (need a header hit, a second weak hit, or
+/// a corroborating status); strong ones prove a block on their own.
+/// Vendor attribution follows the marker text (`incapsula incident` →
+/// Imperva, `akamai edge` → Akamai, …); plain denials map to `Generic`.
+const GENERIC_BODY_MARKERS: &[(&str, bool, WafVendor)] = &[
+    ("request blocked", false, WafVendor::Generic),
+    ("access denied", false, WafVendor::Generic),
+    ("403 forbidden", false, WafVendor::Generic),
+    ("incapsula incident", true, WafVendor::Imperva),
+    ("incapsula", false, WafVendor::Imperva),
+    ("akamai edge", false, WafVendor::Akamai),
+    ("mod_security", false, WafVendor::ModSecurity),
+    ("modsecurity", false, WafVendor::ModSecurity),
+    ("awselb", false, WafVendor::AwsWaf),
+];
+
 /// WAF/CDN vendor behind the response, when identifiable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WafVendor {
     Cloudflare,
+    Akamai,
+    Imperva,
+    ModSecurity,
+    F5,
+    AwsWaf,
+    Sucuri,
+    Fastly,
     Generic,
 }
 
@@ -55,6 +85,13 @@ impl core::fmt::Display for WafVendor {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Cloudflare => write!(f, "cloudflare"),
+            Self::Akamai => write!(f, "akamai"),
+            Self::Imperva => write!(f, "imperva"),
+            Self::ModSecurity => write!(f, "modsecurity"),
+            Self::F5 => write!(f, "f5"),
+            Self::AwsWaf => write!(f, "aws-waf"),
+            Self::Sucuri => write!(f, "sucuri"),
+            Self::Fastly => write!(f, "fastly"),
             Self::Generic => write!(f, "generic"),
         }
     }
@@ -132,6 +169,7 @@ pub fn detect_cloudflare(status: u16, headers: &http::HeaderMap, body: &[u8]) ->
 /// [`HEADER_VALUE_KEEP`]) — detection only needs `contains` on markers such
 /// as `__cf_bm`, and full cookie values must not be retained.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn detect_cloudflare_flat(
     status: u16,
     headers: &[(String, String)],
@@ -169,6 +207,16 @@ pub fn detect_cloudflare_flat(
                     has_mitigated = true;
                     push_hit(&mut hits, "set-cookie:cf_clearance");
                 }
+                // Imperva/Incapsula cookies (`incap_ses_*`, `visid_incap`).
+                if value_lower.contains("incap_") || value_lower.contains("visid_incap") {
+                    push_hit(&mut hits, "set-cookie:incapsula");
+                    set_vendor(&mut vendor, WafVendor::Imperva);
+                }
+                // F5 BIG-IP persistence cookie.
+                if value_lower.contains("bigipserver") || value_lower.contains("bigip") {
+                    push_hit(&mut hits, "set-cookie:bigipserver");
+                    set_vendor(&mut vendor, WafVendor::F5);
+                }
             }
             "cf-mitigated" => {
                 has_mitigated = true;
@@ -178,14 +226,92 @@ pub fn detect_cloudflare_flat(
                 has_cache_status = true;
                 push_hit(&mut hits, name.as_str());
             }
-            _ => {}
+            "x-iinfo" => {
+                push_hit(&mut hits, "x-iinfo");
+                set_vendor(&mut vendor, WafVendor::Imperva);
+            }
+            "x-mod-security" => {
+                push_hit(&mut hits, "x-mod-security");
+                set_vendor(&mut vendor, WafVendor::ModSecurity);
+            }
+            "x-amzn-requestid" | "x-amzn-trace-id" | "x-amz-cf-id" => {
+                push_hit(&mut hits, name.as_str());
+                set_vendor(&mut vendor, WafVendor::AwsWaf);
+            }
+            "via" if value_lower.contains("varnish") => {
+                push_hit(&mut hits, "via:varnish");
+                set_vendor(&mut vendor, WafVendor::Fastly);
+            }
+            _ => {
+                // Prefix / value based vendor headers (names already lowercased).
+                if name.starts_with("x-akamai-") {
+                    push_hit(&mut hits, name.as_str());
+                    set_vendor(&mut vendor, WafVendor::Akamai);
+                } else if name.starts_with("x-sucuri-") {
+                    push_hit(&mut hits, name.as_str());
+                    set_vendor(&mut vendor, WafVendor::Sucuri);
+                } else if name.starts_with("x-fastly-") || name.starts_with("fastly-") {
+                    push_hit(&mut hits, name.as_str());
+                    set_vendor(&mut vendor, WafVendor::Fastly);
+                } else if name.starts_with("x-f5-") {
+                    push_hit(&mut hits, name.as_str());
+                    set_vendor(&mut vendor, WafVendor::F5);
+                } else if name == "server" {
+                    if value_lower.contains("akamaighost") || value_lower.contains("akamai") {
+                        push_hit(&mut hits, "server:akamaighost");
+                        set_vendor(&mut vendor, WafVendor::Akamai);
+                    }
+                    if value_lower.contains("incapsula") {
+                        push_hit(&mut hits, "server:incapsula");
+                        set_vendor(&mut vendor, WafVendor::Imperva);
+                    }
+                    if value_lower.contains("mod_security") || value_lower.contains("modsecurity") {
+                        push_hit(&mut hits, "server:modsecurity");
+                        set_vendor(&mut vendor, WafVendor::ModSecurity);
+                    }
+                    if value_lower.contains("big-ip") || value_lower.contains("bigip") {
+                        push_hit(&mut hits, "server:bigip");
+                        set_vendor(&mut vendor, WafVendor::F5);
+                    }
+                    if value_lower.contains("awselb") {
+                        push_hit(&mut hits, "server:awselb");
+                        set_vendor(&mut vendor, WafVendor::AwsWaf);
+                    }
+                    if value_lower.contains("sucuri") {
+                        push_hit(&mut hits, "server:sucuri");
+                        set_vendor(&mut vendor, WafVendor::Sucuri);
+                    }
+                    if value_lower.contains("varnish") || value_lower.contains("fastly") {
+                        push_hit(&mut hits, "server:varnish");
+                        set_vendor(&mut vendor, WafVendor::Fastly);
+                    }
+                } else {
+                    // Value-based fallbacks for CDN headers without a fixed name
+                    // (only signal names are recorded, never values).
+                    if value_lower.contains("incapsula") {
+                        push_hit(&mut hits, "header:incapsula");
+                        set_vendor(&mut vendor, WafVendor::Imperva);
+                    }
+                    if value_lower.contains("sucuri") {
+                        push_hit(&mut hits, "header:sucuri");
+                        set_vendor(&mut vendor, WafVendor::Sucuri);
+                    }
+                    if value_lower.contains("fastly") {
+                        push_hit(&mut hits, "header:fastly");
+                        set_vendor(&mut vendor, WafVendor::Fastly);
+                    }
+                }
+            }
         }
     }
 
     let cf_headers = has_ray || has_server_cf || has_cf_cookie;
     if cf_headers || has_cache_status {
-        vendor = Some(WafVendor::Cloudflare);
+        set_vendor(&mut vendor, WafVendor::Cloudflare);
     }
+    // Any header signal (Cloudflare or vendor-specific) counts for
+    // status corroboration — never the status alone.
+    let header_hit = !hits.is_empty();
 
     // Body markers — single lowercased pass over a truncated prefix.
     let prefix_len = body.len().min(BODY_SCAN_LEN);
@@ -195,19 +321,26 @@ pub fn detect_cloudflare_flat(
     for hit in &marker_hits {
         push_hit(&mut hits, hit);
     }
-    let body_hits = weak_count;
-    if strong_hit {
+    let (generic_hits, generic_weak, generic_strong, generic_vendor) = generic_body_signals(&lower);
+    for hit in &generic_hits {
+        push_hit(&mut hits, hit);
+    }
+    if let Some(v) = generic_vendor {
+        set_vendor(&mut vendor, v);
+    }
+    let body_hits = weak_count + generic_weak;
+    if strong_hit || generic_strong {
         blocking = true;
     }
     if marker_cf {
-        vendor = Some(WafVendor::Cloudflare);
+        set_vendor(&mut vendor, WafVendor::Cloudflare);
     }
     // `captcha` alone is too generic (any home-grown captcha); it only counts
     // co-occurring with a Cloudflare marker in the same body.
     if lower.contains("captcha") && lower.contains("cloudflare") {
         push_hit(&mut hits, "body:captcha+cloudflare");
         blocking = true;
-        vendor = Some(WafVendor::Cloudflare);
+        set_vendor(&mut vendor, WafVendor::Cloudflare);
     }
     // Generic (non-Cloudflare) rate limiting: corroborating status + generic
     // wording, without any Cloudflare marker.
@@ -216,7 +349,7 @@ pub fn detect_cloudflare_flat(
         && (lower.contains("rate limit") || lower.contains("too many requests"))
     {
         push_hit(&mut hits, "body:rate-limited");
-        vendor = Some(WafVendor::Generic);
+        set_vendor(&mut vendor, WafVendor::Generic);
         blocking = true;
     }
 
@@ -232,7 +365,7 @@ pub fn detect_cloudflare_flat(
     if CORROBORATING_STATUS.contains(&status) && (!hits.is_empty()) {
         // `403/406` alone already feed the legacy `is_waf_blocked`; here they
         // corroborate header/body markers into a blocking verdict.
-        if cf_headers || has_cache_status || body_hits > 0 {
+        if header_hit || body_hits > 0 {
             blocking = true;
         }
     }
@@ -247,6 +380,16 @@ pub fn detect_cloudflare_flat(
 fn push_hit(hits: &mut Vec<String>, hit: &str) {
     if !hits.iter().any(|h| h == hit) {
         hits.push(hit.to_owned());
+    }
+}
+
+/// Prefer a specific vendor over `Generic`; first specific wins when several
+/// fire (deterministic aggregation for `Baseline::new`).
+fn set_vendor(current: &mut Option<WafVendor>, new: WafVendor) {
+    match current {
+        None => *current = Some(new),
+        Some(WafVendor::Generic) if new != WafVendor::Generic => *current = Some(new),
+        _ => {}
     }
 }
 
@@ -270,6 +413,29 @@ fn challenge_body_signals(lower: &str) -> (Vec<String>, usize, bool, bool) {
         }
     }
     (marker_hits, weak_count, strong_hit, vendor_cf)
+}
+
+/// Scan a lowercased body prefix for generic/vendor deny markers. Returns
+/// the hit names, the weak-hit count, whether a strong marker fired, and
+/// the attributed vendor (`Generic` lowest priority — `set_vendor` keeps
+/// any specific vendor found elsewhere).
+fn generic_body_signals(lower: &str) -> (Vec<String>, usize, bool, Option<WafVendor>) {
+    let mut marker_hits = Vec::new();
+    let mut weak_count = 0usize;
+    let mut strong_hit = false;
+    let mut vendor: Option<WafVendor> = None;
+    for (needle, strong, owner) in GENERIC_BODY_MARKERS {
+        if lower.contains(needle) {
+            marker_hits.push(format!("body:{needle}"));
+            if *strong {
+                strong_hit = true;
+            } else {
+                weak_count += 1;
+            }
+            set_vendor(&mut vendor, *owner);
+        }
+    }
+    (marker_hits, weak_count, strong_hit, vendor)
 }
 
 #[cfg(test)]
@@ -366,6 +532,17 @@ mod tests {
     }
 
     #[test]
+    fn ray_id_footer_alone_is_presence_not_blocking() {
+        // Cloudflare prints a `Ray ID` footer on every clean proxied 200 —
+        // it must fingerprint the vendor without raising `blocking` (which
+        // would wrongly auto-tamper + downgrade confidence by 0.3).
+        let body = b"<html>cart ok <!-- Cloudflare Ray ID: abc123 --></html>";
+        let r = detect_cloudflare_flat(200, &headers(&[]), body);
+        assert!(r.is_suspected(), "{r:?}");
+        assert!(!r.blocking, "footer Ray ID must not block: {r:?}");
+    }
+
+    #[test]
     fn single_cloudflare_word_is_not_enough() {
         let r = detect_cloudflare_flat(
             200,
@@ -454,5 +631,129 @@ mod tests {
         assert_eq!(a.vendor, b.vendor);
         assert_eq!(a.hits, b.hits);
         assert_eq!(a.blocking, b.blocking);
+    }
+
+    #[test]
+    fn vendor_display_labels() {
+        assert_eq!(WafVendor::Cloudflare.to_string(), "cloudflare");
+        assert_eq!(WafVendor::Akamai.to_string(), "akamai");
+        assert_eq!(WafVendor::Imperva.to_string(), "imperva");
+        assert_eq!(WafVendor::ModSecurity.to_string(), "modsecurity");
+        assert_eq!(WafVendor::F5.to_string(), "f5");
+        assert_eq!(WafVendor::AwsWaf.to_string(), "aws-waf");
+        assert_eq!(WafVendor::Sucuri.to_string(), "sucuri");
+        assert_eq!(WafVendor::Fastly.to_string(), "fastly");
+        assert_eq!(WafVendor::Generic.to_string(), "generic");
+    }
+
+    #[test]
+    fn detects_akamai_headers_presence_not_blocking() {
+        let r = detect_cloudflare_flat(
+            200,
+            &headers(&[("server", "AkamaiGHost"), ("x-akamai-session-info", "x")]),
+            b"<html>ok</html>",
+        );
+        assert_eq!(r.vendor, Some(WafVendor::Akamai));
+        assert!(!r.blocking, "presence alone must not block: {r:?}");
+    }
+
+    #[test]
+    fn detects_imperva_incapsula_headers_and_incident_body() {
+        let r = detect_cloudflare_flat(
+            200,
+            &headers(&[
+                ("x-iinfo", "1-1"),
+                ("set-cookie", "incap_ses_123=abc; path=/"),
+            ]),
+            b"<html>ok</html>",
+        );
+        assert_eq!(r.vendor, Some(WafVendor::Imperva));
+        assert!(!r.blocking, "{r:?}");
+        let blocked = detect_cloudflare_flat(403, &headers(&[]), b"incapsula incident id 12345");
+        assert_eq!(blocked.vendor, Some(WafVendor::Imperva));
+        assert!(blocked.blocking, "incident id is strong: {blocked:?}");
+    }
+
+    #[test]
+    fn detects_modsecurity_server_and_header() {
+        let r = detect_cloudflare_flat(
+            200,
+            &headers(&[("server", "Apache/2 ModSecurity/CRS")]),
+            b"<html>ok</html>",
+        );
+        assert_eq!(r.vendor, Some(WafVendor::ModSecurity));
+        assert!(!r.blocking);
+        let r2 = detect_cloudflare_flat(
+            200,
+            &headers(&[("x-mod-security", "activated")]),
+            b"<html>ok</html>",
+        );
+        assert_eq!(r2.vendor, Some(WafVendor::ModSecurity));
+    }
+
+    #[test]
+    fn detects_f5_bigip_cookie() {
+        let r = detect_cloudflare_flat(
+            200,
+            &headers(&[("set-cookie", "BIGipServerpool=abc; path=/")]),
+            b"<html>ok</html>",
+        );
+        assert_eq!(r.vendor, Some(WafVendor::F5));
+        assert!(!r.blocking);
+    }
+
+    #[test]
+    fn detects_aws_waf_request_id_plus_blocked_body() {
+        let presence = detect_cloudflare_flat(
+            200,
+            &headers(&[("x-amzn-requestid", "abc")]),
+            b"<html>ok</html>",
+        );
+        assert_eq!(presence.vendor, Some(WafVendor::AwsWaf));
+        assert!(!presence.blocking);
+        let blocked = detect_cloudflare_flat(
+            403,
+            &headers(&[("x-amzn-requestid", "abc")]),
+            b"<html>Request blocked by AWS WAF</html>",
+        );
+        assert_eq!(blocked.vendor, Some(WafVendor::AwsWaf));
+        assert!(blocked.blocking, "{blocked:?}");
+    }
+
+    #[test]
+    fn detects_sucuri_and_fastly_headers() {
+        let s =
+            detect_cloudflare_flat(200, &headers(&[("x-sucuri-id", "123")]), b"<html>ok</html>");
+        assert_eq!(s.vendor, Some(WafVendor::Sucuri));
+        assert!(!s.blocking);
+        let f = detect_cloudflare_flat(
+            200,
+            &headers(&[("x-fastly-request-id", "abc"), ("server", "Varnish")]),
+            b"<html>ok</html>",
+        );
+        assert_eq!(f.vendor, Some(WafVendor::Fastly));
+        assert!(!f.blocking);
+    }
+
+    #[test]
+    fn generic_deny_markers_need_status_to_block() {
+        let presence = detect_cloudflare_flat(200, &headers(&[]), b"access denied");
+        assert_eq!(presence.vendor, Some(WafVendor::Generic));
+        assert!(!presence.blocking, "{presence:?}");
+        let blocked = detect_cloudflare_flat(403, &headers(&[]), b"access denied");
+        assert!(blocked.blocking, "{blocked:?}");
+        let awselb = detect_cloudflare_flat(
+            403,
+            &headers(&[("server", "awselb/2.0")]),
+            b"<html>403 forbidden</html>",
+        );
+        assert_eq!(awselb.vendor, Some(WafVendor::AwsWaf));
+        assert!(awselb.blocking, "{awselb:?}");
+    }
+
+    #[test]
+    fn status_alone_never_fingerprints_new_vendors() {
+        let bare = detect_cloudflare_flat(403, &headers(&[]), b"<html>not found</html>");
+        assert!(!bare.is_suspected(), "{bare:?}");
     }
 }

@@ -62,7 +62,7 @@ impl Baseline {
             sorted[sorted.len() / 2].body.clone()
         };
         // Aggregate WAF signals across samples (headers + body per sample).
-        // `Cloudflare` wins over `Generic` when both appear; hits are
+        // A specific vendor wins over `Generic` when both appear; hits are
         // deduplicated in first-seen order; blocking sticks if any sample
         // blocked.
         let mut waf_vendor: Option<String> = None;
