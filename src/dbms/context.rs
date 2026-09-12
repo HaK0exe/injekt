@@ -170,10 +170,47 @@ impl DbmsBelief {
             (DbmsKind::MsSql, self.mssql),
             (DbmsKind::Oracle, self.oracle),
         ];
-        candidates
-            .into_iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap_or((DbmsKind::Unknown, 0.0))
+        // Phase 0 bugfix (documenté) : l'ancien `max_by` retournait le
+        // *dernier* max en cas d'égalité (`oracle` sur belief uniforme),
+        // biaisant `compute_calibrated_prior` (+15% si prob > 0.8 est faux
+        // ici) et le `fill_missing_dbms` précoce. Tie-break explicite :
+        // `max - min < 1e-9` (uniforme) ou top-2 à `< 1e-9` → `Unknown`.
+        // L1 par défaut inchangé hors égalité (seuil sous le bruit de
+        // `normalize()`).
+        let mut max = f64::NEG_INFINITY;
+        let mut min = f64::INFINITY;
+        for (_, p) in &candidates {
+            let v = if p.is_finite() { *p } else { 0.0 };
+            if v > max {
+                max = v;
+            }
+            if v < min {
+                min = v;
+            }
+        }
+        if !max.is_finite() || !min.is_finite() {
+            return (DbmsKind::Unknown, 0.0);
+        }
+        if (max - min).abs() < 1e-9 {
+            return (DbmsKind::Unknown, max);
+        }
+        let mut best_kind = DbmsKind::Unknown;
+        let mut best = f64::NEG_INFINITY;
+        let mut second = f64::NEG_INFINITY;
+        for (kind, prob) in candidates {
+            let p = if prob.is_finite() { prob } else { 0.0 };
+            if p > best {
+                second = best;
+                best = p;
+                best_kind = kind;
+            } else if p > second {
+                second = p;
+            }
+        }
+        if (best - second).abs() < 1e-9 {
+            return (DbmsKind::Unknown, best);
+        }
+        (best_kind, best)
     }
 
     pub fn update_with_signal(&mut self, kind: DbmsKind, confidence: f64) {
@@ -439,8 +476,10 @@ pub async fn analyze_context(
         }
 
         // If status == 500 or significant difference from baseline, single quote broke query
+        // Phase 0 : erreur transport (`status == 0`, body vide, non comptée
+        // dans `fetch_probe_simple`) ne doit jamais valoir `quote_broke`.
         let sim = adaptive_similarity(&baseline_body, &body);
-        let quote_broke = status == 500 || sim < 0.65;
+        let quote_broke = status != 0 && (status == 500 || sim < 0.65);
 
         if quote_broke && probes_sent < MAX_CONTEXT_PROBES && !cancel.is_cancelled() {
             // Probe 2: Try comment closure `param_value'-- ` to verify single-quote context
@@ -488,12 +527,14 @@ pub async fn analyze_context(
             && !cancel.is_cancelled()
         {
             let plus_large = format!("{base_val}+999999");
-            let (body_large, _elapsed, _status_large) =
+            let (body_large, _elapsed, status_large) =
                 fetch_probe_simple(client, state, cancel, target, param, &plus_large, raw).await;
             probes_sent = probes_sent.saturating_add(1);
 
             let sim_large = adaptive_similarity(&baseline_body, &body_large);
-            if sim_large < 0.70 {
+            // Phase 0 : erreur transport (status 0 / body vide) ne confirme
+            // jamais le contexte numérique.
+            if status_large != 0 && !body_large.is_empty() && sim_large < 0.70 {
                 debug!("context probe: arithmetic confirmed numeric bare context");
                 context.quote = QuoteContext::None;
                 context.numeric = true;
@@ -525,7 +566,9 @@ pub async fn analyze_context(
             error_evidence = Some(evidence);
         } else {
             let sim = adaptive_similarity(&baseline_body, &body);
-            if (status == 500 || sim < 0.65)
+            // Phase 0 : même garde transport que probe 1.
+            if status != 0
+                && (status == 500 || sim < 0.65)
                 && probes_sent < MAX_CONTEXT_PROBES
                 && !cancel.is_cancelled()
             {
@@ -567,13 +610,19 @@ async fn fetch_probe_simple(
     let start = Instant::now();
     let resp = client.send_with_retry(spec, cancel).await;
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-    state.write().await.increment_requests();
 
     match resp {
         Ok(r) => {
             let status = r.status().as_u16();
             match client.read_body_string_with_timeout(r).await {
-                Ok(body) => (body, elapsed, status),
+                Ok(body) => {
+                    // Succès transport : seule issue comptée. Un body vide
+                    // légitime (200 vide) reste compté (similarité ~1.0 de
+                    // toute façon) ; seules les erreurs transport (ci-dessous,
+                    // body vide + status 0) ne sont pas comptées (Phase 0).
+                    state.write().await.increment_requests();
+                    (body, elapsed, status)
+                }
                 Err(e) => {
                     warn!(error=%e, "context probe body read failed");
                     (String::new(), elapsed, 0)
@@ -613,16 +662,19 @@ fn build_spec_for_context(
             if !matched {
                 pairs.push((param.name.clone(), payload.to_owned()));
             }
-            let mut query_str = String::new();
-            for (i, (k, v)) in pairs.iter().enumerate() {
-                if i > 0 {
-                    query_str.push('&');
+            // Phase 0 bugfix (documenté) : l'ancienne concat `k=v` brute
+            // n'encodait rien (`'`/`"`/espace/`+` passés crus, `+` décodé en
+            // espace côté serveur → `1+0` devenait `1 0`). `query_pairs_mut`
+            // (form_urlencoded) percent-encode (`'`→`%27`, `+`→`%2B`, …) ;
+            // `query_pairs()` côté serveur décode à l'identique, L1
+            // byte-identique sur payloads alphanumériques.
+            {
+                let mut qp = url.query_pairs_mut();
+                qp.clear();
+                for (k, v) in &pairs {
+                    qp.append_pair(k, v);
                 }
-                query_str.push_str(k);
-                query_str.push('=');
-                query_str.push_str(v);
             }
-            url.set_query(Some(&query_str));
 
             let mut headers = http::HeaderMap::new();
             if let Some(r) = raw {
@@ -846,5 +898,64 @@ mod tests {
         };
         let ctx_sort = infer_passive_context(&sort_param, None);
         assert!(ctx_sort.order_by);
+    }
+
+    #[test]
+    fn test_top_candidate_tie_break_returns_unknown() {
+        // Phase 0 : uniforme (ancien `max_by` → `oracle`, dernier max)
+        // doit retourner `Unknown`.
+        let uniform = DbmsBelief::uniform();
+        let (kind, prob) = uniform.top_candidate();
+        assert_eq!(kind, DbmsKind::Unknown);
+        assert!((prob - 0.25).abs() < 1e-12);
+        // Near-tie sous 1e-9 → Unknown.
+        let near = DbmsBelief {
+            mysql: 0.250_000_000_000_5,
+            postgres: 0.25,
+            mssql: 0.25,
+            oracle: 0.25,
+        };
+        assert_eq!(near.top_candidate().0, DbmsKind::Unknown);
+        // Top-2 ex æquo (mysql == postgres >> autres) → Unknown.
+        let duel = DbmsBelief {
+            mysql: 0.4,
+            postgres: 0.4,
+            mssql: 0.1,
+            oracle: 0.1,
+        };
+        assert_eq!(duel.top_candidate().0, DbmsKind::Unknown);
+        // Gagnant franc inchangé.
+        let mut clear = DbmsBelief::uniform();
+        clear.update_with_signal(DbmsKind::Postgres, 0.9);
+        assert_eq!(clear.top_candidate().0, DbmsKind::Postgres);
+    }
+
+    #[test]
+    fn test_build_spec_query_percent_encodes_payload() {
+        use crate::target::{parameters::ParameterLocation, url::TargetUrl};
+        let target = TargetUrl::parse("http://example.com/?id=1&other=a", true).unwrap();
+        let param = TargetParameter {
+            name: "id".to_owned(),
+            original_value: "1".to_owned(),
+            location: ParameterLocation::Query,
+        };
+        for payload in ["1'", "1\"-- ", "1+0", "1+999999", "a b&c=d"] {
+            let spec = build_spec_for_context(&target, &param, payload, None);
+            // Roundtrip : le serveur décode à l'identique.
+            let parsed = url::Url::parse(&spec.url).unwrap();
+            let decoded = parsed
+                .query_pairs()
+                .find(|(k, _)| k == "id")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default();
+            assert_eq!(decoded, payload, "roundtrip {payload}");
+            // Caractères à risque encodés dans l'URL brute.
+            if payload.contains('\'') {
+                assert!(spec.url.contains("%27"), "quote encodée: {}", spec.url);
+            }
+            if payload.contains('+') {
+                assert!(spec.url.contains("%2B"), "plus encodé: {}", spec.url);
+            }
+        }
     }
 }
