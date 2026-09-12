@@ -5,7 +5,8 @@ use crate::{
     detection::{
         baseline,
         scanner::scheduler::{
-            EarlyStop, RequestBudget, Scheduler, cost_for, ensure_union_starvation_guard, evi_for,
+            EarlyStop, RequestBudget, Scheduler, cost_for, cost_for_with_ttfb,
+            ensure_union_starvation_guard, evi_for,
         },
     },
     error::InjektError,
@@ -150,6 +151,54 @@ pub fn is_ignored(status: u16, codes: &[u16]) -> bool {
     codes.contains(&status)
 }
 
+/// `true` when every baseline sample is a server error (5xx: origin down,
+/// CF 520–524, …). Detection differentials against error pages are
+/// meaningless (static pages refute everything), so the caller warns loudly
+/// instead of burning hundreds of probes silently. Empty = `false`
+/// (no samples is a different failure, handled upstream). Pure and
+/// unit-testable.
+#[must_use]
+pub fn baseline_all_error(statuses: &[u16]) -> bool {
+    !statuses.is_empty() && statuses.iter().all(|s| (500..600).contains(s))
+}
+
+/// Mid-technique `--max-duration` check for the long per-technique loops
+/// (boolean payloads, ORDER BY enumeration, union matrix). Warns
+/// (operator-visible, once per trip — callers stop right after) and returns
+/// `true` when the shared deadline has passed so the technique ends early
+/// and its outcome folds normally. `None` deadline = unlimited no-op.
+fn check_deadline(deadline: Option<std::time::Instant>, param: &str, technique: &str) -> bool {
+    if BudgetConfig::is_past_deadline(deadline) {
+        warn!(
+            param,
+            technique, "max-duration exceeded inside probes, stopping technique early"
+        );
+        return true;
+    }
+    false
+}
+
+/// Auto-tampers applied when a blocking WAF is seen and the user gave none:
+/// `space2comment` (space-signature bypass) + `randomcase` (case-signature
+/// bypass, 429 rate-limit hardening). Pure and unit-testable. HPP/chunked
+/// are never auto-enabled (request-shape changes stay explicit opt-in).
+#[must_use]
+pub fn waf_auto_tampers() -> Vec<Tamper> {
+    vec![Tamper::Space2Comment, Tamper::RandomCase]
+}
+
+/// Resolve the effective tamper set for a run: the WAF auto-pair when
+/// `waf_blocking` fired and the user gave none, otherwise the user set
+/// unchanged (explicit `--tamper` always wins). Pure and unit-testable.
+#[must_use]
+pub fn resolve_effective_tampers(waf_blocking: bool, user_tampers: &[Tamper]) -> Vec<Tamper> {
+    if waf_blocking && user_tampers.is_empty() {
+        waf_auto_tampers()
+    } else {
+        user_tampers.to_vec()
+    }
+}
+
 /// Build a synthetic raw request from `--data` so body params are preserved
 /// through baseline + injection (same path as `--raw-file`).
 /// Uses [`sniff_kind`] from `target::structured` for robust content-type
@@ -198,6 +247,9 @@ pub struct BudgetConfig {
     pub threads: usize,
     pub level: u8,
     pub request_budget: Option<usize>,
+    /// Global detection time budget in seconds (Phase 3 `--max-duration`).
+    /// `None` (default) = unlimited, historical behaviour byte-identical.
+    pub max_duration_secs: Option<u64>,
 }
 
 impl Default for BudgetConfig {
@@ -206,7 +258,62 @@ impl Default for BudgetConfig {
             threads: 5,
             level: 1,
             request_budget: None,
+            max_duration_secs: None,
         }
+    }
+}
+
+impl BudgetConfig {
+    /// `true` once `started` exceeds the configured `max_duration_secs`.
+    /// `None` (default) never trips. Pure and unit-testable.
+    #[must_use]
+    pub fn is_over_max_duration(
+        started: std::time::Instant,
+        max_duration_secs: Option<u64>,
+    ) -> bool {
+        let Some(max) = max_duration_secs else {
+            return false;
+        };
+        started.elapsed().as_secs() >= max
+    }
+
+    /// Shared `--max-duration` deadline for mid-technique checks.
+    /// `None` (default) = unlimited: every `is_past_deadline` call is a
+    /// no-op and detection stays byte-identical. Pure and unit-testable.
+    #[must_use]
+    pub fn detection_deadline(
+        started: std::time::Instant,
+        max_duration_secs: Option<u64>,
+    ) -> Option<std::time::Instant> {
+        max_duration_secs.and_then(|max| started.checked_add(std::time::Duration::from_secs(max)))
+    }
+
+    /// `true` once the shared `--max-duration` deadline has passed.
+    /// `None` = unlimited (never trips). Pure and unit-testable.
+    #[must_use]
+    pub fn is_past_deadline(deadline: Option<std::time::Instant>) -> bool {
+        deadline.is_some_and(|d| std::time::Instant::now() >= d)
+    }
+
+    /// `true` once the shared `request_count` reaches `request_budget`.
+    /// `None` (default) never trips: historical behaviour byte-identical
+    /// (A1 evasion needs ~1032 req live — no default cap, ever).
+    ///
+    /// CODE calibration (`--request-budget N`, OPT-IN): the per-parameter
+    /// scheduler already caps each param at the same value via
+    /// [`RequestBudget::max_requests`], but schedulers are per-param
+    /// instances — only this check against the shared
+    /// `SessionState::request_count` is a true global plafond. Cooperative:
+    /// the running technique finishes, no new one starts, the run ends in
+    /// clean [`EngineState::Done`] (never an error, never a new finding).
+    /// Concurrent params may overshoot by one technique each.
+    /// Pure and unit-testable.
+    #[must_use]
+    pub fn is_over_request_budget(request_count: u64, request_budget: Option<usize>) -> bool {
+        let Some(max) = request_budget else {
+            return false;
+        };
+        u64::try_from(max).is_ok_and(|m| request_count >= m)
     }
 }
 
@@ -423,6 +530,16 @@ pub struct Engine {
     cancel: CancellationToken,
     scrubber: Scrubber,
     baseline_cache: Option<Arc<crate::recon::BaselineCache>>,
+}
+
+/// Outcome of one concurrent baseline fetch (Phase 3, `join_all` borné).
+/// `BodyReadFailed` (compté, retry) vs `TransportFailed` (non compté, retry)
+/// préserve la comptabilité historique ; `Cancelled` sort proprement.
+enum BaselineOutcome {
+    Sample(baseline::Sample),
+    BodyReadFailed,
+    TransportFailed(String),
+    Cancelled,
 }
 
 impl Engine {
@@ -1009,6 +1126,10 @@ impl Engine {
     }
 
     /// Uncached baseline collection: 3 samples + WAF-aware tampers/opts.
+    ///
+    /// Phase 3: les 3 samples sont émis en concurrent (`join_all` borné à 3,
+    /// sans `spawn` unbounded) ; `attempts <= 6` borne les envois, seuls les
+    /// ratés sont rejoués. Chaque branche vérifie le `CancellationToken`.
     #[allow(clippy::too_many_lines)]
     async fn collect_baseline_uncached(
         &self,
@@ -1026,55 +1147,100 @@ impl Engine {
         // an empty body scores as similarity ~0 / confidence 0.75 (false
         // positive). Transport errors (`Timeout`, stream reset) are retryable
         // and must never enter the baseline.
+        //
+        // Phase 3: the 3 samples are fetched concurrently (`join_all`, borné
+        // à 3, sans `spawn` unbounded) so `3×5s` TTFB coûte ~5-6s au lieu de
+        // 16s séquentiels. `attempts <= 6` borne le total d'envois
+        // individuels ; seuls les samples ratés sont rejoués au tour suivant.
+        // Chaque branche vérifie le `CancellationToken` avant envoi (le
+        // `send_with_retry` + `read_body` restent annulables via le token).
+        // `rate_limit acquire_cancellable` + jitter restent dans
+        // `send_with_retry`, donc partagés et bornés comme avant.
         let mut attempts = 0usize;
         while samples.len() < 3 && attempts < 6 {
-            attempts += 1;
             if self.cancel.is_cancelled() {
                 break;
             }
-            let start = Instant::now();
-            let spec = raw_request.map_or_else(
-                || RequestSpec::get(target.as_str().to_owned()),
-                |raw| request_spec_from_raw(target, raw),
-            );
-            let resp = self.client.send_with_retry(spec, &self.cancel).await;
-            let elapsed = start.elapsed();
-            match resp {
-                Ok(r) => {
-                    let status = r.status().as_u16();
-                    // Clone headers BEFORE the body read consumes the response.
-                    // Values truncated to 128 chars (OPSEC: bounds Set-Cookie
-                    // token retention); WAF detection only needs `contains`.
-                    let raw_headers: Vec<(String, String)> = r
-                        .headers()
-                        .iter()
-                        .filter_map(|(name, value)| {
-                            value.to_str().ok().map(|raw| {
-                                let mut kept = raw.to_owned();
-                                if kept.len() > crate::detection::waf::HEADER_VALUE_KEEP {
-                                    kept.truncate(crate::detection::waf::HEADER_VALUE_KEEP);
-                                }
-                                (name.as_str().to_ascii_lowercase(), kept)
-                            })
-                        })
-                        .collect();
-                    let body = match self.client.read_body_with_timeout(r).await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(error=%e, "baseline body read failed, retrying sample");
-                            self.state.write().await.increment_requests();
-                            continue;
+            let needed =
+                (3usize.saturating_sub(samples.len())).min(6usize.saturating_sub(attempts));
+            if needed == 0 {
+                break;
+            }
+            attempts = attempts.saturating_add(needed);
+            let futs: Vec<_> = (0..needed)
+                .map(|_| async {
+                    if self.cancel.is_cancelled() {
+                        return BaselineOutcome::Cancelled;
+                    }
+                    let start = Instant::now();
+                    let spec = raw_request.map_or_else(
+                        || RequestSpec::get(target.as_str().to_owned()),
+                        |raw| request_spec_from_raw(target, raw),
+                    );
+                    let resp = self.client.send_with_retry(spec, &self.cancel).await;
+                    let elapsed = start.elapsed();
+                    match resp {
+                        Ok(r) => {
+                            let status = r.status().as_u16();
+                            // Clone headers BEFORE the body read consumes the response.
+                            // Values truncated to 128 chars (OPSEC: bounds Set-Cookie
+                            // token retention); WAF detection only needs `contains`.
+                            let raw_headers: Vec<(String, String)> = r
+                                .headers()
+                                .iter()
+                                .filter_map(|(name, value)| {
+                                    value.to_str().ok().map(|raw| {
+                                        let mut kept = raw.to_owned();
+                                        if kept.len() > crate::detection::waf::HEADER_VALUE_KEEP {
+                                            kept.truncate(crate::detection::waf::HEADER_VALUE_KEEP);
+                                        }
+                                        (name.as_str().to_ascii_lowercase(), kept)
+                                    })
+                                })
+                                .collect();
+                            match self.client.read_body_with_timeout(r).await {
+                                Ok(body) => BaselineOutcome::Sample(baseline::Sample {
+                                    status,
+                                    body,
+                                    duration: elapsed,
+                                    headers: raw_headers,
+                                }),
+                                Err(_) => BaselineOutcome::BodyReadFailed,
+                            }
                         }
-                    };
-                    samples.push(baseline::Sample {
-                        status,
-                        body,
-                        duration: elapsed,
-                        headers: raw_headers,
-                    });
-                    self.state.write().await.increment_requests();
+                        Err(e) => BaselineOutcome::TransportFailed(format!(
+                            "baseline request failed: {e}"
+                        )),
+                    }
+                })
+                .collect();
+            // Borné à `needed <= 3`, aucun `spawn` (pas de tâche détachée).
+            let results = futures::future::join_all(futs).await;
+            for outcome in results {
+                if self.cancel.is_cancelled() {
+                    break;
                 }
-                Err(e) => warn!(error=%e, "baseline request failed"),
+                match outcome {
+                    BaselineOutcome::Sample(s) => {
+                        if samples.len() < 3 {
+                            samples.push(s);
+                            self.state.write().await.increment_requests();
+                        }
+                    }
+                    BaselineOutcome::BodyReadFailed => {
+                        warn!("baseline body read failed, retrying sample");
+                        self.state.write().await.increment_requests();
+                    }
+                    BaselineOutcome::Cancelled => {
+                        // Sortie propre : ni compté ni warn.
+                    }
+                    BaselineOutcome::TransportFailed(msg) => {
+                        warn!(error=%msg, "baseline request failed");
+                    }
+                }
+                if samples.len() >= 3 {
+                    break;
+                }
             }
         }
         if samples.is_empty() {
@@ -1095,12 +1261,29 @@ impl Engine {
         {
             let req_done = self.state.read().await.request_count();
             let req_delta = req_done.saturating_sub(req_before);
+            // Status codes are logged so a `blocking=true` verdict stays
+            // auditable (e.g. one corroborated 403 among 200s explains the
+            // WAF warn below without a body dump).
+            let statuses: Vec<u16> = baseline.status_codes.clone();
             info!(
                 elapsed_s = phase_started.elapsed().as_secs_f64(),
                 requests = req_delta,
-                "baseline done in {:.1}s, {req_delta} req",
+                statuses = ?statuses,
+                "baseline done in {:.1}s, {req_delta} req (statuses: {statuses:?})",
                 phase_started.elapsed().as_secs_f64(),
             );
+            // Origin erroring behind the CDN (CF 520–524, 5xx): every
+            // differential below compares static error pages, so a full
+            // detection run is void by construction — say so loudly instead
+            // of burning the budget silently. Scan continues (transient
+            // blips happen) but the verdict must be read as "unreachable",
+            // never as "not injectable".
+            if baseline_all_error(&statuses) {
+                warn!(
+                    statuses = ?statuses,
+                    "baseline: all samples server-error (5xx) — origin unreachable, detection differentials will be meaningless"
+                );
+            }
         }
         // C6 trace: baseline samples as hashes only (never clear body/headers).
         // Guarantees a non-empty RAM-only trace even on clean targets.
@@ -1162,9 +1345,9 @@ impl Engine {
             && self.config.evasion.tampers.is_empty()
         {
             info!(
-                "WAF suspected and no --tamper given — auto-enabling space2comment for detection"
+                "WAF suspected and no --tamper given — auto-enabling space2comment,randomcase for detection"
             );
-            vec![Tamper::Space2Comment]
+            waf_auto_tampers()
         } else {
             self.config.evasion.tampers.clone()
         };
@@ -1293,6 +1476,7 @@ impl Engine {
             Arc::new(indicatif::ProgressBar::hidden())
         };
         let concurrency = self.config.budget.threads.clamp(1, 32);
+        let detection_started = Instant::now();
         let shared = Arc::new(DetectionShared {
             target: target.clone(),
             target_str: target_str.to_owned(),
@@ -1302,6 +1486,7 @@ impl Engine {
             context: context.clone(),
             dbms_belief: dbms_belief.clone(),
             context_probes,
+            started: detection_started,
         });
         let stream = futures::stream::iter(to_test)
             .map(|param| {
@@ -1834,6 +2019,9 @@ struct DetectionShared {
     /// Adaptive context probes already spent (`<=8` by `MAX_CONTEXT_PROBES`):
     /// seeded into every per-parameter scheduler budget.
     context_probes: usize,
+    /// Shared detection clock for `--max-duration` (Phase 3): set once in
+    /// `run_detection`, read in every `run_detection_for_param` iteration.
+    started: Instant,
 }
 
 /// CLI technique name for a [`TechniqueKind`].
@@ -2009,11 +2197,17 @@ fn order_by_prefix_for_context(context: &InjectionContext) -> &'static str {
 /// conservé). Avec `None` (défaut OFF), `boost = None` → `1.0` neutre,
 /// **byte-identique** au comportement historique (`score == evi / cost`,
 /// aucune lecture/écriture disque).
+///
+/// Phase 3 : `mean_ms` (baseline TTFB) module le coût `time` via
+/// [`cost_for_with_ttfb`] (`mean <= 2000` ou `0` = coût statique inchangé,
+/// byte-identique). Seul le canal lent `time` est gonflé sur cible lente
+/// (les différentiels rapides gardent leur priorité).
 fn build_scheduler_for_param(
     config: &EngineConfig,
     param_key: &str,
     hyps: &[Hypothesis],
     context_probes: usize,
+    mean_ms: f64,
 ) -> Scheduler {
     let mut scheduler = Scheduler::new(
         RequestBudget::new(config.budget.request_budget, None),
@@ -2030,7 +2224,12 @@ fn build_scheduler_for_param(
             continue;
         }
         let evi = evi_for(hyp.technique, hyp.posterior);
-        let cost = cost_for(hyp.technique);
+        let base = cost_for(hyp.technique);
+        let cost = if hyp.technique == TechniqueKind::Time {
+            cost_for_with_ttfb(base, mean_ms)
+        } else {
+            base
+        };
         // C13 : OFF (`None`) = `None` → boost neutre 1.0, byte-identique.
         // ON = boost `1+alpha` (`alpha<=0.5`, `[0.5,1.5]`) puis clamp final
         // `[0.5,2.0]` via `scheduled_boost_for` (jamais de veto).
@@ -2124,7 +2323,13 @@ async fn run_detection_for_param(
             )
         })
         .collect();
-    let mut scheduler = build_scheduler_for_param(config, &param_key, &hyps, shared.context_probes);
+    let mut scheduler = build_scheduler_for_param(
+        config,
+        &param_key,
+        &hyps,
+        shared.context_probes,
+        shared.baseline.mean_ms,
+    );
     log_scheduler_state(&scheduler, &param_key, "start");
     let mut executed_kinds: Vec<TechniqueKind> = Vec::with_capacity(hyps.len());
     // Live belief: starts as the adaptive `<=8`-probe belief, then any
@@ -2136,6 +2341,36 @@ async fn run_detection_for_param(
     while let Some(probe) = scheduler.pop() {
         if cancel.is_cancelled() {
             break;
+        }
+        // Phase 3 `--max-duration`: budget temps global partagé (voir
+        // `DetectionShared::started`). `None` = illimité, byte-identique.
+        if BudgetConfig::is_over_max_duration(shared.started, config.budget.max_duration_secs) {
+            warn!(
+                param = param_key,
+                max_duration_secs = ?config.budget.max_duration_secs,
+                "max-duration exceeded, stopping detection early"
+            );
+            break;
+        }
+        // CODE calibration `--request-budget`: plafond global OPT-IN sur le
+        // `request_count` partagé (les schedulers sont per-param : seul ce
+        // compteur global borne le total N1/N2). `None` = illimité,
+        // byte-identique (le helper court-circuite sans lock supplémentaire
+        // au-delà de ce `read`). Coopératif : la technique en cours finit,
+        // aucune nouvelle ne démarre, fin en `Done` propre (ni erreur, ni
+        // finding inventé). Un léger dépassement reste possible sous
+        // concurrence (un tour par param en vol).
+        {
+            let spent = state.read().await.request_count();
+            if BudgetConfig::is_over_request_budget(spent, config.budget.request_budget) {
+                warn!(
+                    param = param_key,
+                    request_budget = ?config.budget.request_budget,
+                    requests = spent,
+                    "request-budget exceeded, stopping detection early"
+                );
+                break;
+            }
         }
         let Some(hyp) = hyps.iter_mut().find(|h| h.technique == probe.technique) else {
             continue;
@@ -2149,6 +2384,13 @@ async fn run_detection_for_param(
         if hyp.cost_spent > 0 && hyp.is_terminal() {
             continue;
         }
+        // Per-family veto streak: a new technique family starts with a fresh
+        // negative counter, so the N1/N2 veto can only trip on a single
+        // family spending >= 25 negative requests — never by accumulating
+        // across never-compared families (boolean-negative != nosql-negative;
+        // cross-family starvation would be a silent false negative).
+        // `confirmed` survives (only `reset_for_new_param` clears it).
+        scheduler.early_stop_mut().reset_negative_streak();
         let before_cost = hyp.cost_spent;
         run_one_technique(
             client,
@@ -2186,11 +2428,38 @@ async fn run_detection_for_param(
         }
     }
     // Starvation guard: `union` keeps >= 1 probe when enabled, even if the
-    // score order truncated it away.
+    // score order truncated it away. Skipped once the global `--request-budget`
+    // is spent (le plafond gagne sur la couverture ; l'épuisement per-param
+    // implique l'épuisement global car le total partagé majore tout total
+    // per-param, donc un seul test global suffit), and once `--max-duration`
+    // is exceeded (a hard user time budget must never be silently overshot:
+    // a single L2 union run can park ~100 req / ~100s on a slow target, as
+    // seen live when detection ran 205s under `--max-duration 120`).
+    // NOTE: the EarlyStop veto is intentionally NOT consulted here — the
+    // guard's contract is union coverage even on vetoed params (the veto
+    // still kills error/time/json/nosql/oob/stacked, saving the bulk).
     let union_enabled = is_technique_enabled(&config.techniques, TechniqueKind::Union);
     let pre_guard_len = executed_kinds.len();
     ensure_union_starvation_guard(&mut executed_kinds, union_enabled);
-    if executed_kinds.len() > pre_guard_len
+    let budget_spent = BudgetConfig::is_over_request_budget(
+        state.read().await.request_count(),
+        config.budget.request_budget,
+    );
+    let duration_spent =
+        BudgetConfig::is_over_max_duration(shared.started, config.budget.max_duration_secs);
+    if budget_spent {
+        debug!(
+            param = param_key,
+            request_budget = ?config.budget.request_budget,
+            "request-budget spent, skipping union starvation guard"
+        );
+    } else if duration_spent {
+        warn!(
+            param = param_key,
+            max_duration_secs = ?config.budget.max_duration_secs,
+            "max-duration exceeded, skipping union starvation guard"
+        );
+    } else if executed_kinds.len() > pre_guard_len
         && !cancel.is_cancelled()
         && let Some(hyp) = hyps
             .iter_mut()
@@ -2212,6 +2481,18 @@ async fn run_detection_for_param(
         )
         .await;
         scheduler.record_outcome(&param_key, hyp.is_confirmed(), hyp.cost_spent.max(1));
+    }
+    // Visibilité du plafond OPT-IN : le scheduler per-param est seedé avec la
+    // même valeur (`budget_total`), donc son épuisement confirme l'arrêt sur
+    // budget (le `warn!` global ci-dessus a déjà annoncé le stop). `None` =
+    // `is_exhausted()` toujours faux : 0 log, chemin inchangé.
+    if scheduler.budget().is_exhausted() {
+        info!(
+            param = param_key,
+            request_budget = ?config.budget.request_budget,
+            spent = scheduler.budget_spent(),
+            "request-budget exhausted for param, detection stopped early (clean Done)"
+        );
     }
     log_scheduler_state(&scheduler, &param_key, "done");
 }
@@ -2326,6 +2607,12 @@ async fn dispatch_probe_first_half(
 ) {
     let opts = ProbeOpts::new(config.evasion.hpp, config.evasion.chunked);
     let raw = raw_request.as_ref().as_ref();
+    // Shared `--max-duration` deadline for the long per-technique loops
+    // (boolean payloads, ORDER BY enumeration, union matrix): a single
+    // technique must not silently overshoot an explicit user budget.
+    // `None` = unlimited, historical behaviour byte-identical.
+    let deadline =
+        BudgetConfig::detection_deadline(shared.started, config.budget.max_duration_secs);
     match kind {
         TechniqueKind::Boolean => {
             test_boolean_bounded(
@@ -2347,6 +2634,7 @@ async fn dispatch_probe_first_half(
                 config.seed,
                 &shared.context,
                 &shared.dbms_belief,
+                deadline,
             )
             .await;
         }
@@ -2418,6 +2706,7 @@ async fn dispatch_probe_first_half(
                 config.seed,
                 &shared.context,
                 &shared.dbms_belief,
+                deadline,
             )
             .await;
         }
@@ -4115,6 +4404,7 @@ async fn test_boolean_bounded(
     seed: Option<u64>,
     context: &InjectionContext,
     dbms_belief: &DbmsBelief,
+    deadline: Option<std::time::Instant>,
 ) {
     let (top_dbms, top_prob) = dbms_belief.top_candidate();
     debug!(param = param.key(), context = context.summary(), %top_dbms, top_prob, "boolean: context-aware detection");
@@ -4136,6 +4426,12 @@ async fn test_boolean_bounded(
         .take(payload_budget(level, 2, payloads.len()))
     {
         if cancel.is_cancelled() {
+            break;
+        }
+        // Shared `--max-duration` deadline: stop the technique early so one
+        // payload family cannot silently overshoot an explicit user budget.
+        // `None` deadline = no-op. Outcome folds normally below.
+        if check_deadline(deadline, &param.key(), "boolean") {
             break;
         }
         let mut found = false;
@@ -5953,6 +6249,7 @@ async fn enumerate_columns_via_order_by(
     ignore_codes: &[u16],
     seed: Option<u64>,
     context: &InjectionContext,
+    deadline: Option<std::time::Instant>,
 ) -> Option<usize> {
     // Seeded tamper RNG (`--seed`): same seed yields identical payloads;
     // `None` preserves the historical OS-random behaviour.
@@ -5970,6 +6267,11 @@ async fn enumerate_columns_via_order_by(
     let prefix = order_by_prefix_for_context(context);
     for i in 1..=max_order_by_cols {
         if cancel.is_cancelled() {
+            return None;
+        }
+        // Shared `--max-duration` deadline: stop enumeration early so one
+        // technique cannot silently overshoot an explicit user budget.
+        if check_deadline(deadline, &param.key(), "union-order-by") {
             return None;
         }
         let base = crate::techniques::union::payloads::order_by_payload_for(prefix, i);
@@ -6005,10 +6307,16 @@ async fn enumerate_columns_via_order_by(
         }
     }
     // Undetermined is actionable (yellow warn, not a drowned `info!`): the
-    // operator can widen the enumeration with `--level 2` (15 cols) or
-    // `--level 3` (20 cols) instead of assuming "not injectable".
+    // operator can widen the enumeration instead of assuming "not
+    // injectable". The hint is level-aware so L2 runs are not told to
+    // "try --level 2" again.
+    let level_hint = match level {
+        0 | 1 => "try --level 2 (15 cols)",
+        2 => "try --level 3 (20 cols)",
+        _ => "already at max enumeration (20 cols)",
+    };
     warn!(
-        "ORDER BY enumeration inconclusive: no error up to {max_order_by_cols} columns — try --level 2 (15 cols) or --level 3 (20 cols)"
+        "ORDER BY enumeration inconclusive: no error up to {max_order_by_cols} columns — {level_hint}"
     );
     None
 }
@@ -6034,6 +6342,7 @@ async fn test_union_bounded(
     seed: Option<u64>,
     context: &InjectionContext,
     dbms_belief: &DbmsBelief,
+    deadline: Option<std::time::Instant>,
 ) {
     if context.order_by {
         debug!(
@@ -6075,6 +6384,7 @@ async fn test_union_bounded(
         ignore_codes,
         seed,
         context,
+        deadline,
     )
     .await;
     // DBMS-aware UNION cores once the belief is actionable (>= 0.85);
@@ -6097,6 +6407,11 @@ async fn test_union_bounded(
         if cancel.is_cancelled() {
             return;
         }
+        // Shared `--max-duration` deadline: stop the matrix early so one
+        // technique cannot silently overshoot an explicit user budget.
+        if check_deadline(deadline, &param.key(), "union") {
+            return;
+        }
         let cols = *cols;
         let payloads = union_payloads_for(dbms_label, cols);
         for p in payloads
@@ -6104,6 +6419,11 @@ async fn test_union_bounded(
             .take(payload_budget(level, 1, payloads.len()))
         {
             if cancel.is_cancelled() {
+                return;
+            }
+            // Shared `--max-duration` deadline: stop the matrix early (see
+            // per-cols check above).
+            if check_deadline(deadline, &param.key(), "union") {
                 return;
             }
             for trans in &tamper_sets {
@@ -6164,6 +6484,10 @@ async fn test_union_bounded(
     // Secondary pass: fallback heuristic if primary (inferred) yielded nothing
     for cols in fallback {
         if cancel.is_cancelled() {
+            break;
+        }
+        // Shared `--max-duration` deadline (see primary pass above).
+        if check_deadline(deadline, &param.key(), "union") {
             break;
         }
         let payloads = union_payloads_for(dbms_label, cols);
@@ -7709,5 +8033,182 @@ mod orchestrator_gating_tests {
             infer_signal_and_trials(TechniqueKind::Error, &[unconfirmed], true),
             (0.4, 0)
         );
+    }
+
+    #[test]
+    fn budget_request_budget_defaults_to_none_and_helper() {
+        // CODE calibration: default None = unlimited, byte-identical.
+        // A1 evasion (~1032 req live) must never trip a default cap.
+        let cfg = super::BudgetConfig::default();
+        assert_eq!(cfg.request_budget, None);
+        assert!(!super::BudgetConfig::is_over_request_budget(0, None));
+        assert!(!super::BudgetConfig::is_over_request_budget(10_000, None));
+        // Zero budget trips immediately (early-break path, cooperative stop).
+        assert!(super::BudgetConfig::is_over_request_budget(0, Some(0)));
+        assert!(super::BudgetConfig::is_over_request_budget(11, Some(0)));
+        // Boundary: `>=` trips exactly at the cap, never before.
+        assert!(!super::BudgetConfig::is_over_request_budget(24, Some(25)));
+        assert!(super::BudgetConfig::is_over_request_budget(25, Some(25)));
+        assert!(super::BudgetConfig::is_over_request_budget(666, Some(25)));
+        assert!(!super::BudgetConfig::is_over_request_budget(
+            1031,
+            Some(1032)
+        ));
+        assert!(super::BudgetConfig::is_over_request_budget(
+            1032,
+            Some(1032)
+        ));
+    }
+
+    #[test]
+    fn budget_max_duration_defaults_to_none_and_helper() {
+        // Phase 3: default None = unlimited, byte-identical.
+        let cfg = super::BudgetConfig::default();
+        assert_eq!(cfg.max_duration_secs, None);
+        let now = std::time::Instant::now();
+        assert!(!super::BudgetConfig::is_over_max_duration(now, None));
+        // Zero budget trips immediately (early-break path).
+        assert!(super::BudgetConfig::is_over_max_duration(now, Some(0)));
+        // Future start + generous budget does not trip.
+        assert!(!super::BudgetConfig::is_over_max_duration(now, Some(3600)));
+        // Past start beyond budget trips.
+        let past = now
+            .checked_sub(std::time::Duration::from_secs(10))
+            .unwrap_or(now);
+        assert!(super::BudgetConfig::is_over_max_duration(past, Some(5)));
+        assert!(!super::BudgetConfig::is_over_max_duration(past, Some(60)));
+    }
+
+    #[test]
+    fn detection_deadline_none_is_unlimited_noop() {
+        // `None` (default) = no deadline: mid-technique checks no-op,
+        // detection byte-identical.
+        let now = std::time::Instant::now();
+        assert_eq!(super::BudgetConfig::detection_deadline(now, None), None);
+        assert!(!super::BudgetConfig::is_past_deadline(None));
+    }
+
+    #[test]
+    fn detection_deadline_trips_after_budget() {
+        use super::BudgetConfig;
+        let now = std::time::Instant::now();
+        // Zero budget: deadline is (about) now, already past.
+        let zero = BudgetConfig::detection_deadline(now, Some(0)).expect("deadline");
+        assert!(BudgetConfig::is_past_deadline(Some(zero)));
+        // Generous budget: future deadline, not past.
+        let far = BudgetConfig::detection_deadline(now, Some(3600)).expect("deadline");
+        assert!(!BudgetConfig::is_past_deadline(Some(far)));
+        // Past start beyond budget: deadline already behind us.
+        let past = now
+            .checked_sub(std::time::Duration::from_secs(10))
+            .unwrap_or(now);
+        let blown = BudgetConfig::detection_deadline(past, Some(5)).expect("deadline");
+        assert!(BudgetConfig::is_past_deadline(Some(blown)));
+    }
+
+    #[test]
+    fn baseline_all_error_only_on_full_5xx() {
+        // Live case: `[520, 520, 520]` (CF origin-unreachable) must warn.
+        assert!(super::baseline_all_error(&[520, 520, 520]));
+        assert!(super::baseline_all_error(&[500]));
+        assert!(super::baseline_all_error(&[500, 503, 524]));
+        // Healthy or mixed baselines must not warn.
+        assert!(!super::baseline_all_error(&[200, 200, 200]));
+        assert!(!super::baseline_all_error(&[200, 520, 520]));
+        assert!(!super::baseline_all_error(&[403, 403, 403]));
+        assert!(!super::baseline_all_error(&[]));
+    }
+
+    #[test]
+    fn scheduler_ttfb_static_by_default_and_dynamic_when_slow() {
+        use super::build_scheduler_for_param;
+        use crate::detection::scanner::scheduler::{cost_for, cost_for_with_ttfb};
+        let cfg = super::EngineConfig::default();
+        let hyps: Vec<Hypothesis> = vec![
+            Hypothesis::new(
+                "id@query".to_owned(),
+                TechniqueKind::Boolean,
+                DbmsBelief::uniform(),
+                InjectionContext::new(),
+            ),
+            Hypothesis::new(
+                "id@query".to_owned(),
+                TechniqueKind::Time,
+                DbmsBelief::uniform(),
+                InjectionContext::new(),
+            ),
+        ];
+        // mean 0 => static costs (L1 byte-identical).
+        let sched = build_scheduler_for_param(&cfg, "id@query", &hyps, 0, 0.0);
+        assert_eq!(sched.len(), 2);
+        let base_time = cost_for(TechniqueKind::Time);
+        assert!((cost_for_with_ttfb(base_time, 0.0) - base_time).abs() < 1e-12);
+        // mean 5s => time cost doubles (3.0 -> 6.0), boolean stays 1.0.
+        let scaled = cost_for_with_ttfb(base_time, 5000.0);
+        assert!((scaled - 6.0).abs() < 1e-12);
+        let sched_slow = build_scheduler_for_param(&cfg, "id@query", &hyps, 0, 5000.0);
+        assert_eq!(sched_slow.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn baseline_concurrent_returns_three_samples() {
+        use crate::{
+            engine::orchestrator::{Engine, EngineConfig},
+            http::{client::HttpClient, jitter::Jitter, rate_limit::RateLimiter},
+            target::url::TargetUrl,
+        };
+        use std::{sync::Arc, time::Duration};
+        use tokio_util::sync::CancellationToken;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("baseline-ok"))
+            .mount(&server)
+            .await;
+
+        let client = HttpClient::builder()
+            .timeout(Duration::from_secs(5))
+            .jitter(Jitter::new(1.0, 0.5).with_min(0))
+            .rate_limiter(Arc::new(RateLimiter::disabled()))
+            .allow_private(true)
+            .build()
+            .expect("client build");
+        let cfg = EngineConfig::test_defaults();
+        let cancel = CancellationToken::new();
+        let engine = Engine::new(cfg, client, cancel);
+        let target =
+            TargetUrl::parse(&format!("{}/?id=1", server.uri()), true).expect("target parse");
+        let collected = engine
+            .collect_baseline_uncached(&target, None)
+            .await
+            .expect("baseline ok")
+            .expect("some baseline");
+        let (baseline, _, _) = collected;
+        assert_eq!(
+            baseline.status_codes.len(),
+            3,
+            "concurrent baseline must return 3 samples"
+        );
+        assert!(baseline.status_codes.iter().all(|c| *c == 200));
+    }
+
+    #[test]
+    fn waf_auto_tampers_are_space2comment_plus_randomcase() {
+        use crate::techniques::tamper::Tamper;
+        assert_eq!(
+            super::waf_auto_tampers(),
+            vec![Tamper::Space2Comment, Tamper::RandomCase]
+        );
+        // Blocking + no user tampers => auto-pair (never HPP/chunked here).
+        assert_eq!(
+            super::resolve_effective_tampers(true, &[]),
+            vec![Tamper::Space2Comment, Tamper::RandomCase]
+        );
+        // Explicit user tampers always win, even when blocking.
+        let user = vec![Tamper::VersionedComment];
+        assert_eq!(super::resolve_effective_tampers(true, &user), user);
+        // No block => user set unchanged (including empty).
+        assert!(super::resolve_effective_tampers(false, &[]).is_empty());
     }
 }
