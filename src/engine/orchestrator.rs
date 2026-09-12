@@ -249,6 +249,9 @@ pub struct BudgetConfig {
     pub request_budget: Option<usize>,
     /// Global detection time budget in seconds (Phase 3 `--max-duration`).
     /// `None` (default) = unlimited, historical behaviour byte-identical.
+    /// SCOPE: detection phase only (clock starts in `run_detection` after
+    /// baseline + context); never bounds the total run. OPT-IN hors
+    /// profils/config-file (CLI/env only, range `0..=86400` enforced at parse).
     pub max_duration_secs: Option<u64>,
 }
 
@@ -263,9 +266,22 @@ impl Default for BudgetConfig {
     }
 }
 
+/// Cap for `--max-duration` (24h). MUST stay consistent with
+/// `crate::cli::args::MAX_DURATION_SECS` (kept local: `cli::args` depends on
+/// this module via `synthetic_raw_from_data`, so importing it here would
+/// cycle). The CLI rejects larger values at parse time; programmatic
+/// `BudgetConfig` values above it are clamped in
+/// [`BudgetConfig::detection_deadline`].
+pub const MAX_DETECTION_DURATION_SECS_CAP: u64 = 86_400;
+
 impl BudgetConfig {
     /// `true` once `started` exceeds the configured `max_duration_secs`.
     /// `None` (default) never trips. Pure and unit-testable.
+    ///
+    /// SCOPE (PR20): `started` is the *detection* clock (set once in
+    /// `run_detection`, AFTER baseline + context) — this never bounds the
+    /// total run, only the detection loops. Compared as `Duration`
+    /// (sub-second precision), not `as_secs()` truncation.
     #[must_use]
     pub fn is_over_max_duration(
         started: std::time::Instant,
@@ -274,18 +290,31 @@ impl BudgetConfig {
         let Some(max) = max_duration_secs else {
             return false;
         };
-        started.elapsed().as_secs() >= max
+        started.elapsed() >= std::time::Duration::from_secs(max)
     }
 
     /// Shared `--max-duration` deadline for mid-technique checks.
     /// `None` (default) = unlimited: every `is_past_deadline` call is a
     /// no-op and detection stays byte-identical. Pure and unit-testable.
+    ///
+    /// Overflow (PR20): `checked_add` returns `None` on overflow, which would
+    /// conflate an explicit huge budget with "unlimited" (silent fail-open).
+    /// User input can never reach it — the CLI rejects `> 86400s` at parse
+    /// time (`crate::cli::args::MAX_DURATION_SECS`, mirrored as
+    /// `MAX_DETECTION_DURATION_SECS_CAP` below since `cli` depends on this
+    /// module and cannot be imported here). Programmatic values are clamped
+    /// to that cap first, so `checked_add` only returns `None` in the
+    /// pathological case of an `Instant` within one day of its maximum
+    /// (practically unreachable): there `None` = effectively-infinite
+    /// deadline, documented here rather than silent.
     #[must_use]
     pub fn detection_deadline(
         started: std::time::Instant,
         max_duration_secs: Option<u64>,
     ) -> Option<std::time::Instant> {
-        max_duration_secs.and_then(|max| started.checked_add(std::time::Duration::from_secs(max)))
+        let max = max_duration_secs?;
+        let capped = max.min(MAX_DETECTION_DURATION_SECS_CAP);
+        started.checked_add(std::time::Duration::from_secs(capped))
     }
 
     /// `true` once the shared `--max-duration` deadline has passed.
@@ -2021,6 +2050,8 @@ struct DetectionShared {
     context_probes: usize,
     /// Shared detection clock for `--max-duration` (Phase 3): set once in
     /// `run_detection`, read in every `run_detection_for_param` iteration.
+    /// Starts AFTER baseline + context, so `--max-duration` covers detection
+    /// loops only — never the total run (documented in `--help`).
     started: Instant,
 }
 
@@ -2202,6 +2233,20 @@ fn order_by_prefix_for_context(context: &InjectionContext) -> &'static str {
 /// [`cost_for_with_ttfb`] (`mean <= 2000` ou `0` = coût statique inchangé,
 /// byte-identique). Seul le canal lent `time` est gonflé sur cible lente
 /// (les différentiels rapides gardent leur priorité).
+///
+/// PR20 — pourquoi `oob`/`stacked` restent statiques (choix volontaire,
+/// pas d'extension) : seul `time` parque un permit du pool isolé
+/// `TIME_POOL_SLOTS` pendant toute la sonde (jitter + retries inclus) avec
+/// un timeout de classe 15s — sur cible lente (mean 5s) une sonde `sleep 5s`
+/// bloque ~10s + risque timeout, son score EVI/coût doit chuter face aux
+/// différentiels bon marché. `oob` attend le collaborateur en async
+/// (`oob_wait_secs`, défaut 5s, classe `oob` sans permit `time`) : sa latence
+/// est bornée par le poll, pas par le TTFB cible. `stacked` tourne en classe
+/// `Default` (latence statique 0.5s, coût = risque retry, pas blocage TTFB).
+/// Gonfler aussi `oob` (EVI 0.4) / `stacked` (EVI 0.5) les affamerait sur
+/// cibles lentes (jamais schedulés) sans bénéfice mesuré — le
+/// `scheduler_ttfb_static_by_default_and_dynamic_when_slow` couvre le
+/// comportement `time`-only.
 fn build_scheduler_for_param(
     config: &EngineConfig,
     param_key: &str,
@@ -2385,11 +2430,13 @@ async fn run_detection_for_param(
             continue;
         }
         // Per-family veto streak: a new technique family starts with a fresh
-        // negative counter, so the N1/N2 veto can only trip on a single
-        // family spending >= 25 negative requests — never by accumulating
-        // across never-compared families (boolean-negative != nosql-negative;
-        // cross-family starvation would be a silent false negative).
-        // `confirmed` survives (only `reset_for_new_param` clears it).
+        // negative counter, so the N1/N2 veto only *arms* on a single
+        // family spending >= 25 negative requests — and `Scheduler::pop`
+        // additionally gates enforcement on a full pass (B1), so an armed
+        // veto never blocks never-attempted families (boolean-negative !=
+        // nosql-negative; cross-family starvation would be a silent false
+        // negative). `confirmed` survives (only `reset_for_new_param`
+        // clears it).
         scheduler.early_stop_mut().reset_negative_streak();
         let before_cost = hyp.cost_spent;
         run_one_technique(
@@ -8104,6 +8151,26 @@ mod orchestrator_gating_tests {
             .unwrap_or(now);
         let blown = BudgetConfig::detection_deadline(past, Some(5)).expect("deadline");
         assert!(BudgetConfig::is_past_deadline(Some(blown)));
+    }
+
+    #[test]
+    fn detection_deadline_clamps_huge_values_without_silent_unlimited() {
+        // PR20: `u64::MAX` used to make `checked_add` return `None`,
+        // conflated with "unlimited". Now clamped to the 24h cap: always a
+        // real (future) deadline, never a silent fail-open.
+        use super::{BudgetConfig, MAX_DETECTION_DURATION_SECS_CAP};
+        assert_eq!(MAX_DETECTION_DURATION_SECS_CAP, 86_400);
+        let now = std::time::Instant::now();
+        let clamped =
+            BudgetConfig::detection_deadline(now, Some(u64::MAX)).expect("clamped deadline");
+        assert!(!BudgetConfig::is_past_deadline(Some(clamped)));
+        // The clamp equals the capped input (idempotent).
+        let at_cap = BudgetConfig::detection_deadline(now, Some(86_400)).expect("cap deadline");
+        assert!(!BudgetConfig::is_past_deadline(Some(at_cap)));
+        // `is_over_max_duration` never panics on huge values and never trips
+        // immediately (Duration compare, no overflow).
+        assert!(!BudgetConfig::is_over_max_duration(now, Some(u64::MAX)));
+        assert!(BudgetConfig::is_over_max_duration(now, Some(0)));
     }
 
     #[test]

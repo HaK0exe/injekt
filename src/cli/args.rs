@@ -4,6 +4,44 @@ use crate::cli::profile::Profile;
 use clap::{Parser, Subcommand, ValueEnum};
 use secrecy::SecretString;
 
+/// Upper bound for `--max-duration` (24h, 86400s). Rejects absurd values at
+/// parse time so [`crate::engine::orchestrator::BudgetConfig::detection_deadline`]
+/// `checked_add` can never overflow from user input (overflow beforehand
+/// silently became `None` = unlimited).
+pub const MAX_DURATION_SECS: u64 = 86_400;
+/// Upper bound for `--request-budget` (1M requests). Rejects absurd values at
+/// parse time; the A1 evasion ceiling (~1032 req live) stays far below it.
+pub const MAX_REQUEST_BUDGET: usize = 1_000_000;
+
+/// Parse `--max-duration` / `INJEKT_MAX_DURATION`: `0..=86400` seconds.
+/// `0` trips immediately (early-break path, tested); absent = unlimited.
+fn parse_max_duration_secs(s: &str) -> Result<u64, String> {
+    let v: u64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid --max-duration '{s}': expected 0..={MAX_DURATION_SECS}"))?;
+    if v > MAX_DURATION_SECS {
+        return Err(format!(
+            "invalid --max-duration '{v}': max is {MAX_DURATION_SECS}s (24h)"
+        ));
+    }
+    Ok(v)
+}
+
+/// Parse `--request-budget` / `INJEKT_REQUEST_BUDGET`: `0..=1000000` requests.
+/// `0` trips immediately (cooperative stop, tested); absent = unlimited.
+fn parse_request_budget(s: &str) -> Result<usize, String> {
+    let v: usize = s.trim().parse().map_err(|_| {
+        format!("invalid --request-budget '{s}': expected 0..={MAX_REQUEST_BUDGET}")
+    })?;
+    if v > MAX_REQUEST_BUDGET {
+        return Err(format!(
+            "invalid --request-budget '{v}': max is {MAX_REQUEST_BUDGET}"
+        ));
+    }
+    Ok(v)
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 #[non_exhaustive]
 pub enum TechniqueOpt {
@@ -221,17 +259,28 @@ pub struct Cli {
     #[arg(long, global = true, value_parser = clap::value_parser!(u8).range(1..=5), env = "INJEKT_LEVEL")]
     pub level: Option<u8>,
 
-    /// Global detection time budget in seconds (`--max-duration 120`).
+    /// Global detection time budget in seconds (`--max-duration 120`, range
+    /// `0..=86400`, OPT-IN).
+    /// SCOPE: detection phase only — the clock starts in `run_detection`,
+    /// AFTER baseline + context (baseline/context/fingerprint/enumeration are
+    /// NOT covered; `--max-duration` never bounds the total run).
     /// `None` (default) = unlimited, historical behaviour byte-identical.
+    /// OPT-IN hors profils/config-file: `--profile` and `injekt.toml` never
+    /// set it; only `--max-duration N` / `INJEKT_MAX_DURATION` enables the
+    /// cooperative stop. Values above 86400s (24h) are rejected at parse time.
     /// When set, the per-parameter detection loop breaks early once the
     /// shared detection clock exceeds it (warn + clean `Done`, no new
     /// findings invented).
-    #[arg(long = "max-duration", global = true, env = "INJEKT_MAX_DURATION")]
+    #[arg(long = "max-duration", global = true, env = "INJEKT_MAX_DURATION", value_parser = parse_max_duration_secs)]
     pub max_duration: Option<u64>,
 
-    /// Global request budget for a run (`--request-budget 25`).
+    /// Global request budget for a run (`--request-budget 25`, range
+    /// `0..=1000000`, OPT-IN).
     /// `None` (default) = unlimited, historical behaviour byte-identical
     /// (A1 evasion needs ~1032 req live: never cap by default).
+    /// OPT-IN hors profils/config-file: `--profile` and `injekt.toml` never
+    /// set it; only `--request-budget N` / `INJEKT_REQUEST_BUDGET` enables
+    /// the cooperative global stop. Values above 1000000 are rejected.
     /// When set, detection stops cooperatively once the shared
     /// `SessionState::request_count` reaches it: current technique finishes,
     /// no new technique starts (warn + clean `Done`, never an error, never
@@ -239,7 +288,7 @@ pub struct Cli {
     /// same value for scheduler visibility (`budget_total`), so the
     /// authoritative global check lives in the orchestrator (concurrent
     /// params may overshoot by one technique each).
-    #[arg(long = "request-budget", global = true, env = "INJEKT_REQUEST_BUDGET")]
+    #[arg(long = "request-budget", global = true, env = "INJEKT_REQUEST_BUDGET", value_parser = parse_request_budget)]
     pub request_budget: Option<usize>,
 
     /// Strict second-pass confirmation (C6 real): re-sondes every confirmed
@@ -1373,6 +1422,35 @@ mod tests {
         assert!(
             cli_default.request_budget.is_none(),
             "default --request-budget must be None"
+        );
+    }
+
+    #[test]
+    fn budget_parsers_reject_absurd_values() {
+        // PR20: absurd CLI values are rejected at parse time (no silent
+        // `checked_add` overflow → unlimited, no unbounded request flood).
+        assert_eq!(super::parse_max_duration_secs("0"), Ok(0));
+        assert_eq!(super::parse_max_duration_secs("86400"), Ok(86_400));
+        assert!(super::parse_max_duration_secs("86401").is_err());
+        assert!(super::parse_max_duration_secs("99999999").is_err());
+        assert!(super::parse_max_duration_secs("nope").is_err());
+        assert_eq!(super::parse_request_budget("0"), Ok(0));
+        assert_eq!(super::parse_request_budget("1000000"), Ok(1_000_000));
+        assert!(super::parse_request_budget("1000001").is_err());
+        assert!(super::parse_request_budget("nope").is_err());
+    }
+
+    #[test]
+    fn budget_flags_reject_absurd_cli_values() {
+        // End-to-end through clap (flags + env share the same value_parser).
+        use clap::Parser as _;
+        assert!(Cli::try_parse_from(["injekt", "--max-duration", "99999999"]).is_err());
+        assert!(Cli::try_parse_from(["injekt", "--request-budget", "99999999"]).is_err());
+        assert_eq!(
+            Cli::try_parse_from(["injekt", "--max-duration", "120"])
+                .unwrap_or_else(|_| blank_cli())
+                .effective_max_duration(),
+            Some(120)
         );
     }
 }

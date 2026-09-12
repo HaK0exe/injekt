@@ -73,7 +73,10 @@ pub const fn cost_for(kind: TechniqueKind) -> f64 {
 /// Rationale: on a slow target (mean 5s) a `time` sleep probe parks a slot
 /// for ~10s + class timeout risk, so its EVI/cost score must drop relative
 /// to cheap differentials. The caller applies this selectively to slow
-/// channels (`time`); fast techniques keep the static cost.
+/// channels (`time`); fast techniques keep the static cost. `oob`/`stacked`
+/// deliberately stay static too (see `build_scheduler_for_param`: async
+/// collaborator wait / `Default`-class latency, not `TIME_POOL_SLOTS`
+/// blocking — scaling them would starve already-low-EVI slow channels).
 #[must_use]
 pub fn cost_for_with_ttfb(base_cost: f64, mean_ms: f64) -> f64 {
     if !base_cost.is_finite() || !mean_ms.is_finite() || mean_ms <= 2000.0 {
@@ -253,12 +256,17 @@ impl RequestBudget {
 /// family** (per-request cost, not per technique): `record_requests`
 /// adds `spent` on a negative outcome. The streak resets at every
 /// technique boundary via [`EarlyStop::reset_negative_streak`] (called by
-/// the orchestrator when it pops the next family), so the veto can only
-/// trip on a single family spending `>= max_negative_probes` negative
-/// requests (e.g. a full L2 boolean matrix on a clean target) — it can
-/// never starve never-attempted families (a boolean-negative target may
-/// still be nosql-positive; cross-family starvation would be a silent
-/// false negative, the worst failure mode for a scanner).
+/// the orchestrator when it pops the next family), so the veto only *arms*
+/// on a single family spending `>= max_negative_probes` negative
+/// requests (e.g. a full L2 boolean matrix on a clean target).
+///
+/// Enforcement is separate: [`Scheduler::pop`] only honors the veto after
+/// a full pass (every enqueued family dequeued at least once), so an armed
+/// veto can never starve never-attempted families (a boolean-negative
+/// target may still be nosql-positive; cross-family starvation would be a
+/// silent false negative, the worst failure mode for a scanner). B1: the
+/// pre-fix `pop` checked the veto *before* the boundary reset could run,
+/// so L2 boolean (~40 req, top EVI) vetoed error/time/union/nosql unseen.
 ///
 /// Inter-param isolation is separate: each parameter repart d'un compteur
 /// frais via [`EarlyStop::reset_for_new_param`] (called by the orchestrator
@@ -379,6 +387,13 @@ impl Ord for ScoredProbe {
 }
 
 /// Cost-based probe scheduler maintaining a max-heap of scored probes.
+///
+/// B1: the scheduler tracks `enqueued_kinds` (every family pushed) vs
+/// `attempted_kinds` (every family dequeued via [`Scheduler::pop`]) and
+/// only enforces the [`EarlyStop`] veto once the full pass is complete.
+/// Pop-side tracking (rather than orchestrator `executed_kinds` plumbing)
+/// keeps [`Scheduler::record_outcome`]'s signature stable and covers the
+/// orchestrator's skip paths for already-terminal hypotheses.
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct Scheduler {
@@ -386,6 +401,8 @@ pub struct Scheduler {
     budget: RequestBudget,
     early_stop: EarlyStop,
     next_id: usize,
+    enqueued_kinds: Vec<TechniqueKind>,
+    attempted_kinds: Vec<TechniqueKind>,
 }
 
 impl Scheduler {
@@ -396,6 +413,8 @@ impl Scheduler {
             budget,
             early_stop,
             next_id: 0,
+            enqueued_kinds: Vec::new(),
+            attempted_kinds: Vec::new(),
         }
     }
 
@@ -416,6 +435,9 @@ impl Scheduler {
         let boost = clamp_knowledge_boost(knowledge_boost.unwrap_or(KNOWLEDGE_NEUTRAL_BOOST));
         let safe_cost = cost.max(0.01);
         let score = (evi * boost) / safe_cost;
+        if !self.enqueued_kinds.contains(&technique) {
+            self.enqueued_kinds.push(technique);
+        }
 
         self.heap.push(ScoredProbe {
             id: self.next_id,
@@ -445,9 +467,18 @@ impl Scheduler {
     }
 
     /// Dequeue the next highest-scoring probe, respecting budget and early-stop limits.
+    ///
+    /// B1: the [`EarlyStop`] veto is only enforced after a full pass (every
+    /// enqueued family dequeued at least once) — before that, an armed veto
+    /// never blocks a never-attempted family. On veto, returns `None`
+    /// immediately WITHOUT draining the heap (the old `continue` emptied it,
+    /// starving the survivors permanently).
     #[must_use]
     pub fn pop(&mut self) -> Option<ScoredProbe> {
         if self.budget.is_exhausted() {
+            return None;
+        }
+        if self.early_stop.should_stop() && self.full_pass_complete() {
             return None;
         }
 
@@ -455,13 +486,29 @@ impl Scheduler {
             if self.budget.is_param_exhausted(&probe.param) {
                 continue;
             }
-            if self.early_stop.should_stop() {
-                continue;
-            }
+            self.mark_attempted(probe.technique);
             return Some(probe);
         }
 
         None
+    }
+
+    /// `true` once every enqueued family was dequeued at least once (B1
+    /// full-pass gate for the [`EarlyStop`] veto). Vacuously `true` when
+    /// nothing was enqueued, matching the pre-fix veto behavior.
+    #[must_use]
+    fn full_pass_complete(&self) -> bool {
+        self.enqueued_kinds
+            .iter()
+            .all(|kind| self.attempted_kinds.contains(kind))
+    }
+
+    /// Record a dequeued family (pop-side, so orchestrator skip paths for
+    /// already-terminal hypotheses count as attempted too).
+    fn mark_attempted(&mut self, technique: TechniqueKind) {
+        if !self.attempted_kinds.contains(&technique) {
+            self.attempted_kinds.push(technique);
+        }
     }
 
     /// Record probe execution outcome and spent requests.
@@ -471,8 +518,9 @@ impl Scheduler {
     /// requests; the [`EarlyStop`] negative streak advances by the same
     /// spent requests. The streak resets at every technique boundary
     /// ([`EarlyStop::reset_negative_streak`], called by the orchestrator),
-    /// so the 25-negative veto only trips on a single family spending that
-    /// much with zero signal — never by accumulating across untested
+    /// so the 25-negative veto only *arms* on a single family spending that
+    /// much with zero signal — and [`Scheduler::pop`] additionally gates
+    /// enforcement on a full pass (B1), so arming never blocks untested
     /// families. `budget_spent`, `next_best_probe` et le câblage
     /// N1/N2 restent cohérents.
     pub fn record_outcome(&mut self, param: &str, is_finding: bool, requests_spent: usize) {
@@ -516,11 +564,14 @@ impl Scheduler {
 
     /// Preview of the next probe `pop` would return (heap top) without
     /// consuming it. `None` when the budget is exhausted, the param is
-    /// exhausted, or [`EarlyStop`] says to stop. Best-effort preview: `pop`
+    /// exhausted, or [`EarlyStop`] says to stop past a full pass (B1 gate,
+    /// mirroring [`Scheduler::pop`]). Best-effort preview: `pop`
     /// remains authoritative when deeper entries are still eligible.
     #[must_use]
     pub fn next_best_probe(&self) -> Option<ScoredProbe> {
-        if self.budget.is_exhausted() || self.early_stop.should_stop() {
+        if self.budget.is_exhausted()
+            || (self.early_stop.should_stop() && self.full_pass_complete())
+        {
             return None;
         }
         let top = self.heap.peek()?;
@@ -622,6 +673,11 @@ mod tests {
         let mut s = Scheduler::new(RequestBudget::unlimited(), early_stop);
 
         s.push("id", TechniqueKind::Boolean, "p1", 1.0, 1.0, None);
+        s.push("id", TechniqueKind::Boolean, "p2", 1.0, 1.0, None);
+
+        // Real flow: pop marks the family attempted, then negatives accumulate.
+        let first = s.pop().expect("first probe");
+        assert_eq!(first.technique, TechniqueKind::Boolean);
 
         // 5 consecutive negatives
         for _ in 0..5 {
@@ -629,7 +685,10 @@ mod tests {
         }
 
         assert!(s.early_stop().should_stop());
+        // Full pass complete (sole enqueued family attempted): veto honored
+        // with an immediate None that leaves the heap intact (no drain).
         assert!(s.pop().is_none());
+        assert_eq!(s.len(), 1);
     }
 
     #[test]
@@ -702,9 +761,13 @@ mod tests {
         // Phase 0 : `max_negative_probes` se compare à des requêtes.
         // 3 outcomes × 10 req = 30 ≥ 25 → stop (l'ancien comptage par
         // technique aurait exigé 25 outcomes et ne trippait jamais mid-pass
-        // sur 8 techniques).
+        // sur 8 techniques). B1 : le pop préalable marque la famille
+        // tentée (full pass complet sur une seule famille enfilée), donc
+        // le veto armé s'applique sans drainer le heap.
         let mut s = Scheduler::new(RequestBudget::unlimited(), EarlyStop::new(25));
         s.push("id", TechniqueKind::Boolean, "p1", 1.0, 1.0, None);
+        s.push("id", TechniqueKind::Boolean, "p2", 1.0, 1.0, None);
+        let _first = s.pop().expect("family attempted before outcomes");
         assert!(!s.early_stop().should_stop());
         s.record_outcome("id", false, 10);
         assert!(!s.early_stop().should_stop());
@@ -713,6 +776,7 @@ mod tests {
         s.record_outcome("id", false, 10);
         assert!(s.early_stop().should_stop());
         assert!(s.pop().is_none());
+        assert_eq!(s.len(), 1);
         // Un finding verrouille `confirmed` et désactive le stop.
         let mut c = Scheduler::new(RequestBudget::unlimited(), EarlyStop::new(5));
         c.push("id", TechniqueKind::Boolean, "p1", 1.0, 1.0, None);
@@ -723,29 +787,40 @@ mod tests {
 
     #[test]
     fn test_early_stop_streak_resets_per_technique_family() {
-        // No cross-family starvation: boolean 24 + error 10 must NOT trip
-        // the 25 veto (boolean-negative != nosql-negative). Only a single
-        // family spending >= 25 trips it. Guards `nosql_in_all_techniques`.
+        // No cross-family starvation: boolean 24 + error 40 must NOT block
+        // nosql (boolean-negative != nosql-negative). The per-family reset
+        // keeps arming per-family, while the B1 full-pass gate keeps an
+        // armed veto from blocking never-attempted families. Guards
+        // `nosql_in_all_techniques`.
         let mut s = Scheduler::new(RequestBudget::unlimited(), EarlyStop::new(25));
         s.push("id", TechniqueKind::Boolean, "p1", 1.0, 1.0, None);
         s.push("id", TechniqueKind::Error, "p2", 1.0, 1.0, None);
         s.push("id", TechniqueKind::Nosql, "p3", 1.0, 1.0, None);
-        // Family 1: 24 negatives, then boundary reset (orchestrator).
+        // Family 1: pop (attempted), 24 negatives, then boundary reset.
+        let first = s.pop().expect("boolean first (FIFO tie-break)");
+        assert_eq!(first.technique, TechniqueKind::Boolean);
         s.record_outcome("id", false, 24);
         assert!(!s.early_stop().should_stop());
         s.early_stop_mut().reset_negative_streak();
-        // Family 2: 10 negatives, then boundary reset.
-        s.record_outcome("id", false, 10);
-        assert!(!s.early_stop().should_stop());
-        s.early_stop_mut().reset_negative_streak();
-        // Family 3 runs: heap intact, pop still serves.
-        assert!(s.pop().is_some());
-        // But a single family spending >= 25 still trips (L2 long tails).
+        // Family 2: pop (attempted), 40 negatives -> veto ARMS, no reset:
+        // the B1 gate alone must let the unattempted family through.
+        let second = s.pop().expect("error serves: full pass incomplete");
+        assert_eq!(second.technique, TechniqueKind::Error);
+        s.record_outcome("id", false, 40);
+        assert!(s.early_stop().should_stop());
+        // Family 3 runs: armed veto does not block a never-attempted family.
+        let third = s.pop().expect("B1: armed veto must not block nosql");
+        assert_eq!(third.technique, TechniqueKind::Nosql);
+        // But a single family spending >= 25 still trips once its pass is
+        // complete (L2 long tails stay bounded, heap left intact).
         let mut t = Scheduler::new(RequestBudget::unlimited(), EarlyStop::new(25));
         t.push("id", TechniqueKind::Boolean, "p1", 1.0, 1.0, None);
+        t.push("id", TechniqueKind::Boolean, "p2", 1.0, 1.0, None);
+        let _ = t.pop().expect("family attempted before outcomes");
         t.record_outcome("id", false, 100);
         assert!(t.early_stop().should_stop());
         assert!(t.pop().is_none());
+        assert_eq!(t.len(), 1);
         // `confirmed` survives the streak reset (veto stays off).
         let mut c = Scheduler::new(RequestBudget::unlimited(), EarlyStop::new(5));
         c.push("id", TechniqueKind::Boolean, "p1", 1.0, 1.0, None);
@@ -774,12 +849,50 @@ mod tests {
     fn test_early_stop_after_25_negatives_default() {
         let mut s = Scheduler::new(RequestBudget::unlimited(), EarlyStop::default());
         s.push("id", TechniqueKind::Boolean, "p1", 1.0, 1.0, None);
+        s.push("id", TechniqueKind::Boolean, "p2", 1.0, 1.0, None);
+        let _ = s.pop().expect("family attempted before outcomes");
         for _ in 0..25 {
             s.record_outcome("id", false, 1);
         }
         assert!(s.early_stop().should_stop());
         assert!(s.pop().is_none());
         assert!(s.next_best_probe().is_none());
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn test_b1_l2_boolean_negatives_do_not_starve_untested_nosql() {
+        // B1 regression: at L2 the boolean family (top EVI/cost) spends ~40
+        // negative requests (4 payloads x 5 sets x 2) before error/nosql ever
+        // run. The 25-negative veto arms but must stay gated until every
+        // enqueued family was attempted once, so a nosql-only target still
+        // gets tested instead of `pop` returning `None` unseen.
+        let mut s = Scheduler::new(RequestBudget::unlimited(), EarlyStop::new(25));
+        s.push_for_posterior("id", TechniqueKind::Boolean, "b", 0.5, None);
+        s.push_for_posterior("id", TechniqueKind::Error, "e", 0.15, None);
+        s.push_for_posterior("id", TechniqueKind::Nosql, "n", 0.05, None);
+
+        let first = s.pop().expect("boolean serves first (top EVI/cost)");
+        assert_eq!(first.technique, TechniqueKind::Boolean);
+
+        // L2 boolean matrix, all negative: veto arms...
+        s.record_outcome("id", false, 40);
+        assert!(s.early_stop().should_stop());
+
+        // ...but the full pass is incomplete: preview + pop still serve error.
+        assert!(s.next_best_probe().is_some());
+        let second = s
+            .pop()
+            .expect("B1: armed veto must not block unattempted error");
+        assert_eq!(second.technique, TechniqueKind::Error);
+        s.record_outcome("id", false, 40);
+        assert!(s.early_stop().should_stop());
+
+        // nosql (never attempted) still pops: the nosql-only target is tested.
+        let third = s
+            .pop()
+            .expect("B1: armed veto must not block unattempted nosql");
+        assert_eq!(third.technique, TechniqueKind::Nosql);
     }
 
     #[test]

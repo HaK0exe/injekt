@@ -199,8 +199,9 @@ impl InjektServer {
             verbose: false,
             level: Some(1),
             max_duration: None,
-            // MCP: pas de plafond requête (surface minimale, comportement
-            // historique illimité). Le CLI `--request-budget` reste opt-in.
+            // Budgets OPT-IN (None = illimité, comportement historique) :
+            // exposés comme params MCP optionnels, câblés dans
+            // `build_scan_cli` / `build_recon_scan`.
             request_budget: None,
             confirm: false,
             no_mutation: false,
@@ -242,6 +243,8 @@ impl InjektServer {
         cli.rate_limit = params.rate_limit;
         cli.jitter = params.jitter;
         cli.timeout = params.timeout;
+        cli.max_duration = params.max_duration;
+        cli.request_budget = params.request_budget;
         cli.retries = params.retries;
         cli.delay = params.delay;
         if let Some(v) = params.headers {
@@ -393,6 +396,8 @@ impl InjektServer {
         cli.chunked = params.chunked.unwrap_or(false);
         cli.no_redact = params.no_redact.unwrap_or(false);
         cli.timeout = params.timeout;
+        cli.max_duration = params.max_duration;
+        cli.request_budget = params.request_budget;
         cli.retries = params.retries;
         cli.delay = params.delay;
         Self::apply_common_network_opts(
@@ -676,6 +681,12 @@ pub struct ScanParams {
     pub jitter: Option<String>,
     /// Request timeout in seconds (default: 30)
     pub timeout: Option<u64>,
+    /// Global detection time budget in seconds (OPT-IN, None = unlimited):
+    /// detection stops cooperatively once exceeded (clean Done, no error)
+    pub max_duration: Option<u64>,
+    /// Global request budget (OPT-IN calibration, None = unlimited):
+    /// detection stops cooperatively once total `request_count` reaches N
+    pub request_budget: Option<usize>,
     /// Max retries for failed requests (default: 3)
     pub retries: Option<usize>,
     /// Base retry delay in milliseconds (default: 500)
@@ -835,6 +846,10 @@ pub struct ReconScanParams {
     pub jitter: Option<String>,
     /// Request timeout in seconds (default: 30)
     pub timeout: Option<u64>,
+    /// Global detection time budget in seconds (OPT-IN, None = unlimited)
+    pub max_duration: Option<u64>,
+    /// Global request budget (OPT-IN calibration, None = unlimited)
+    pub request_budget: Option<usize>,
     /// Max retries for failed requests (default: 3)
     pub retries: Option<usize>,
     /// Base retry delay in milliseconds (default: 500)

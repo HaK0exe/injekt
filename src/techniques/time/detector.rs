@@ -71,11 +71,23 @@ impl TimeDetector {
     /// at `sigma = 2.0` on fast targets (same floor of 100ms, same
     /// multiplier). On slow targets (`mean > 1s`) the adaptive floor
     /// `max(100ms, mean*0.1)` widens the threshold proportionally.
+    ///
+    /// PR20 divergence (intentional, documented): `Baseline::threshold_ms`
+    /// keeps the static 100ms floor for generic fast differentials, while
+    /// this detector widens on slow targets (mean 5s: 6000 here vs 5200
+    /// there). A sleep probe on a 5s-mean target must tolerate ±200ms
+    /// wobble without flagging it as `SQLi`; the relaxed
+    /// `adaptive_min_sleep_fraction` (0.3 above 3s mean) pairs with it so a
+    /// real 5s sleep (`~10s` measured) still confirms. Fast targets
+    /// (`mean <= 1s`) stay byte-identical (`from_baseline_matches_threshold_ms`).
     #[must_use]
     pub fn from_baseline(baseline: &crate::detection::baseline::Baseline) -> Self {
         Self::new(baseline.mean_ms, baseline.stddev_ms)
     }
 
+    /// Anomaly bar for sleep probes: `mean + 2 * max(stddev, adaptive floor)`.
+    /// See [`Self::from_baseline`] for the intentional divergence from
+    /// [`crate::detection::baseline::Baseline::threshold_ms`] on slow targets.
     #[must_use]
     pub fn threshold(&self) -> f64 {
         self.baseline_mean_ms

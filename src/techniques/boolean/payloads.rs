@@ -144,6 +144,13 @@ pub fn boolean_payloads_for(dbms: Option<&str>) -> Vec<BooleanPayload> {
         // Phase 1 P0 operator variants (appended last so L1/L2 budgets stay
         // byte-identical): RLIKE (LIKE is often signatured), DIV / XOR
         // arithmetic oracles, and quoteless CHR/CHAR function comparisons.
+        // Dialect notes (generic payload list = accepted cost, L1 unchanged):
+        // - `RLIKE` is MySQL-only (PG uses `~`, MSSQL `LIKE`); off-DBMS it
+        //   errors on both branches (no differential) and is skipped by budget.
+        // - `1 DIV 0` yields NULL, not FALSE — NULL is falsy so the oracle
+        //   still holds (TRUE=`1`, FALSE=NULL).
+        // - `CHR()` is Oracle/PG-only (MySQL uses `CHAR()`); both spellings are
+        //   probed so each DBMS gets its native function.
         BooleanPayload::new(
             format!("' OR 'a' RLIKE 'a'{comment}"),
             format!("' OR 'a' RLIKE 'b'{comment}"),

@@ -63,10 +63,19 @@ const GENERIC_BODY_MARKERS: &[(&str, bool, WafVendor)] = &[
     ("akamai edge", false, WafVendor::Akamai),
     ("mod_security", false, WafVendor::ModSecurity),
     ("modsecurity", false, WafVendor::ModSecurity),
-    ("awselb", false, WafVendor::AwsWaf),
+    // ALB error-page wording is load-balancer infra, not a WAF verdict —
+    // attribute to `AwsAlb`, never `AwsWaf` (ALB ≠ WAF).
+    ("awselb", false, WafVendor::AwsAlb),
 ];
 
 /// WAF/CDN vendor behind the response, when identifiable.
+///
+/// Infrastructure fingerprints are kept distinct from security products:
+/// `AwsAlb` (plain ALB / `x-amzn-*` IDs — every ALB/API-GW response carries
+/// them, WAF or not) and `Varnish` (bare reverse-proxy/cache — Fastly
+/// derives from it but a bare `via: varnish` proves no Fastly) never imply
+/// `AwsWaf` / `Fastly`. `AwsWaf` / `Fastly` are reserved for explicit
+/// product signals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WafVendor {
@@ -76,8 +85,10 @@ pub enum WafVendor {
     ModSecurity,
     F5,
     AwsWaf,
+    AwsAlb,
     Sucuri,
     Fastly,
+    Varnish,
     Generic,
 }
 
@@ -90,8 +101,10 @@ impl core::fmt::Display for WafVendor {
             Self::ModSecurity => write!(f, "modsecurity"),
             Self::F5 => write!(f, "f5"),
             Self::AwsWaf => write!(f, "aws-waf"),
+            Self::AwsAlb => write!(f, "aws-alb"),
             Self::Sucuri => write!(f, "sucuri"),
             Self::Fastly => write!(f, "fastly"),
+            Self::Varnish => write!(f, "varnish"),
             Self::Generic => write!(f, "generic"),
         }
     }
@@ -184,6 +197,14 @@ pub fn detect_cloudflare_flat(
     let mut has_cf_cookie = false;
     let mut has_mitigated = false;
     let mut has_cache_status = false;
+    // Security-significant header signal (vs pure infrastructure presence).
+    // Only this flag corroborates a status into `blocking`: `x-amzn-*`,
+    // `via: varnish`, `server: awselb/varnish` are emitted on *all* traffic
+    // of those platforms (plain ALB, cache) with no WAF implication, so they
+    // fingerprint the vendor but must never turn a bare app 403 into a WAF
+    // block (which would wrongly auto-tamper + downgrade confidence by 0.3).
+    // Vendor fingerprinting (`vendor`) is unaffected — presence still shows.
+    let mut corroborating_header_hit = false;
 
     for (name, value) in headers {
         let value_lower = value.to_ascii_lowercase();
@@ -191,98 +212,134 @@ pub fn detect_cloudflare_flat(
             "cf-ray" => {
                 has_ray = true;
                 push_hit(&mut hits, "cf-ray");
+                corroborating_header_hit = true;
             }
             "server" if value_lower.contains("cloudflare") => {
                 has_server_cf = true;
                 push_hit(&mut hits, "server:cloudflare");
+                corroborating_header_hit = true;
             }
             "set-cookie" => {
                 if value_lower.contains("__cf_bm") {
                     has_cf_cookie = true;
                     push_hit(&mut hits, "set-cookie:__cf_bm");
+                    corroborating_header_hit = true;
                 }
                 if value_lower.contains("cf_clearance") {
                     // Clearance cookie = a challenge was solved/traversed.
                     has_cf_cookie = true;
                     has_mitigated = true;
                     push_hit(&mut hits, "set-cookie:cf_clearance");
+                    corroborating_header_hit = true;
                 }
                 // Imperva/Incapsula cookies (`incap_ses_*`, `visid_incap`).
                 if value_lower.contains("incap_") || value_lower.contains("visid_incap") {
                     push_hit(&mut hits, "set-cookie:incapsula");
                     set_vendor(&mut vendor, WafVendor::Imperva);
+                    corroborating_header_hit = true;
                 }
                 // F5 BIG-IP persistence cookie.
                 if value_lower.contains("bigipserver") || value_lower.contains("bigip") {
                     push_hit(&mut hits, "set-cookie:bigipserver");
                     set_vendor(&mut vendor, WafVendor::F5);
+                    corroborating_header_hit = true;
                 }
             }
             "cf-mitigated" => {
                 has_mitigated = true;
                 push_hit(&mut hits, "cf-mitigated");
+                corroborating_header_hit = true;
             }
             "cf-cache-status" | "cf-request-id" => {
                 has_cache_status = true;
                 push_hit(&mut hits, name.as_str());
+                corroborating_header_hit = true;
             }
             "x-iinfo" => {
                 push_hit(&mut hits, "x-iinfo");
                 set_vendor(&mut vendor, WafVendor::Imperva);
+                corroborating_header_hit = true;
             }
             "x-mod-security" => {
                 push_hit(&mut hits, "x-mod-security");
                 set_vendor(&mut vendor, WafVendor::ModSecurity);
+                corroborating_header_hit = true;
             }
+            // Pure infrastructure IDs (every ALB/API-GW response carries
+            // them, WAF or not): fingerprint only, never corroborate.
+            // Attributed to `AwsAlb`, never `AwsWaf` (ALB ≠ WAF).
             "x-amzn-requestid" | "x-amzn-trace-id" | "x-amz-cf-id" => {
                 push_hit(&mut hits, name.as_str());
-                set_vendor(&mut vendor, WafVendor::AwsWaf);
+                set_vendor(&mut vendor, WafVendor::AwsAlb);
             }
+            // `via: varnish` is a bare cache, not Fastly (Fastly derives
+            // from Varnish but a bare `via` proves no Fastly): fingerprint
+            // only.
             "via" if value_lower.contains("varnish") => {
                 push_hit(&mut hits, "via:varnish");
-                set_vendor(&mut vendor, WafVendor::Fastly);
+                set_vendor(&mut vendor, WafVendor::Varnish);
             }
             _ => {
                 // Prefix / value based vendor headers (names already lowercased).
                 if name.starts_with("x-akamai-") {
                     push_hit(&mut hits, name.as_str());
                     set_vendor(&mut vendor, WafVendor::Akamai);
+                    corroborating_header_hit = true;
                 } else if name.starts_with("x-sucuri-") {
                     push_hit(&mut hits, name.as_str());
                     set_vendor(&mut vendor, WafVendor::Sucuri);
+                    corroborating_header_hit = true;
                 } else if name.starts_with("x-fastly-") || name.starts_with("fastly-") {
                     push_hit(&mut hits, name.as_str());
                     set_vendor(&mut vendor, WafVendor::Fastly);
+                    corroborating_header_hit = true;
                 } else if name.starts_with("x-f5-") {
                     push_hit(&mut hits, name.as_str());
                     set_vendor(&mut vendor, WafVendor::F5);
+                    corroborating_header_hit = true;
                 } else if name == "server" {
                     if value_lower.contains("akamaighost") || value_lower.contains("akamai") {
                         push_hit(&mut hits, "server:akamaighost");
                         set_vendor(&mut vendor, WafVendor::Akamai);
+                        corroborating_header_hit = true;
                     }
                     if value_lower.contains("incapsula") {
                         push_hit(&mut hits, "server:incapsula");
                         set_vendor(&mut vendor, WafVendor::Imperva);
+                        corroborating_header_hit = true;
                     }
                     if value_lower.contains("mod_security") || value_lower.contains("modsecurity") {
                         push_hit(&mut hits, "server:modsecurity");
                         set_vendor(&mut vendor, WafVendor::ModSecurity);
+                        corroborating_header_hit = true;
                     }
                     if value_lower.contains("big-ip") || value_lower.contains("bigip") {
                         push_hit(&mut hits, "server:bigip");
                         set_vendor(&mut vendor, WafVendor::F5);
+                        corroborating_header_hit = true;
                     }
+                    // Plain load-balancer banner (every ALB answers this,
+                    // WAF or not): fingerprint only, never corroborate.
+                    // Attributed to `AwsAlb`, never `AwsWaf` (ALB ≠ WAF).
                     if value_lower.contains("awselb") {
                         push_hit(&mut hits, "server:awselb");
-                        set_vendor(&mut vendor, WafVendor::AwsWaf);
+                        set_vendor(&mut vendor, WafVendor::AwsAlb);
                     }
                     if value_lower.contains("sucuri") {
                         push_hit(&mut hits, "server:sucuri");
                         set_vendor(&mut vendor, WafVendor::Sucuri);
+                        corroborating_header_hit = true;
                     }
-                    if value_lower.contains("varnish") || value_lower.contains("fastly") {
+                    // Bare cache banner vs Fastly product banner (split:
+                    // `Varnish` is a generic reverse-proxy, `Fastly` only
+                    // on explicit `fastly`): fingerprint only, never
+                    // corroborate.
+                    if value_lower.contains("varnish") {
                         push_hit(&mut hits, "server:varnish");
+                        set_vendor(&mut vendor, WafVendor::Varnish);
+                    }
+                    if value_lower.contains("fastly") {
+                        push_hit(&mut hits, "server:fastly");
                         set_vendor(&mut vendor, WafVendor::Fastly);
                     }
                 } else {
@@ -291,14 +348,17 @@ pub fn detect_cloudflare_flat(
                     if value_lower.contains("incapsula") {
                         push_hit(&mut hits, "header:incapsula");
                         set_vendor(&mut vendor, WafVendor::Imperva);
+                        corroborating_header_hit = true;
                     }
                     if value_lower.contains("sucuri") {
                         push_hit(&mut hits, "header:sucuri");
                         set_vendor(&mut vendor, WafVendor::Sucuri);
+                        corroborating_header_hit = true;
                     }
                     if value_lower.contains("fastly") {
                         push_hit(&mut hits, "header:fastly");
                         set_vendor(&mut vendor, WafVendor::Fastly);
+                        corroborating_header_hit = true;
                     }
                 }
             }
@@ -309,9 +369,11 @@ pub fn detect_cloudflare_flat(
     if cf_headers || has_cache_status {
         set_vendor(&mut vendor, WafVendor::Cloudflare);
     }
-    // Any header signal (Cloudflare or vendor-specific) counts for
-    // status corroboration — never the status alone.
-    let header_hit = !hits.is_empty();
+    // Security-significant header signals corroborate a status into a
+    // blocking verdict — pure infrastructure presence (`x-amzn-*`,
+    // `via: varnish`, `server: awselb/varnish`) fingerprints the vendor
+    // but never blocks alone. Never the status alone.
+    let header_hit = corroborating_header_hit;
 
     // Body markers — single lowercased pass over a truncated prefix.
     let prefix_len = body.len().min(BODY_SCAN_LEN);
@@ -641,8 +703,10 @@ mod tests {
         assert_eq!(WafVendor::ModSecurity.to_string(), "modsecurity");
         assert_eq!(WafVendor::F5.to_string(), "f5");
         assert_eq!(WafVendor::AwsWaf.to_string(), "aws-waf");
+        assert_eq!(WafVendor::AwsAlb.to_string(), "aws-alb");
         assert_eq!(WafVendor::Sucuri.to_string(), "sucuri");
         assert_eq!(WafVendor::Fastly.to_string(), "fastly");
+        assert_eq!(WafVendor::Varnish.to_string(), "varnish");
         assert_eq!(WafVendor::Generic.to_string(), "generic");
     }
 
@@ -703,20 +767,23 @@ mod tests {
     }
 
     #[test]
-    fn detects_aws_waf_request_id_plus_blocked_body() {
+    fn detects_aws_alb_request_id_plus_blocked_body() {
+        // Plain ALB infrastructure (`x-amzn-*` on every ALB/API-GW
+        // response, WAF or not) fingerprints `AwsAlb` — never `AwsWaf`
+        // (ALB ≠ WAF). `AwsWaf` stays reserved for explicit WAF signals.
         let presence = detect_cloudflare_flat(
             200,
             &headers(&[("x-amzn-requestid", "abc")]),
             b"<html>ok</html>",
         );
-        assert_eq!(presence.vendor, Some(WafVendor::AwsWaf));
+        assert_eq!(presence.vendor, Some(WafVendor::AwsAlb));
         assert!(!presence.blocking);
         let blocked = detect_cloudflare_flat(
             403,
             &headers(&[("x-amzn-requestid", "abc")]),
             b"<html>Request blocked by AWS WAF</html>",
         );
-        assert_eq!(blocked.vendor, Some(WafVendor::AwsWaf));
+        assert_eq!(blocked.vendor, Some(WafVendor::AwsAlb));
         assert!(blocked.blocking, "{blocked:?}");
     }
 
@@ -731,8 +798,29 @@ mod tests {
             &headers(&[("x-fastly-request-id", "abc"), ("server", "Varnish")]),
             b"<html>ok</html>",
         );
+        // `x-fastly-*` is an explicit Fastly product signal and wins over
+        // the generic `server: Varnish` cache banner (first-specific-wins).
         assert_eq!(f.vendor, Some(WafVendor::Fastly));
         assert!(!f.blocking);
+    }
+
+    #[test]
+    fn bare_varnish_is_not_fastly() {
+        // `Varnish` is a generic reverse-proxy/cache; Fastly derives from
+        // it but a bare `via`/`server` banner proves no Fastly.
+        let via =
+            detect_cloudflare_flat(200, &headers(&[("via", "1.1 varnish")]), b"<html>ok</html>");
+        assert_eq!(via.vendor, Some(WafVendor::Varnish));
+        assert!(!via.blocking);
+        let server =
+            detect_cloudflare_flat(200, &headers(&[("server", "Varnish")]), b"<html>ok</html>");
+        assert_eq!(server.vendor, Some(WafVendor::Varnish));
+        assert!(!server.blocking);
+        // Explicit Fastly product banner keeps its own label.
+        let fastly =
+            detect_cloudflare_flat(200, &headers(&[("server", "Fastly")]), b"<html>ok</html>");
+        assert_eq!(fastly.vendor, Some(WafVendor::Fastly));
+        assert!(!fastly.blocking);
     }
 
     #[test]
@@ -747,7 +835,10 @@ mod tests {
             &headers(&[("server", "awselb/2.0")]),
             b"<html>403 forbidden</html>",
         );
-        assert_eq!(awselb.vendor, Some(WafVendor::AwsWaf));
+        // Blocking here comes from the `403 forbidden` body marker + 403
+        // status (body corroboration path), not from the infra banner —
+        // and the label is `aws-alb`, never `aws-waf`.
+        assert_eq!(awselb.vendor, Some(WafVendor::AwsAlb));
         assert!(awselb.blocking, "{awselb:?}");
     }
 
@@ -755,5 +846,65 @@ mod tests {
     fn status_alone_never_fingerprints_new_vendors() {
         let bare = detect_cloudflare_flat(403, &headers(&[]), b"<html>not found</html>");
         assert!(!bare.is_suspected(), "{bare:?}");
+    }
+
+    #[test]
+    fn infra_headers_fingerprint_without_blocking_on_bare_status() {
+        // Pure infrastructure headers (every ALB / Varnish response carries
+        // them, WAF or not) must fingerprint the infra vendor but never turn a
+        // bare app 403 into a WAF block — otherwise every ALB 403 would
+        // wrongly auto-tamper + downgrade confidence by 0.3. Labels must be
+        // infra (`aws-alb` / `varnish`), never `aws-waf` / `fastly`.
+        for (hdrs, expected) in [
+            (vec![("x-amzn-requestid", "abc")], WafVendor::AwsAlb),
+            (vec![("x-amzn-trace-id", "abc")], WafVendor::AwsAlb),
+            (vec![("x-amz-cf-id", "abc")], WafVendor::AwsAlb),
+            (vec![("via", "1.1 varnish")], WafVendor::Varnish),
+            (vec![("server", "awselb/2.0")], WafVendor::AwsAlb),
+            (vec![("server", "Varnish")], WafVendor::Varnish),
+        ] {
+            let r = detect_cloudflare_flat(403, &headers(&hdrs), b"<html>not found</html>");
+            assert!(r.is_suspected(), "infra must fingerprint: {r:?}");
+            assert_eq!(r.vendor, Some(expected), "infra label: {r:?}");
+            assert!(
+                r.vendor != Some(WafVendor::AwsWaf) && r.vendor != Some(WafVendor::Fastly),
+                "infra must never claim a WAF/CDN product: {r:?}"
+            );
+            assert!(!r.blocking, "infra + bare 403 must not block: {r:?}");
+        }
+        // With a deny body marker the same responses still block (body
+        // corroboration path, unchanged).
+        let with_body = detect_cloudflare_flat(
+            403,
+            &headers(&[("x-amzn-requestid", "abc")]),
+            b"<html>access denied</html>",
+        );
+        assert!(with_body.blocking, "{with_body:?}");
+        assert_eq!(with_body.vendor, Some(WafVendor::AwsAlb), "{with_body:?}");
+    }
+
+    #[test]
+    fn security_headers_still_corroborate_status() {
+        // Product-security headers keep corroborating a status (no body
+        // marker needed) — only pure-infra headers were demoted.
+        let imperva = detect_cloudflare_flat(
+            403,
+            &headers(&[("x-iinfo", "1-1")]),
+            b"<html>not found</html>",
+        );
+        assert!(imperva.blocking, "{imperva:?}");
+        let akamai = detect_cloudflare_flat(
+            403,
+            &headers(&[("server", "AkamaiGHost")]),
+            b"<html>not found</html>",
+        );
+        assert!(akamai.blocking, "{akamai:?}");
+        // Cloudflare keeps its historical semantics (test-pinned).
+        let cf = detect_cloudflare_flat(
+            524,
+            &headers(&[("cf-ray", "x")]),
+            b"<html>origin timeout</html>",
+        );
+        assert!(cf.blocking, "{cf:?}");
     }
 }

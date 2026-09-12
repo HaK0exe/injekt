@@ -110,7 +110,17 @@ impl Baseline {
 
     #[must_use]
     pub fn threshold_ms(&self, sigma: f64) -> f64 {
-        // Unified floor 100ms per 2026 audit (time detector uses 100)
+        // Unified floor 100ms per 2026 audit (time detector uses 100).
+        // PR20 divergence note: this static floor is intentional for generic
+        // (fast-differential) use. `TimeDetector::threshold` reuses the same
+        // mean/stddev via `from_baseline` but swaps the floor for
+        // `adaptive_stddev_floor_ms` (`max(100ms, mean*0.1)`): byte-identical
+        // below/at 1s mean, proportionally wider above (e.g. mean 5s →
+        // threshold 6000 vs 5200 here). Rationale: on slow targets a static
+        // 100ms floor flags every ±200ms wobble as anomalous for sleep
+        // probes, while boolean/error differentials still want the tight
+        // static bar — so the time channel alone adapts, this helper stays
+        // put.
         self.mean_ms + sigma * self.stddev_ms.max(100.0)
     }
 

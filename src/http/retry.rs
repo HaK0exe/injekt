@@ -29,9 +29,47 @@ pub const RETRY_AFTER_HONOR_CAP_SECS: u64 = 60;
 /// transient — the immediate retry gets a fresh connection — so it is
 /// retryable. Plain `is_request` errors without that signature stay
 /// non-retryable to avoid burning budget on deterministic request errors.
+///
+/// Idempotence gate: this legacy overload assumes an idempotent method
+/// (equivalent to `GET`; Cloudflare keep-alive fix preserved). Callers that
+/// know the request method MUST use
+/// [`is_retryable_error_for_method`] instead: replaying a non-idempotent
+/// `POST`/`PATCH` on a stale-pool `EOF` would double-submit (the server may
+/// already have executed the first copy). See [`is_idempotent_method`].
 #[must_use]
 pub fn is_retryable_error(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_body() || is_stale_pool_eof(e)
+}
+
+/// Method-aware retry gate (preferred over [`is_retryable_error`]).
+///
+/// `timeout`/`connect`/`body` stay retryable for every method (historical
+/// behaviour, unchanged): they fire before/without a usable response and the
+/// scanner's detection payloads are read-only probes. The stale-pool TLS
+/// `EOF` race replays the *whole* request, so it is only retryable for
+/// idempotent methods (see [`is_idempotent_method`]): a `POST` that hit the
+/// race is surfaced as-is instead of being replayed.
+#[must_use]
+pub fn is_retryable_error_for_method(e: &reqwest::Error, method: &http::Method) -> bool {
+    e.is_timeout() || e.is_connect() || e.is_body() || is_stale_pool_eof_for_method(e, method)
+}
+
+/// RFC 9110 §9.2.2 idempotent methods: replaying the request has the same
+/// effect as a single copy. `GET`/`HEAD` (the scanner's query-param path)
+/// plus `OPTIONS`/`TRACE`/`PUT`/`DELETE` are safe to replay on a stale-pool
+/// `EOF`; `POST`/`PATCH`/`CONNECT` are not (double-submit risk) and must
+/// never auto-retry that race.
+#[must_use]
+pub fn is_idempotent_method(method: &http::Method) -> bool {
+    matches!(
+        *method,
+        http::Method::GET
+            | http::Method::HEAD
+            | http::Method::OPTIONS
+            | http::Method::TRACE
+            | http::Method::PUT
+            | http::Method::DELETE
+    )
 }
 
 /// Detect the stale-pooled-connection TLS race: `Kind::Request` whose source
@@ -47,9 +85,43 @@ fn is_stale_pool_eof(e: &reqwest::Error) -> bool {
     source_chain_has_eof(e.source())
 }
 
+/// Idempotent-gated variant of [`is_stale_pool_eof`]: returns `false` for
+/// non-idempotent methods without even inspecting the chain, so a `POST`
+/// checkout race is never replayed (double-submit). Pure gate extracted as
+/// [`should_retry_stale_eof_for_method`] for unit tests.
+fn is_stale_pool_eof_for_method(e: &reqwest::Error, method: &http::Method) -> bool {
+    use std::error::Error as _;
+    if !should_retry_stale_eof_for_method(method, true) {
+        return false;
+    }
+    if !e.is_request() {
+        return false;
+    }
+    source_chain_has_eof(e.source())
+}
+
+/// Pure idempotence gate for the stale-pool `EOF` race, unit-testable without
+/// a real `reqwest::Error`: `chain_has_eof` is the [`source_chain_has_eof`]
+/// verdict. `POST`/`PATCH` (non-idempotent) never retry the race, even when
+/// the chain matches — the request is surfaced as-is.
+#[must_use]
+pub fn should_retry_stale_eof_for_method(method: &http::Method, chain_has_eof: bool) -> bool {
+    chain_has_eof && is_idempotent_method(method)
+}
+
 /// Walk an error source chain looking for the stale-pool TLS signature.
 /// Split out (pure over `&dyn Error`) so it is unit-testable without
 /// constructing a real `reqwest::Error`.
+///
+/// Fragility note (PR20): the `Display.contains("close_notify" |
+/// "UnexpectedEof")` arm is best-effort string matching across
+/// rustls/hyper versions — message wording is not a stable API and a
+/// reword could silently disable the Cloudflare keep-alive retry (false
+/// negative, never a false retry: unknown errors stay non-retryable). The
+/// authoritative signal is the `io::ErrorKind::UnexpectedEof` downcast
+/// checked first; the string arm only covers rustls builds that surface the
+/// race as `io::Error::other` with the token in the message. Keep both arms,
+/// keep the gate fail-closed (no match = no retry).
 fn source_chain_has_eof(mut source: Option<&(dyn std::error::Error + 'static)>) -> bool {
     while let Some(err) = source {
         if let Some(io) = err.downcast_ref::<std::io::Error>()
@@ -275,5 +347,48 @@ mod tests {
         let timed_out = IoError::new(ErrorKind::TimedOut, "timed out");
         assert!(!super::source_chain_has_eof(Some(&timed_out)));
         assert!(!super::source_chain_has_eof(None));
+    }
+
+    #[test]
+    fn idempotent_methods_allow_stale_eof_retry() {
+        assert!(super::is_idempotent_method(&http::Method::GET));
+        assert!(super::is_idempotent_method(&http::Method::HEAD));
+        assert!(super::is_idempotent_method(&http::Method::OPTIONS));
+        assert!(super::is_idempotent_method(&http::Method::PUT));
+        assert!(super::is_idempotent_method(&http::Method::DELETE));
+    }
+
+    #[test]
+    fn post_is_never_replayed_on_stale_pool_eof() {
+        // PR20 double-submit guard: even with a matching EOF chain, a
+        // non-idempotent method must not retry the stale-pool race.
+        // `GET` keeps the Cloudflare keep-alive fix.
+        assert!(super::should_retry_stale_eof_for_method(
+            &http::Method::GET,
+            true
+        ));
+        assert!(super::should_retry_stale_eof_for_method(
+            &http::Method::HEAD,
+            true
+        ));
+        assert!(!super::should_retry_stale_eof_for_method(
+            &http::Method::POST,
+            true
+        ));
+        assert!(!super::should_retry_stale_eof_for_method(
+            &http::Method::PATCH,
+            true
+        ));
+        // No chain match = no retry whatever the method (fail-closed).
+        assert!(!super::should_retry_stale_eof_for_method(
+            &http::Method::GET,
+            false
+        ));
+        assert!(!super::should_retry_stale_eof_for_method(
+            &http::Method::POST,
+            false
+        ));
+        assert!(!super::is_idempotent_method(&http::Method::POST));
+        assert!(!super::is_idempotent_method(&http::Method::PATCH));
     }
 }

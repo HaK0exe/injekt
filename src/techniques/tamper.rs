@@ -62,6 +62,9 @@ pub enum Tamper {
     VersionedFuzz,
     /// `"` → `\u0022`, `'` → `\u0027`, ` ` → `\u0020`, `/` → `\u002f`
     /// (JSON-unicode escapes; trailing line-comment terminator preserved).
+    /// **Breaks boolean TRUE/FALSE differentials** like [`Tamper::Base64Encode`]:
+    /// the backend sees literal `\u0027` (no quote to close), so both branches
+    /// go inert (equally false) — see [`Tamper::is_boolean_safe`].
     JsonUnicodeEscape,
     /// Seeded numeric obfuscation: integer literals → `{n}e0` (`1=1` →
     /// `1e0=1e0`) or ASCII-hex (`1` → `0x31`); equality coherence keeps
@@ -174,12 +177,14 @@ impl Tamper {
     ///
     /// Most tampers rewrite both sides of the pair identically, so the
     /// differential stays valid. [`Tamper::Base64Encode`] makes the whole
-    /// payload opaque to backends that do not Base64-decode: TRUE and FALSE
-    /// become indistinguishable, so boolean-style detectors must skip sets
-    /// containing it (see [`boolean_safe_transformation_sets`]).
+    /// payload opaque to backends that do not Base64-decode, and
+    /// [`Tamper::JsonUnicodeEscape`] escapes the quotes the injection needs
+    /// (`'` → `\u0027`): both branches become equally inert/false. TRUE and
+    /// FALSE become indistinguishable, so boolean-style detectors must skip
+    /// sets containing either (see [`boolean_safe_transformation_sets`]).
     #[must_use]
     pub const fn is_boolean_safe(&self) -> bool {
-        !matches!(self, Self::Base64Encode)
+        !matches!(self, Self::Base64Encode | Self::JsonUnicodeEscape)
     }
 
     /// Apply this single tamper to `payload` and return the transformed string.
@@ -442,7 +447,8 @@ pub fn tamper_transformation_sets(tampers: &[Tamper]) -> Vec<Vec<Tamper>> {
 /// Boolean-differential-safe variant of [`tamper_transformation_sets`].
 ///
 /// Drops every set containing a tamper for which [`Tamper::is_boolean_safe`]
-/// is `false` (currently [`Tamper::Base64Encode`): an opaque transform would
+/// is `false` (currently [`Tamper::Base64Encode`] and
+/// [`Tamper::JsonUnicodeEscape`]): an opaque/inert transform would
 /// make TRUE and FALSE indistinguishable and could mask a real finding or
 /// waste the confirmation budget. The `[]` (original) set is always kept, so
 /// the result is never empty and stays within the same `t.len()+2` bound.
@@ -775,8 +781,13 @@ fn apply_versioned_fuzz(payload: &str, rng: &mut impl rand::Rng) -> String {
 }
 
 /// JSON-unicode escapes for WAF-visible chars, applied to the body only
-/// (trailing `-- ...`/`#...` terminator preserved verbatim). Digits are
-/// untouched, so TRUE (`1`) vs FALSE (`2`) stay distinct.
+/// (trailing `-- ...`/`#...` terminator preserved verbatim).
+///
+/// NOT boolean-safe: escaping `'`/`"` removes the quote the injection relies
+/// on, so both TRUE and FALSE branches go inert (equally false) even though
+/// the transformed strings stay `a != b`. Boolean detectors must skip it
+/// (see [`Tamper::is_boolean_safe`]); string-level `assert_ne!` alone cannot
+/// catch this semantic collapse.
 fn apply_json_unicode_escape(payload: &str) -> String {
     let (body, tail) = split_trailing_comment(payload);
     let mut out = String::with_capacity(body.len() + 16);
@@ -802,15 +813,36 @@ fn integer_literal_regex() -> Option<&'static Regex> {
 /// One style per payload from `rng`: `{n}e0` (`1=1` → `1e0=1e0`, value
 /// preserving) or ASCII-hex (`1` → `0x31`, equality preserving). Both keep
 /// `TRUE == TRUE` and `TRUE != FALSE`, whatever each branch draws.
+///
+/// Two carve-outs keep function/arithmetic oracles coherent:
+/// - digits inside `CHAR(...)`/`CHR(...)` are left untouched (`CHAR(97)` must
+///   stay `97`: `CHAR(0x3937)` drifts from `'a'` and large codes can NULL/error
+///   per DBMS, collapsing the differential);
+/// - all-zero literals (`0`, `00`) stay `0` so `DIV 0 → NULL` (falsy, oracle
+///   holds) and `XOR 0` (falsy) survive the ASCII-hex style (`0` → `0x30`=48
+///   would turn falsy into truthy and flip `1 DIV 0` / `1 XOR 0` to true).
 fn apply_numeric_obfuscate(payload: &str, rng: &mut impl rand::Rng) -> String {
     let (body, tail) = split_trailing_comment(payload);
     let Some(re) = integer_literal_regex() else {
         return payload.to_owned();
     };
+    let protected = char_chr_protected_ranges(body);
     let hex_style = rng.random_bool(0.5);
     let replaced = re
         .replace_all(body, |caps: &regex::Captures| {
-            let n = &caps[0];
+            let Some(m) = caps.get(0) else {
+                return String::new();
+            };
+            let n = m.as_str();
+            if n.bytes().all(|b| b == b'0') {
+                return n.to_owned();
+            }
+            if protected
+                .iter()
+                .any(|&(start, end)| m.start() >= start && m.start() < end)
+            {
+                return n.to_owned();
+            }
             if hex_style {
                 let mut h = String::with_capacity(2 + n.len() * 2);
                 h.push_str("0x");
@@ -824,6 +856,66 @@ fn apply_numeric_obfuscate(payload: &str, rng: &mut impl rand::Rng) -> String {
         })
         .into_owned();
     format!("{replaced}{tail}")
+}
+
+/// Byte ranges of `CHAR(...)` / `CHR(...)` argument lists in `body` where
+/// [`apply_numeric_obfuscate`] must not rewrite integer literals.
+/// Case-insensitive `char`/`chr` + optional whitespace + balanced parens;
+/// unbalanced trailing `(` protects to end. Word-boundary checked so
+/// `XCHAR(` does not match.
+fn char_chr_protected_ranges(body: &str) -> Vec<(usize, usize)> {
+    fn is_word_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+    let bytes = body.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i > 0 && is_word_byte(bytes[i - 1]) {
+            i += 1;
+            continue;
+        }
+        let mut len = 0;
+        if body
+            .get(i..i + 4)
+            .is_some_and(|s| s.eq_ignore_ascii_case("char"))
+        {
+            len = 4;
+        } else if body
+            .get(i..i + 3)
+            .is_some_and(|s| s.eq_ignore_ascii_case("chr"))
+        {
+            len = 3;
+        }
+        if len == 0 {
+            i += 1;
+            continue;
+        }
+        let mut j = i + len;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'(' {
+            i += 1;
+            continue;
+        }
+        let open = j;
+        let mut depth = 1_usize;
+        j += 1;
+        while j < bytes.len() && depth > 0 {
+            if bytes[j] == b'(' {
+                depth += 1;
+            } else if bytes[j] == b')' {
+                depth = depth.saturating_sub(1);
+            }
+            j += 1;
+        }
+        if j > open + 1 {
+            ranges.push((open + 1, j.saturating_sub(1)));
+        }
+        i = j;
+    }
+    ranges
 }
 
 /// Seeded trailing line-comment swap. Without a `split_trailing_comment`
@@ -1232,7 +1324,7 @@ mod tests {
     fn other_tampers_are_boolean_safe() {
         for name in Tamper::all_names() {
             let t = Tamper::from_name(name).unwrap_or_else(|| panic!("known {name}"));
-            if t == Tamper::Base64Encode {
+            if t == Tamper::Base64Encode || t == Tamper::JsonUnicodeEscape {
                 continue;
             }
             assert!(t.is_boolean_safe(), "{name} should be boolean-safe");
@@ -1249,6 +1341,21 @@ mod tests {
         assert_eq!(sets[1], vec![Tamper::Space2Comment]);
         for s in &sets {
             assert!(!s.contains(&Tamper::Base64Encode));
+        }
+    }
+
+    #[test]
+    fn boolean_safe_sets_drop_json_unicode_escape() {
+        // I1: `JsonUnicodeEscape` escapes the injection quote itself, so both
+        // branches go inert — it must be filtered like `Base64Encode`.
+        assert!(!Tamper::JsonUnicodeEscape.is_boolean_safe());
+        let tampers = vec![Tamper::Space2Comment, Tamper::JsonUnicodeEscape];
+        let sets = boolean_safe_transformation_sets(&tampers);
+        assert_eq!(sets.len(), 2);
+        assert_eq!(sets[0], Vec::<Tamper>::new());
+        assert_eq!(sets[1], vec![Tamper::Space2Comment]);
+        for s in &sets {
+            assert!(!s.contains(&Tamper::JsonUnicodeEscape));
         }
     }
 
@@ -1429,9 +1536,13 @@ mod tests {
             Some(Tamper::JsonUnicodeEscape)
         );
         assert_eq!(Tamper::from_name("commentfuzz"), Some(Tamper::LineComment));
+        // I1: `JsonUnicodeEscape` (like `Base64Encode`) is NOT boolean-safe:
+        // it escapes the injection quote itself, both branches go inert.
+        assert!(!Tamper::Base64Encode.is_boolean_safe());
+        assert!(!Tamper::JsonUnicodeEscape.is_boolean_safe());
         for name in Tamper::all_names() {
             let t = Tamper::from_name(name).expect("known tamper");
-            if t == Tamper::Base64Encode {
+            if t == Tamper::Base64Encode || t == Tamper::JsonUnicodeEscape {
                 continue;
             }
             assert!(t.is_boolean_safe(), "{name} should be boolean-safe");
@@ -1604,6 +1715,64 @@ mod tests {
     }
 
     #[test]
+    fn numericobfuscate_preserves_char_chr_and_zero_coherence() {
+        use crate::seeded_rng::make_rng;
+        // Crossed I1: `CHAR(97)`/`CHR(97)` function oracles × `NumericObfuscate`.
+        // The `97` inside `CHAR(...)/CHR(...)` must survive (`CHAR(0x3937)`
+        // drifts from `'a'`), `0` must stay `0` (`DIV 0 → NULL`, `XOR 0` falsy).
+        // TRUE stays `X=X`, FALSE stays `X=Y` with `X != Y`, per branch.
+        let pairs = [
+            ("' OR CHAR(97)=CHAR(97) -- -", "' OR CHAR(97)=CHAR(98) -- -"),
+            ("' OR CHR(97)=CHR(97) -- -", "' OR CHR(97)=CHR(98) -- -"),
+            ("' OR 1 DIV 1 -- -", "' OR 1 DIV 0 -- -"),
+            ("' OR 1 XOR 0 -- -", "' OR 1 XOR 1 -- -"),
+        ];
+        for seed in [1, 2, 3, 7, 42] {
+            for (true_p, false_p) in &pairs {
+                let mut rng = make_rng(Some(seed));
+                let a = Tamper::NumericObfuscate.apply_with_rng(true_p, &mut rng);
+                let mut rng = make_rng(Some(seed));
+                let b = Tamper::NumericObfuscate.apply_with_rng(false_p, &mut rng);
+                assert_ne!(a, b, "seed {seed} collapsed differential for {true_p}");
+                for out in [&a, &b] {
+                    assert!(out.ends_with("-- -"), "terminator preserved: {out}");
+                }
+                if true_p.contains("CHAR(") || true_p.contains("CHR(") {
+                    assert!(
+                        a.contains("CHAR(97)=CHAR(97)") || a.contains("CHR(97)=CHR(97)"),
+                        "CHAR/CHR args must survive obfuscation: {a}"
+                    );
+                    assert!(
+                        b.contains("CHAR(97)=CHAR(98)") || b.contains("CHR(97)=CHR(98)"),
+                        "CHAR/CHR FALSE must stay X=Y with X!=Y: {b}"
+                    );
+                    assert!(
+                        !a.contains("0x3937") && !a.contains("97e0"),
+                        "97 inside CHAR/CHR must not be rewritten: {a}"
+                    );
+                }
+                if true_p.contains("DIV") {
+                    assert!(
+                        b.contains("DIV 0"),
+                        "DIV-by-zero NULL oracle must keep bare 0: {b}"
+                    );
+                }
+                if true_p.contains("XOR 0") {
+                    assert!(
+                        a.contains("XOR 0") || a.contains("XOR 0x30"),
+                        "XOR TRUE must keep falsy 0: {a}"
+                    );
+                }
+            }
+        }
+        // Lowercase / spaced variants are protected too.
+        let mut rng = make_rng(Some(9));
+        let out =
+            Tamper::NumericObfuscate.apply_with_rng("' OR char (97)=char (97) -- -", &mut rng);
+        assert!(out.contains("char (97)=char (97)"), "got {out}");
+    }
+
+    #[test]
     fn linecomment_swaps_terminator_seeded() {
         use crate::seeded_rng::make_rng;
         use std::collections::HashSet;
@@ -1645,10 +1814,12 @@ mod tests {
             ("' OR 1=1 -- -", "' OR 1=2 -- -"),
             ("' OR 'a'='a' -- -", "' OR 'a'='b' -- -"),
         ];
+        // I1: `JsonUnicodeEscape` excluded — string-level `a != b` still holds
+        // but both branches are semantically inert (quotes escaped), so it is
+        // NOT boolean-safe and must not be asserted as such here.
         let tampers = [
             Tamper::Space2Paren,
             Tamper::VersionedFuzz,
-            Tamper::JsonUnicodeEscape,
             Tamper::NumericObfuscate,
             Tamper::LineComment,
         ];
@@ -1660,6 +1831,33 @@ mod tests {
                 let b = t.apply_with_rng(false_p, &mut rng);
                 assert_ne!(a, b, "{t:?} collapsed differential for {true_p}");
             }
+        }
+    }
+
+    #[test]
+    fn jsonunicodeescape_is_not_boolean_safe_despite_string_difference() {
+        // I1 regression: `a != b` as strings is NOT enough — the escaped quotes
+        // make both branches equally inert server-side (no quote to close).
+        use crate::seeded_rng::make_rng;
+        assert!(!Tamper::JsonUnicodeEscape.is_boolean_safe());
+        let mut rng = make_rng(Some(42));
+        let a = Tamper::JsonUnicodeEscape.apply_with_rng("' OR 1=1 -- -", &mut rng);
+        let b = Tamper::JsonUnicodeEscape.apply_with_rng("' OR 1=2 -- -", &mut rng);
+        // Strings differ (digits untouched) yet both are inert: no raw `'`
+        // left in the body to break out of the string context.
+        assert_ne!(a, b);
+        for out in [&a, &b] {
+            let body = out.split("--").next().unwrap_or("");
+            assert!(
+                !body.contains('\''),
+                "inert payload must not keep a raw quote: {out}"
+            );
+        }
+        // And the safe-sets filter really drops it.
+        let sets =
+            boolean_safe_transformation_sets(&[Tamper::Space2Comment, Tamper::JsonUnicodeEscape]);
+        for s in &sets {
+            assert!(!s.contains(&Tamper::JsonUnicodeEscape));
         }
     }
 

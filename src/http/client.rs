@@ -733,7 +733,14 @@ impl HttpClient {
                 Err(e) => {
                     let retryable = match &e {
                         ClientError::Timeout(_) => true,
-                        ClientError::Reqwest(e) => crate::http::retry::is_retryable_error(e),
+                        // Idempotence-gated stale-pool EOF (PR20): `GET`/`HEAD`
+                        // keep the Cloudflare keep-alive retry, `POST`/`PATCH`
+                        // never replay the race (double-submit). `timeout` /
+                        // `connect` / `body` stay retryable for all methods
+                        // (historical behaviour).
+                        ClientError::Reqwest(e) => {
+                            crate::http::retry::is_retryable_error_for_method(e, &spec.method)
+                        }
                         _ => false,
                     } && self.retry.should_retry(attempt, None);
                     if retryable {
