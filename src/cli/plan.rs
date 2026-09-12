@@ -591,9 +591,12 @@ mod tests {
         assert!(!plan.is_empty());
         assert_eq!(plan.params.len(), 1);
         assert_eq!(plan.ordered.len(), 8);
-        // `error` leads on a bare numeric param (highest EVI/cost: 0.765 vs
-        // 0.74 for `boolean` at calibrated priors), and scores never rise.
-        assert_eq!(plan.ordered[0].technique, "error");
+        // `boolean` leads on a bare numeric param (entropie binaire Phase 0 :
+        // EVI `4·p·(1-p)·base` → boolean prior 0.26 ⇒ 0.77 vs `error` prior
+        // 0.15 ⇒ 0.46 ; l'ancien `(1-p)·base` donnait `error` 0.765 vs
+        // `boolean` 0.74 — bugfix documenté, ordre L1 changé voulu), and
+        // scores never rise.
+        assert_eq!(plan.ordered[0].technique, "boolean");
         let mut prev = f64::INFINITY;
         for probe in &plan.ordered {
             assert!(

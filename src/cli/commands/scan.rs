@@ -50,7 +50,8 @@ pub(crate) fn engine_config(cli: &Cli) -> EngineConfig {
         budget: crate::engine::orchestrator::BudgetConfig {
             threads: cli.effective_threads(),
             level: cli.effective_level(),
-            request_budget: None,
+            request_budget: cli.effective_request_budget(),
+            max_duration_secs: cli.effective_max_duration(),
         },
         evasion: crate::engine::orchestrator::EvasionConfig {
             payload_opts: cli.payload_opts(),

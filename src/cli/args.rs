@@ -221,6 +221,27 @@ pub struct Cli {
     #[arg(long, global = true, value_parser = clap::value_parser!(u8).range(1..=5), env = "INJEKT_LEVEL")]
     pub level: Option<u8>,
 
+    /// Global detection time budget in seconds (`--max-duration 120`).
+    /// `None` (default) = unlimited, historical behaviour byte-identical.
+    /// When set, the per-parameter detection loop breaks early once the
+    /// shared detection clock exceeds it (warn + clean `Done`, no new
+    /// findings invented).
+    #[arg(long = "max-duration", global = true, env = "INJEKT_MAX_DURATION")]
+    pub max_duration: Option<u64>,
+
+    /// Global request budget for a run (`--request-budget 25`).
+    /// `None` (default) = unlimited, historical behaviour byte-identical
+    /// (A1 evasion needs ~1032 req live: never cap by default).
+    /// When set, detection stops cooperatively once the shared
+    /// `SessionState::request_count` reaches it: current technique finishes,
+    /// no new technique starts (warn + clean `Done`, never an error, never
+    /// a new finding). Per-parameter [`RequestBudget`] is seeded with the
+    /// same value for scheduler visibility (`budget_total`), so the
+    /// authoritative global check lives in the orchestrator (concurrent
+    /// params may overshoot by one technique each).
+    #[arg(long = "request-budget", global = true, env = "INJEKT_REQUEST_BUDGET")]
+    pub request_budget: Option<usize>,
+
     /// Strict second-pass confirmation (C6 real): re-sondes every confirmed
     /// finding with fresh payloads + derived seed after detection (OOB
     /// excluded, ~2x requests worst-case, documented). Never creates new
@@ -272,7 +293,7 @@ pub struct Cli {
     #[arg(long, global = true, env = "INJEKT_OOB_WAIT_SECS")]
     pub oob_wait_secs: Option<u64>,
 
-    /// WAF tamper scripts (comma-separated): space2comment,space2plus,randomcase,versionedcomment,versionedmorekeywords,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,betweencomment,randomcomments,equaltolike,base64encode (opt-in: breaks boolean differentials)
+    /// WAF tamper scripts (comma-separated): space2comment,space2plus,randomcase,versionedcomment,versionedmorekeywords,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,betweencomment,randomcomments,equaltolike,space2paren,versionedfuzz,jsonunicodeescape,numericobfuscate,linecomment,base64encode (opt-in: breaks boolean differentials). Presets: cloudflare-generic (=randomcase,space2comment,versionedmorekeywords), aggressive (=randomcase,space2paren,versionedfuzz,equaltolike)
     #[arg(long, global = true, value_delimiter = ',', env = "INJEKT_TAMPER")]
     pub tamper: Vec<String>,
 
@@ -437,6 +458,8 @@ impl core::fmt::Debug for Cli {
             .field("code", &self.code)
             .field("text_only", &self.text_only)
             .field("level", &self.level)
+            .field("max_duration", &self.max_duration)
+            .field("request_budget", &self.request_budget)
             .field("confirm", &self.confirm)
             .field("no_mutation", &self.no_mutation)
             .field("explain", &self.explain)
@@ -766,6 +789,24 @@ impl Cli {
             return Some(v);
         }
         self.file_snapshot().seed
+    }
+
+    /// Effective global detection time budget in seconds (Phase 3).
+    /// `None` (default) = unlimited, historical behaviour byte-identical.
+    /// Profiles / config file never set it (explicit opt-in only).
+    #[must_use]
+    pub const fn effective_max_duration(&self) -> Option<u64> {
+        self.max_duration
+    }
+
+    /// Effective global request budget (CODE calibration).
+    /// `None` (default) = unlimited, historical behaviour byte-identical.
+    /// Profiles / config file never set it (explicit opt-in only, like
+    /// `--max-duration`): only `--request-budget N` / `INJEKT_REQUEST_BUDGET`
+    /// enables the cooperative global stop.
+    #[must_use]
+    pub const fn effective_request_budget(&self) -> Option<usize> {
+        self.request_budget
     }
 
     /// C13 opt-in gate: `false` par défaut → RAM-only, aucune IO knowledge,
@@ -1157,6 +1198,8 @@ mod tests {
             code: None,
             text_only: false,
             level: None,
+            max_duration: None,
+            request_budget: None,
             confirm: false,
             no_mutation: false,
             explain: None,
@@ -1282,5 +1325,54 @@ mod tests {
         assert!(cli.validate_explicit_config().is_err());
         cli.config = None;
         assert!(cli.validate_explicit_config().is_ok());
+    }
+
+    #[test]
+    fn max_duration_defaults_to_none_byte_identical() {
+        // Phase 3: default None = unlimited, historical behaviour.
+        let cli = blank_cli();
+        assert_eq!(cli.effective_max_duration(), None);
+        let mut cli = blank_cli();
+        cli.max_duration = Some(120);
+        assert_eq!(cli.effective_max_duration(), Some(120));
+    }
+
+    #[test]
+    fn max_duration_parses_from_cli() {
+        use clap::Parser as _;
+        let cli =
+            Cli::try_parse_from(["injekt", "--max-duration", "60"]).unwrap_or_else(|_| blank_cli());
+        assert_eq!(cli.effective_max_duration(), Some(60));
+        let cli_default = Cli::try_parse_from(["injekt"]).unwrap_or_else(|_| blank_cli());
+        // Explicit config slot may shadow auto-discovery in this harness;
+        // the flag itself must be None when absent.
+        assert!(
+            cli_default.max_duration.is_none(),
+            "default --max-duration must be None"
+        );
+    }
+
+    #[test]
+    fn request_budget_defaults_to_none_byte_identical() {
+        // CODE calibration: default None = unlimited, historical behaviour
+        // (A1 evasion ~1032 req live must never trip a default cap).
+        let cli = blank_cli();
+        assert_eq!(cli.effective_request_budget(), None);
+        let mut cli = blank_cli();
+        cli.request_budget = Some(25);
+        assert_eq!(cli.effective_request_budget(), Some(25));
+    }
+
+    #[test]
+    fn request_budget_parses_from_cli() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["injekt", "--request-budget", "25"])
+            .unwrap_or_else(|_| blank_cli());
+        assert_eq!(cli.effective_request_budget(), Some(25));
+        let cli_default = Cli::try_parse_from(["injekt"]).unwrap_or_else(|_| blank_cli());
+        assert!(
+            cli_default.request_budget.is_none(),
+            "default --request-budget must be None"
+        );
     }
 }

@@ -5,8 +5,9 @@
 //! * Single URL (or raw/bulk/stdin/OpenAPI/sitemap/raw-dir ingestion) → direct scan.
 //! * Bare host or `--with-recon` → crawl, then test each discovered candidate.
 //! * Escalation loop (unless `--no-escalate`): L1 as-configured → L2
-//!   (`level ≥ 2` + `space2comment,randomcase`) → L3 (`level 3` + `text-only`
-//!   fallback + `hpp` + `space2comment,randomcase,charencode,equaltolike`).
+//!   (`level ≥ 2` + `space2comment,randomcase,versionedfuzz`) → L3 (`level 3` +
+//!   `text-only` fallback + `hpp` +
+//!   `space2comment,randomcase,charencode,equaltolike,numericobfuscate,linecomment`).
 //!   Stops at the first step with findings, so clean targets pay a single
 //!   pass and WAF-ish targets get two extra chances. `base64encode` is never
 //!   auto-enabled: it breaks boolean TRUE/FALSE differentials.
@@ -47,8 +48,9 @@ pub fn escalation_plan(base: &EngineConfig, escalate: bool) -> Vec<EscalationSte
     let mut l2 = base.clone();
     l2.budget.level = base.budget.level.max(2);
     if l2.evasion.tampers.is_empty() {
-        l2.evasion.tampers =
-            crate::techniques::tamper::parse_tamper_list(Some("space2comment,randomcase"));
+        l2.evasion.tampers = crate::techniques::tamper::parse_tamper_list(Some(
+            "space2comment,randomcase,versionedfuzz",
+        ));
     }
     l2.confirm = false;
     steps.push(EscalationStep {
@@ -58,12 +60,13 @@ pub fn escalation_plan(base: &EngineConfig, escalate: bool) -> Vec<EscalationSte
 
     let mut l3 = base.clone();
     l3.budget.level = base.budget.level.max(3);
-    // 4 tampers → 6 transformation sets (`t.len()+2` bound): adds `equaltolike`
-    // (`=`-signature WAFs) orthogonal to the space/encoding coverage. Opaque
+    // 6 tampers → 8 transformation sets (`t.len()+2` bound): adds `equaltolike`
+    // (`=`-signature WAFs) plus `numericobfuscate`/`linecomment` (numeric and
+    // terminator signatures) orthogonal to the space/encoding coverage. Opaque
     // tampers (`base64encode`) stay opt-in only — never auto-escalated.
-    if l3.evasion.tampers.len() < 4 {
+    if l3.evasion.tampers.len() < 6 {
         l3.evasion.tampers = crate::techniques::tamper::parse_tamper_list(Some(
-            "space2comment,randomcase,charencode,equaltolike",
+            "space2comment,randomcase,charencode,equaltolike,numericobfuscate,linecomment",
         ));
     }
     l3.matcher.text_only = true;
@@ -446,10 +449,40 @@ mod tests {
             !l3.contains(&Tamper::Base64Encode),
             "base64encode must stay opt-in (breaks boolean differentials): {l3:?}"
         );
-        // bounded escalation: 4 tampers → 6 sets, not exponential
+        // bounded escalation: 6 tampers → 8 sets, not exponential
         assert_eq!(
             crate::techniques::tamper::tamper_transformation_sets(l3).len(),
             l3.len() + 2
+        );
+    }
+
+    #[test]
+    fn l2_adds_versionedfuzz() {
+        use crate::techniques::tamper::Tamper;
+        let steps = escalation_plan(&base_config(), true);
+        let l2 = &steps[1].config.evasion.tampers;
+        assert!(
+            l2.contains(&Tamper::VersionedFuzz),
+            "L2 should add versionedfuzz: {l2:?}"
+        );
+        assert!(
+            !l2.contains(&Tamper::Base64Encode),
+            "base64encode must stay opt-in: {l2:?}"
+        );
+    }
+
+    #[test]
+    fn l3_adds_numericobfuscate_and_linecomment() {
+        use crate::techniques::tamper::Tamper;
+        let steps = escalation_plan(&base_config(), true);
+        let l3 = &steps[2].config.evasion.tampers;
+        assert!(
+            l3.contains(&Tamper::NumericObfuscate),
+            "L3 should add numericobfuscate: {l3:?}"
+        );
+        assert!(
+            l3.contains(&Tamper::LineComment),
+            "L3 should add linecomment: {l3:?}"
         );
     }
 

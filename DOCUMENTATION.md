@@ -118,6 +118,7 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--code <N>` | Response status **must equal** this code, otherwise veto finding | — |
 | `--text-only` | Strip HTML tags/entities before matching and detection | `false` |
 | `--level <1-5>` | Aggressiveness: L1 = historical payload budget, L2 doubles it, L3+ tries every payload and widens ORDER BY enumeration | `1` |
+| `--request-budget <N>` | Global request budget (**OPT-IN** calibration): detection stops cooperatively once total `request_count` reaches `N` (current technique finishes, clean `Done`, no error, no new finding; concurrent params may overshoot by one technique each). Per-param scheduler is seeded with the same value for visibility (`budget_total`). `None` = unlimited (default, historical behaviour — A1 evasion needs ~1032 req live, never cap by default) | — |
 | `--seed <N>` | Deterministic run seed, recorded in the report as `seed` (C1 metrology). Seeds all non-cryptographic RNG (tamper scripts, request jitter, UA rotation, retry backoff): runs with the same seed are deterministic. Crypto randomness (export salt/nonce) always stays OS-random | — |
 | `--confirm` | Strict second-pass confirmation (planned C6; **currently warning-only, not implemented** — in-detection 3-trial confirmation still applies regardless of this flag) | `false` |
 | `--ignore-code <LIST>` | Status codes treated as negative probes (e.g. `--ignore-code 429,503`); never yields a finding. Baseline/WAF detection runs **before** this filter and is never ignored | — |
