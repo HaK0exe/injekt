@@ -51,8 +51,11 @@ fn check_golden(name: &str, rendered: &str) {
     }
     let expected = std::fs::read_to_string(&path)
         .unwrap_or_else(|_| panic!("golden file missing: {path} (run with UPDATE_GOLDEN=1)"));
+    // Compare line-ending-insensitively: on Windows, git may check goldens out
+    // with CRLF (core.autocrlf), while `rendered` is always LF. The surface
+    // freeze cares about content, not the platform's newline convention.
     assert!(
-        expected == rendered,
+        expected.replace("\r\n", "\n") == rendered.replace("\r\n", "\n"),
         "golden mismatch for {name}: review the diff, then UPDATE_GOLDEN=1 to accept"
     );
 }

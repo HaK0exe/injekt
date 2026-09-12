@@ -1,0 +1,13 @@
+# Normalize all text files to LF on checkout across every platform.
+# Without this, Windows CI (core.autocrlf=true) checks out golden fixtures
+# with CRLF, breaking the byte-exact surface-freeze goldens in
+# tests/golden/* against the LF strings the tests generate.
+* text=auto eol=lf
+
+# Golden fixtures are compared byte-for-byte: pin them to LF explicitly.
+tests/golden/** text eol=lf
+
+# Binary types git should never touch.
+*.png binary
+*.jpg binary
+*.ico binary
