@@ -63,11 +63,39 @@ pub const fn cost_for(kind: TechniqueKind) -> f64 {
     1.0 + latency_secs_for(kind) + waf_risk_for(kind)
 }
 
+/// TTFB-aware dynamic cost (Phase 3 perf baseline/contexte/time).
+///
+/// Scales a static `base_cost` (typically [`cost_for`]) when the baseline
+/// mean exceeds 2000ms: `base * (1 + mean_ms / 5000)`. Below/at 2000ms (or on
+/// non-finite input) the cost is returned unchanged, so `mean_ms = 0`
+/// (unknown baseline) keeps the historical static schedule byte-identical.
+///
+/// Rationale: on a slow target (mean 5s) a `time` sleep probe parks a slot
+/// for ~10s + class timeout risk, so its EVI/cost score must drop relative
+/// to cheap differentials. The caller applies this selectively to slow
+/// channels (`time`); fast techniques keep the static cost.
+#[must_use]
+pub fn cost_for_with_ttfb(base_cost: f64, mean_ms: f64) -> f64 {
+    if !base_cost.is_finite() || !mean_ms.is_finite() || mean_ms <= 2000.0 {
+        return base_cost;
+    }
+    base_cost * (1.0 + mean_ms / 5000.0)
+}
+
 /// Expected Value of Information for a technique at `posterior`:
-/// `(1 - posterior) * base_evi`. Falls as belief converges (0 or 1).
+/// binary variance `4·p·(1-p)·base_evi`, peak `base_evi` at `p = 0.5`
+/// (max uncertainty), zero at convergence (0 or 1).
+///
+/// Phase 0 bugfix (documenté) : l'ancien `(1-posterior)·base` décroissait
+/// monotonement et favorisait toujours le prior le plus faible (ex. `oob`
+/// 0.02 → EVI ~0.98·base) au lieu de la réduction d'incertitude maximale.
+/// La variance binaire normalisée (`4·p·(1-p)`, max 1.0 à 0.5) restaure le
+/// pic à 0.5 ; `score = evi / cost` inchangé. L'ordre L1 change sur priors
+/// calibrés (voulu : prioriser l'incertitude, pas le plus petit prior).
 #[must_use]
 pub fn evi_for(kind: TechniqueKind, posterior: f64) -> f64 {
-    (1.0 - posterior.clamp(0.0, 1.0)) * base_evi_for(kind)
+    let p = posterior.clamp(0.0, 1.0);
+    4.0 * p * (1.0 - p) * base_evi_for(kind)
 }
 
 /// Clamp a knowledge multiplier to `[0.5, 2.0]`; non-finite input is neutral.
@@ -221,17 +249,23 @@ impl RequestBudget {
 /// Early stopping mechanism for clean targets (N1/N2 veto: 25 negatives)
 /// and early resolution on confirmed vulnerabilities.
 ///
-/// Counts consecutive negative technique **outcomes** (one unit per
-/// `record_outcome`, whatever the request cost): the v0.5 loop runs each
-/// enabled technique once per parameter (8 max), so a per-parameter counter
-/// never trips mid-pass and cannot starve a late technique (`union`,
-/// `stacked`, `json`) on single-channel-vulnerable targets. The N1/N2 bound
-/// comes from inter-param isolation: every parameter starts from a fresh
-/// counter via [`EarlyStop::reset_for_new_param`] (called by the
-/// orchestrator at each parameter boundary), while the true cross-param
-/// total stays visible in `SessionState::request_count` and in the seeded
-/// [`RequestBudget`]. Any confirmed finding latches `confirmed` and disables
-/// stopping for that parameter.
+/// Counts consecutive negative **requests within the current technique
+/// family** (per-request cost, not per technique): `record_requests`
+/// adds `spent` on a negative outcome. The streak resets at every
+/// technique boundary via [`EarlyStop::reset_negative_streak`] (called by
+/// the orchestrator when it pops the next family), so the veto can only
+/// trip on a single family spending `>= max_negative_probes` negative
+/// requests (e.g. a full L2 boolean matrix on a clean target) — it can
+/// never starve never-attempted families (a boolean-negative target may
+/// still be nosql-positive; cross-family starvation would be a silent
+/// false negative, the worst failure mode for a scanner).
+///
+/// Inter-param isolation is separate: each parameter repart d'un compteur
+/// frais via [`EarlyStop::reset_for_new_param`] (called by the orchestrator
+/// at each parameter boundary), while the cross-param total stays visible
+/// in `SessionState::request_count` and in the [`RequestBudget`]. Any
+/// confirmed finding locks `confirmed` and disables the stop for the rest
+/// of the parameter (both resets preserve it).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct EarlyStop {
@@ -264,10 +298,17 @@ impl EarlyStop {
     }
 
     pub fn record_result(&mut self, is_finding: bool) {
+        self.record_requests(is_finding, 1);
+    }
+
+    /// Per-request variant (Phase 0) : ajoute `requests_spent` (pas 1) sur
+    /// négatif, de sorte que `max_negative_probes` se compare à des
+    /// requêtes et trippe mid-pass sur cible propre.
+    pub fn record_requests(&mut self, is_finding: bool, requests_spent: usize) {
         if is_finding {
             self.confirmed = true;
         } else {
-            self.negative_count = self.negative_count.saturating_add(1);
+            self.negative_count = self.negative_count.saturating_add(requests_spent.max(1));
         }
     }
 
@@ -282,6 +323,15 @@ impl EarlyStop {
     pub fn reset_for_new_param(&mut self) {
         self.negative_count = 0;
         self.confirmed = false;
+    }
+
+    /// Reset the negative streak at a technique-family boundary (the
+    /// orchestrator calls this when it starts a new family on the same
+    /// parameter). Unlike [`EarlyStop::reset_for_new_param`], `confirmed`
+    /// is preserved: a confirmed finding keeps disabling the veto for the
+    /// rest of the parameter.
+    pub fn reset_negative_streak(&mut self) {
+        self.negative_count = 0;
     }
 }
 
@@ -418,14 +468,16 @@ impl Scheduler {
     ///
     /// The [`RequestBudget`] (global `--request-budget` envelope, seeded with
     /// the `<=8` context probes by the orchestrator) advances by the spent
-    /// requests; the [`EarlyStop`] outcome counter advances by one unit per
-    /// technique so a single pass over the 8 techniques can never trip the
-    /// 25-negatives veto mid-pass (no starvation of late techniques on
-    /// single-channel targets). `budget_spent`, `next_best_probe` and the
-    /// N1/N2 wiring stay consistent.
+    /// requests; the [`EarlyStop`] negative streak advances by the same
+    /// spent requests. The streak resets at every technique boundary
+    /// ([`EarlyStop::reset_negative_streak`], called by the orchestrator),
+    /// so the 25-negative veto only trips on a single family spending that
+    /// much with zero signal — never by accumulating across untested
+    /// families. `budget_spent`, `next_best_probe` et le câblage
+    /// N1/N2 restent cohérents.
     pub fn record_outcome(&mut self, param: &str, is_finding: bool, requests_spent: usize) {
         self.budget.record_request(param, requests_spent);
-        self.early_stop.record_result(is_finding);
+        self.early_stop.record_requests(is_finding, requests_spent);
     }
 
     #[must_use]
@@ -594,17 +646,128 @@ mod tests {
     }
 
     #[test]
-    fn test_evi_decreases_as_posterior_rises() {
-        let low = evi_for(TechniqueKind::Boolean, 0.1);
-        let high = evi_for(TechniqueKind::Boolean, 0.8);
-        assert!(low > high);
-        assert!((low - 0.9).abs() < 1e-12);
-        assert!((high - 0.2).abs() < 1e-12);
-        // Score inherits the decay under neutral knowledge.
+    fn test_cost_for_with_ttfb_static_by_default() {
+        // mean 0 (unknown) / fast baseline => static cost unchanged.
+        let base = cost_for(TechniqueKind::Time);
+        assert!((cost_for_with_ttfb(base, 0.0) - base).abs() < 1e-12);
+        assert!((cost_for_with_ttfb(base, 500.0) - base).abs() < 1e-12);
+        assert!((cost_for_with_ttfb(base, 2000.0) - base).abs() < 1e-12);
+        // Non-finite inputs are pass-through (never NaN-poison the heap).
+        assert!((cost_for_with_ttfb(base, f64::NAN) - base).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_cost_for_with_ttfb_scales_slow_targets() {
+        // mean 5s => factor (1 + 5000/5000) = 2.0, time 3.0 -> 6.0.
+        let base = cost_for(TechniqueKind::Time);
+        let scaled = cost_for_with_ttfb(base, 5000.0);
+        assert!((scaled - 6.0).abs() < 1e-12, "got {scaled}");
+        assert!(scaled > base);
+        // Boundary just above 2000ms scales slightly.
+        let just_over = cost_for_with_ttfb(base, 2001.0);
+        assert!(just_over > base);
+        assert!((just_over - base * (1.0 + 2001.0 / 5000.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_evi_entropy_peaks_at_half() {
+        // Phase 0 : variance binaire normalisée `4·p·(1-p)·base`
+        // (pic `base` à 0.5, 0 aux convergences 0/1).
+        let base = base_evi_for(TechniqueKind::Boolean);
+        assert!((evi_for(TechniqueKind::Boolean, 0.5) - base).abs() < 1e-12);
+        assert!((evi_for(TechniqueKind::Boolean, 0.0)).abs() < 1e-12);
+        assert!((evi_for(TechniqueKind::Boolean, 1.0)).abs() < 1e-12);
+        assert!((evi_for(TechniqueKind::Boolean, 0.1) - 0.36 * base).abs() < 1e-12);
+        assert!((evi_for(TechniqueKind::Boolean, 0.8) - 0.64 * base).abs() < 1e-12);
+        // Symétrie p ↔ 1-p, pic strict à 0.5.
         assert!(
-            score_for(TechniqueKind::Boolean, 0.1, None)
+            (evi_for(TechniqueKind::Boolean, 0.2) - evi_for(TechniqueKind::Boolean, 0.8)).abs()
+                < 1e-12
+        );
+        assert!(evi_for(TechniqueKind::Boolean, 0.5) > evi_for(TechniqueKind::Boolean, 0.8));
+        assert!(evi_for(TechniqueKind::Boolean, 0.5) > evi_for(TechniqueKind::Boolean, 0.1));
+        // Score hérite du pic sous knowledge neutre.
+        assert!(
+            score_for(TechniqueKind::Boolean, 0.5, None)
                 > score_for(TechniqueKind::Boolean, 0.8, None)
         );
+        assert!(
+            score_for(TechniqueKind::Boolean, 0.5, None)
+                > score_for(TechniqueKind::Boolean, 0.1, None)
+        );
+    }
+
+    #[test]
+    fn test_early_stop_counts_requests_trips_mid_pass() {
+        // Phase 0 : `max_negative_probes` se compare à des requêtes.
+        // 3 outcomes × 10 req = 30 ≥ 25 → stop (l'ancien comptage par
+        // technique aurait exigé 25 outcomes et ne trippait jamais mid-pass
+        // sur 8 techniques).
+        let mut s = Scheduler::new(RequestBudget::unlimited(), EarlyStop::new(25));
+        s.push("id", TechniqueKind::Boolean, "p1", 1.0, 1.0, None);
+        assert!(!s.early_stop().should_stop());
+        s.record_outcome("id", false, 10);
+        assert!(!s.early_stop().should_stop());
+        s.record_outcome("id", false, 10);
+        assert!(!s.early_stop().should_stop());
+        s.record_outcome("id", false, 10);
+        assert!(s.early_stop().should_stop());
+        assert!(s.pop().is_none());
+        // Un finding verrouille `confirmed` et désactive le stop.
+        let mut c = Scheduler::new(RequestBudget::unlimited(), EarlyStop::new(5));
+        c.push("id", TechniqueKind::Boolean, "p1", 1.0, 1.0, None);
+        c.record_outcome("id", false, 10);
+        c.record_outcome("id", true, 1);
+        assert!(!c.early_stop().should_stop());
+    }
+
+    #[test]
+    fn test_early_stop_streak_resets_per_technique_family() {
+        // No cross-family starvation: boolean 24 + error 10 must NOT trip
+        // the 25 veto (boolean-negative != nosql-negative). Only a single
+        // family spending >= 25 trips it. Guards `nosql_in_all_techniques`.
+        let mut s = Scheduler::new(RequestBudget::unlimited(), EarlyStop::new(25));
+        s.push("id", TechniqueKind::Boolean, "p1", 1.0, 1.0, None);
+        s.push("id", TechniqueKind::Error, "p2", 1.0, 1.0, None);
+        s.push("id", TechniqueKind::Nosql, "p3", 1.0, 1.0, None);
+        // Family 1: 24 negatives, then boundary reset (orchestrator).
+        s.record_outcome("id", false, 24);
+        assert!(!s.early_stop().should_stop());
+        s.early_stop_mut().reset_negative_streak();
+        // Family 2: 10 negatives, then boundary reset.
+        s.record_outcome("id", false, 10);
+        assert!(!s.early_stop().should_stop());
+        s.early_stop_mut().reset_negative_streak();
+        // Family 3 runs: heap intact, pop still serves.
+        assert!(s.pop().is_some());
+        // But a single family spending >= 25 still trips (L2 long tails).
+        let mut t = Scheduler::new(RequestBudget::unlimited(), EarlyStop::new(25));
+        t.push("id", TechniqueKind::Boolean, "p1", 1.0, 1.0, None);
+        t.record_outcome("id", false, 100);
+        assert!(t.early_stop().should_stop());
+        assert!(t.pop().is_none());
+        // `confirmed` survives the streak reset (veto stays off).
+        let mut c = Scheduler::new(RequestBudget::unlimited(), EarlyStop::new(5));
+        c.push("id", TechniqueKind::Boolean, "p1", 1.0, 1.0, None);
+        c.record_outcome("id", true, 1);
+        c.early_stop_mut().reset_negative_streak();
+        assert!(!c.early_stop().should_stop());
+    }
+
+    #[test]
+    fn test_early_stop_record_requests_unit() {
+        let mut e = EarlyStop::new(5);
+        e.record_requests(false, 3);
+        assert_eq!(e.negative_count, 3);
+        assert!(!e.should_stop());
+        e.record_requests(false, 2);
+        assert!(e.should_stop());
+        // `record_result` reste l'alias 1-req pour compat.
+        let mut r = EarlyStop::new(2);
+        r.record_result(false);
+        assert_eq!(r.negative_count, 1);
+        r.record_result(false);
+        assert!(r.should_stop());
     }
 
     #[test]
