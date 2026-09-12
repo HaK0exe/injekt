@@ -235,6 +235,13 @@ def main() -> int:
         "xcheck.ansi-mismatch",
         R.cross_check_requests(ansi, 150)["match"] is False,
     )
+    # engine logs moved to stderr: callers pass stdout+stderr combined
+    combined = "noise on stdout " + ansi
+    check(
+        "xcheck.stderr-combined",
+        R.cross_check_requests(combined, 143)["match"] is True,
+        repr(combined),
+    )
 
     # --- compare / matrix over fixture histories -----------------------------
     with tempfile.TemporaryDirectory() as td:

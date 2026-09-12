@@ -532,8 +532,13 @@ def parse_ghauri(text: str) -> dict:
 # ------------------------------------------------------- request x-check --
 
 
-def cross_check_requests(stdout_full: str, report_count) -> dict:
+def cross_check_requests(log_text: str, report_count) -> dict:
     """Compare the engine log counter (`requests=N`) with the JSON report.
+
+    `log_text` should be stdout+stderr combined: engine logs moved to
+    stderr (console output keeps stdout machine-clean), and older
+    binaries logged to stdout — searching both keeps the check working
+    across versions.
 
     Returns {"engine_requests", "report_requests", "match", "note"} where
     match is True/False, or None when the engine line is absent (old binary,
@@ -544,7 +549,7 @@ def cross_check_requests(stdout_full: str, report_count) -> dict:
     sanitized before matching — a bare requests-equals-digits regex misses
     real log lines.
     """
-    clean = ANSI_RE.sub("", stdout_full or "")
+    clean = ANSI_RE.sub("", log_text or "")
     m = ENGINE_REQUESTS_RE.search(clean)
     engine = int(m.group(1)) if m else None
     if engine is None:
@@ -999,7 +1004,8 @@ def main() -> int:
             parsed = parse_injekt_report(out)
             parsed["elapsed_s"] = proc["elapsed_s"]
             xcheck = cross_check_requests(
-                proc.get("stdout", ""), parsed.get("request_count")
+                proc.get("stdout", "") + proc.get("stderr", ""),
+                parsed.get("request_count"),
             )
             if xcheck["match"] is False:
                 print(
