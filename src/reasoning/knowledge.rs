@@ -544,14 +544,19 @@ pub fn resolve_knowledge_path(explicit: Option<&str>) -> PathBuf {
     {
         return PathBuf::from(env);
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    // `HOME` on Unix, `USERPROFILE` on Windows (where `HOME` is usually unset).
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let mut p = PathBuf::from(home);
-        p.push(".cache/injekt");
+        p.push(".cache");
+        p.push("injekt");
         p.push(KNOWLEDGE_FILE_NAME);
         return p;
     }
+    // Last resort: same `injekt/knowledge.json` shape under the temp dir, so the
+    // file name stays stable on every platform.
     let mut p = std::env::temp_dir();
-    p.push("injekt-knowledge.json");
+    p.push("injekt");
+    p.push(KNOWLEDGE_FILE_NAME);
     p
 }
 
