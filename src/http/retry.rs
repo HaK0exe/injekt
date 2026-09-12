@@ -21,9 +21,49 @@ pub const RETRY_AFTER_HONOR_CAP_SECS: u64 = 60;
 /// Check if a reqwest error is retryable (timeout, connect, body).
 /// `is_decode` is deliberately excluded: decode failures are deterministic
 /// (bad body framing) and retrying them just burns requests.
+///
+/// Stale-pool TLS race included: Cloudflare-style edges close idle
+/// keep-alive connections without TLS `close_notify`; rustls/hyper then
+/// surfaces the reuse as `UnexpectedEof` (`Kind::Request` with an
+/// `UnexpectedEof`/`close_notify` in the source chain). That race is
+/// transient — the immediate retry gets a fresh connection — so it is
+/// retryable. Plain `is_request` errors without that signature stay
+/// non-retryable to avoid burning budget on deterministic request errors.
 #[must_use]
 pub fn is_retryable_error(e: &reqwest::Error) -> bool {
-    e.is_timeout() || e.is_connect() || e.is_body()
+    e.is_timeout() || e.is_connect() || e.is_body() || is_stale_pool_eof(e)
+}
+
+/// Detect the stale-pooled-connection TLS race: `Kind::Request` whose source
+/// chain carries `io::ErrorKind::UnexpectedEof` or mentions `close_notify` /
+/// `UnexpectedEof` (rustls `UnexpectedEof` docs: peer closed without
+/// `close_notify`; safe to retry when no message is in flight, which is
+/// exactly the idle-pool checkout case).
+fn is_stale_pool_eof(e: &reqwest::Error) -> bool {
+    use std::error::Error as _;
+    if !e.is_request() {
+        return false;
+    }
+    source_chain_has_eof(e.source())
+}
+
+/// Walk an error source chain looking for the stale-pool TLS signature.
+/// Split out (pure over `&dyn Error`) so it is unit-testable without
+/// constructing a real `reqwest::Error`.
+fn source_chain_has_eof(mut source: Option<&(dyn std::error::Error + 'static)>) -> bool {
+    while let Some(err) = source {
+        if let Some(io) = err.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::UnexpectedEof
+        {
+            return true;
+        }
+        let msg = err.to_string();
+        if msg.contains("close_notify") || msg.contains("UnexpectedEof") {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 impl Default for RetryPolicy {
@@ -220,5 +260,20 @@ mod tests {
             delay >= Duration::from_secs(1),
             "Retry-After: 1 must floor the backoff, got {delay:?}"
         );
+    }
+
+    #[test]
+    fn stale_pool_eof_chain_is_detected() {
+        use std::io::{Error as IoError, ErrorKind};
+        // Direct `UnexpectedEof` kind.
+        let eof = IoError::new(ErrorKind::UnexpectedEof, "early eof");
+        assert!(super::source_chain_has_eof(Some(&eof)));
+        // rustls-style message without the kind.
+        let notify = IoError::other("peer closed connection without sending TLS close_notify");
+        assert!(super::source_chain_has_eof(Some(&notify)));
+        // Ordinary errors are not the pool race.
+        let timed_out = IoError::new(ErrorKind::TimedOut, "timed out");
+        assert!(!super::source_chain_has_eof(Some(&timed_out)));
+        assert!(!super::source_chain_has_eof(None));
     }
 }

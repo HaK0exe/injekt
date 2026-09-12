@@ -6,10 +6,21 @@ use tokio_util::sync::CancellationToken;
 
 /// Token-bucket rate limiter.
 ///
-/// Note on pacing: [`HttpClient::send_with_retry`] awaits `acquire()` and
-/// then the jitter sleep back-to-back, so per-request pacing is additive
+/// Note on pacing: [`HttpClient::send_with_retry`] awaits
+/// `acquire_cancellable()` (chemin scan, annulable via `CancellationToken`)
+/// and then the jitter sleep back-to-back, so per-request pacing is additive
 /// (`rate-limit wait` + `jitter wait`), not `max()` of the two. Lower both
 /// knobs together to speed up scans; raising only one leaves the other.
+///
+/// `acquire()` (non-annulable) est conservé pour les chemins hors scan
+/// (tests/outils); tout le chemin scan utilise `acquire_cancellable()`
+/// (vérifié Phase 0: `client.rs` 4 appels, 0 `acquire()` restant dans `src/`).
+///
+/// Cap `Retry-After` 60s: voir [`MAX_RETRY_AFTER_PENALTY_SECS`] (pénalité
+/// pacing) + `RETRY_AFTER_HONOR_CAP_SECS` (`retry.rs`, délai retry) +
+/// `parse_retry_after_secs` (parse, cap 60s) — les trois bornes restent à
+/// 60s pour qu'un `Retry-After: 3600` malicieux ne parque ni le pacing ni un
+/// retry plus de 60s.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct RateLimiter {
@@ -90,6 +101,8 @@ impl RateLimiter {
     }
 
     pub async fn acquire(&self) {
+        // Hors scan uniquement (tests/outils) : le chemin scan doit utiliser
+        // `acquire_cancellable()` pour que Ctrl+C interrompe l'attente.
         // Fast-path: `disabled()` uses infinite tokens — no locking/sleep.
         if !self.max_per_sec.is_finite() {
             return;

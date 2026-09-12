@@ -256,6 +256,14 @@ impl ClientBuilder<HasTimeout> {
             .brotli(true)
             .cookie_store(false) // we manage cookies manually for OPSEC
             .use_rustls_tls()
+            // Pool vs Cloudflare-style edge: CF closes idle keep-alive
+            // connections without TLS `close_notify`, and rustls surfaces
+            // the reuse as `UnexpectedEof` (see `retry::is_retryable_error`,
+            // which transparently retries that exact race once). A short
+            // idle timeout + small per-host pool shrinks the race window
+            // without disabling reuse (default reqwest: 90s / unlimited).
+            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(8)
             .redirect(reqwest_policy);
 
         // `socks5h://` resolves remotely: remember it so `send_with_retry`
