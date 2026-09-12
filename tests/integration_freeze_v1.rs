@@ -12,7 +12,7 @@
 //! - `tests/golden/v1-report-schema.json` — sorted JSON key lists (values
 //!   excluded so `version`/`git_sha`/timestamps never churn the freeze;
 //!   `v1-` prefix dodges the `report*.json` local-scan gitignore rule)
-//! - `Tamper::all_names()` / `Profile::all_names()` pinned inline (19 / 4)
+//! - `Tamper::all_names()` / `Profile::all_names()` pinned inline (24 / 4)
 //!
 //! Legacy compat (same file, same gate):
 //! - pre-C7 minimal finding JSON still deserializes via `#[serde(default)]`
@@ -117,7 +117,7 @@ fn cli_flags_frozen() {
 #[test]
 fn tamper_names_frozen_at_19() {
     let names = injekt::techniques::tamper::Tamper::all_names();
-    assert_eq!(names.len(), 19, "new tamper must break freeze deliberately");
+    assert_eq!(names.len(), 24, "new tamper must break freeze deliberately");
     let expected = [
         "space2comment",
         "space2plus",
@@ -138,6 +138,11 @@ fn tamper_names_frozen_at_19() {
         "equaltolike",
         "versionedmorekeywords",
         "base64encode",
+        "space2paren",
+        "versionedfuzz",
+        "jsonunicodeescape",
+        "numericobfuscate",
+        "linecomment",
     ];
     assert_eq!(names, &expected);
 }

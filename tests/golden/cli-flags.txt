@@ -55,6 +55,7 @@ scan
 --level
 --marker
 --max-candidates
+--max-duration
 --max-pages
 --max-per-template
 --method
@@ -77,6 +78,7 @@ scan
 --rate-limit
 --raw-dir
 --raw-file
+--request-budget
 --retries
 --safe-chars
 --second-order
