@@ -5,8 +5,9 @@
 //! * Single URL (or raw/bulk/stdin/OpenAPI/sitemap/raw-dir ingestion) → direct scan.
 //! * Bare host or `--with-recon` → crawl, then test each discovered candidate.
 //! * Escalation loop (unless `--no-escalate`): L1 as-configured → L2
-//!   (`level ≥ 2` + `space2comment,randomcase`) → L3 (`level 3` + `text-only`
-//!   fallback + `hpp` + `space2comment,randomcase,charencode,equaltolike`).
+//!   (`level ≥ 2` + `space2comment,randomcase,versionedfuzz`) → L3 (`level 3` +
+//!   `text-only` fallback + `hpp` +
+//!   `space2comment,randomcase,charencode,equaltolike,numericobfuscate,linecomment`).
 //!   Stops at the first step with findings, so clean targets pay a single
 //!   pass and WAF-ish targets get two extra chances. `base64encode` is never
 //!   auto-enabled: it breaks boolean TRUE/FALSE differentials.
@@ -15,7 +16,7 @@ use crate::{
     cli::args::{AutoArgs, Cli},
     cli::output::file::write_output_file_async,
     engine::orchestrator::{Engine, EngineConfig},
-    reporting::{console, json::JsonReport},
+    reporting::{console, json::JsonReport, render::render_report},
     session::scrubber::Scrubber,
 };
 use tokio_util::sync::CancellationToken;
@@ -45,9 +46,11 @@ pub fn escalation_plan(base: &EngineConfig, escalate: bool) -> Vec<EscalationSte
     }];
 
     let mut l2 = base.clone();
-    l2.level = base.level.max(2);
-    if l2.tampers.is_empty() {
-        l2.tampers = crate::techniques::tamper::parse_tamper_list(Some("space2comment,randomcase"));
+    l2.budget.level = base.budget.level.max(2);
+    if l2.evasion.tampers.is_empty() {
+        l2.evasion.tampers = crate::techniques::tamper::parse_tamper_list(Some(
+            "space2comment,randomcase,versionedfuzz",
+        ));
     }
     l2.confirm = false;
     steps.push(EscalationStep {
@@ -56,17 +59,18 @@ pub fn escalation_plan(base: &EngineConfig, escalate: bool) -> Vec<EscalationSte
     });
 
     let mut l3 = base.clone();
-    l3.level = base.level.max(3);
-    // 4 tampers → 6 transformation sets (`t.len()+2` bound): adds `equaltolike`
-    // (`=`-signature WAFs) orthogonal to the space/encoding coverage. Opaque
+    l3.budget.level = base.budget.level.max(3);
+    // 6 tampers → 8 transformation sets (`t.len()+2` bound): adds `equaltolike`
+    // (`=`-signature WAFs) plus `numericobfuscate`/`linecomment` (numeric and
+    // terminator signatures) orthogonal to the space/encoding coverage. Opaque
     // tampers (`base64encode`) stay opt-in only — never auto-escalated.
-    if l3.tampers.len() < 4 {
-        l3.tampers = crate::techniques::tamper::parse_tamper_list(Some(
-            "space2comment,randomcase,charencode,equaltolike",
+    if l3.evasion.tampers.len() < 6 {
+        l3.evasion.tampers = crate::techniques::tamper::parse_tamper_list(Some(
+            "space2comment,randomcase,charencode,equaltolike,numericobfuscate,linecomment",
         ));
     }
     l3.matcher.text_only = true;
-    l3.hpp = true;
+    l3.evasion.hpp = true;
     steps.push(EscalationStep {
         label: "L3-evasion",
         config: l3,
@@ -123,14 +127,15 @@ fn dry_run(cli: &Cli, args: &AutoArgs, targets: &[String]) {
         println!(
             "    - {}: level={} tampers={:?} text-only={} hpp={}",
             step.label,
-            step.config.level,
+            step.config.budget.level,
             step.config
+                .evasion
                 .tampers
                 .iter()
                 .map(crate::techniques::tamper::Tamper::name)
                 .collect::<Vec<_>>(),
             step.config.matcher.text_only,
-            step.config.hpp,
+            step.config.evasion.hpp,
         );
     }
     println!(
@@ -184,22 +189,57 @@ async fn run_auto_direct(
     console::print_findings(&all_findings, &scrubber);
     console::print_extracted(&all_extracted);
 
+    // C13 post-run opt-in : un seul delta agrégé sur tous les findings du run
+    // (fusion + `fsync` + perms 0600). OFF = aucune IO.
+    if cli.knowledge_enabled() {
+        let base = super::scan::engine_config(cli);
+        let mut delta = crate::reasoning::knowledge::KnowledgeStore::empty();
+        crate::reasoning::knowledge::learn_from_run(
+            &mut delta,
+            &all_findings,
+            &base.techniques,
+            base.dbms_hint.as_deref(),
+            total_requests,
+        );
+        if let Err(e) = crate::reasoning::knowledge::save_delta_if_enabled(
+            &delta,
+            true,
+            cli.knowledge_path.as_deref(),
+        ) {
+            tracing::warn!(error=%e, "knowledge save failed (run results kept in RAM)");
+        }
+    }
+
     if let Some(out) = cli.output.as_deref() {
+        let base = super::scan::engine_config(cli);
+        let meta = crate::reporting::json::ReportMeta::current(
+            base.seed,
+            cli.active_profile()
+                .map(|p| format!("{p:?}").to_ascii_lowercase()),
+            base.techniques.clone(),
+            base.budget.level,
+            base.evasion
+                .tampers
+                .iter()
+                .map(|t| t.name().to_owned())
+                .collect(),
+        );
         let report = JsonReport::new(
             targets.first().cloned().unwrap_or_default(),
             all_findings,
             vec![],
             all_extracted,
             total_requests,
+            meta,
         );
         write_json(
             out,
-            &report.to_json(&scrubber),
+            &render_report(&report, cli.format, &scrubber),
             cli.force,
             &scrubber.scrub(out),
         )
         .await?;
-        tracing::info!(path = %scrubber.scrub(out), "auto json report written (0o600, no overwrite unless --force)");
+        tracing::info!(path = %scrubber.scrub(out), format = %cli.format.to_string(), "auto report written (0o600, no overwrite unless --force)");
     }
     Ok(())
 }
@@ -212,7 +252,7 @@ async fn scan_with_escalation(
 ) -> anyhow::Result<(Vec<crate::session::state::Finding>, Vec<String>, u64)> {
     let mut base = super::scan::engine_config(cli);
     if args.auto_enumerate {
-        base.extract = true;
+        base.enumeration.extract = true;
     }
     let steps = escalation_plan(&base, !args.no_escalate);
     let mut total_requests: u64 = 0;
@@ -220,7 +260,7 @@ async fn scan_with_escalation(
         if cancel.is_cancelled() {
             break;
         }
-        tracing::info!(target = %target, step = step.label, level = step.config.level, "auto pass");
+        tracing::info!(target = %target, step = step.label, level = step.config.budget.level, "auto pass");
         let client = crate::cli::client_builder::build_client(cli, cli.allow_private)?;
         let engine = Engine::new(step.config.clone(), client, cancel.clone());
         match engine.run(target).await {
@@ -261,6 +301,7 @@ async fn run_auto_recon(
         depth: args.depth.min(16),
         max_pages: args.max_pages.min(100_000),
         max_per_template: 3,
+        max_candidates: 500,
         include_subdomains: false,
         ignore_robots: false,
     };
@@ -278,7 +319,7 @@ async fn run_auto_recon(
 
     let mut base = super::scan::engine_config(cli);
     if args.auto_enumerate {
-        base.extract = true;
+        base.enumeration.extract = true;
     }
     let steps = escalation_plan(&base, !args.no_escalate);
     let client = crate::cli::client_builder::build_client(cli, cli.allow_private)?;
@@ -317,9 +358,27 @@ async fn run_auto_recon(
         report.request_count
     );
     console::print_findings(&report.findings, &scrubber);
+    // C13 post-run opt-in : delta anonyme du run recon (fusion, `fsync`, 0600).
+    if cli.knowledge_enabled() {
+        let mut delta = crate::reasoning::knowledge::KnowledgeStore::empty();
+        crate::reasoning::knowledge::learn_from_run(
+            &mut delta,
+            &report.findings,
+            &base.techniques,
+            base.dbms_hint.as_deref(),
+            report.request_count,
+        );
+        if let Err(e) = crate::reasoning::knowledge::save_delta_if_enabled(
+            &delta,
+            true,
+            cli.knowledge_path.as_deref(),
+        ) {
+            tracing::warn!(error=%e, "knowledge save failed (run results kept in RAM)");
+        }
+    }
     if let Some(out) = cli.output.as_deref() {
-        let scrubbed = report.scrubbed(&scrubber);
-        let json = serde_json::to_string_pretty(&scrubbed)?;
+        let scrubbed_report = report.scrubbed(&scrubber);
+        let json = serde_json::to_string_pretty(&scrubbed_report)?;
         write_json(out, &json, cli.force, &scrubber.scrub(out)).await?;
     }
     Ok(())
@@ -362,8 +421,8 @@ mod tests {
     fn three_steps_with_escalation() {
         let steps = escalation_plan(&base_config(), true);
         assert_eq!(steps.len(), 3);
-        assert!(steps[1].config.level >= 2);
-        assert!(steps[2].config.level >= 3);
+        assert!(steps[1].config.budget.level >= 2);
+        assert!(steps[2].config.budget.level >= 3);
         assert!(steps[2].config.matcher.text_only);
         assert!(!steps[0].config.matcher.text_only);
     }
@@ -371,16 +430,17 @@ mod tests {
     #[test]
     fn l2_keeps_explicit_tampers() {
         let mut base = base_config();
-        base.tampers = crate::techniques::tamper::parse_tamper_list(Some("versionedcomment"));
+        base.evasion.tampers =
+            crate::techniques::tamper::parse_tamper_list(Some("versionedcomment"));
         let steps = escalation_plan(&base, true);
-        assert_eq!(steps[1].config.tampers, base.tampers);
+        assert_eq!(steps[1].config.evasion.tampers, base.evasion.tampers);
     }
 
     #[test]
     fn l3_adds_equaltolike_without_base64() {
         use crate::techniques::tamper::Tamper;
         let steps = escalation_plan(&base_config(), true);
-        let l3 = &steps[2].config.tampers;
+        let l3 = &steps[2].config.evasion.tampers;
         assert!(
             l3.contains(&Tamper::EqualToLike),
             "L3 should add equaltolike: {l3:?}"
@@ -389,10 +449,40 @@ mod tests {
             !l3.contains(&Tamper::Base64Encode),
             "base64encode must stay opt-in (breaks boolean differentials): {l3:?}"
         );
-        // bounded escalation: 4 tampers → 6 sets, not exponential
+        // bounded escalation: 6 tampers → 8 sets, not exponential
         assert_eq!(
             crate::techniques::tamper::tamper_transformation_sets(l3).len(),
             l3.len() + 2
+        );
+    }
+
+    #[test]
+    fn l2_adds_versionedfuzz() {
+        use crate::techniques::tamper::Tamper;
+        let steps = escalation_plan(&base_config(), true);
+        let l2 = &steps[1].config.evasion.tampers;
+        assert!(
+            l2.contains(&Tamper::VersionedFuzz),
+            "L2 should add versionedfuzz: {l2:?}"
+        );
+        assert!(
+            !l2.contains(&Tamper::Base64Encode),
+            "base64encode must stay opt-in: {l2:?}"
+        );
+    }
+
+    #[test]
+    fn l3_adds_numericobfuscate_and_linecomment() {
+        use crate::techniques::tamper::Tamper;
+        let steps = escalation_plan(&base_config(), true);
+        let l3 = &steps[2].config.evasion.tampers;
+        assert!(
+            l3.contains(&Tamper::NumericObfuscate),
+            "L3 should add numericobfuscate: {l3:?}"
+        );
+        assert!(
+            l3.contains(&Tamper::LineComment),
+            "L3 should add linecomment: {l3:?}"
         );
     }
 

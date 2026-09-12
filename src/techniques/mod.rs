@@ -2,6 +2,7 @@
 pub mod boolean;
 pub mod error;
 pub mod json;
+pub mod nosql;
 pub mod oob;
 pub mod payload_opts;
 pub mod request_tamper;

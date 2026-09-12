@@ -31,9 +31,16 @@ fn different_body() -> &'static str {
 }
 
 /// WAF mock: inspects only the FIRST `id` value (like naive signature WAFs).
-/// - first `id` looks malicious (`or` / `%27`) → block → baseline always.
+/// - first `id` looks malicious (`or` / `and` / `%27`) → block → baseline always.
 /// - first `id` benign → backend evaluates the LAST `id` value:
 ///   `1=1` → baseline-like, `1=2` → different.
+///
+/// NOTE (v0.5-4): the keyword list must cover `and` as well as `or`: L1 now
+/// leads with quoteless numeric payloads (`1 AND 1=1 -- -`) on numeric
+/// contexts (quote-correct ordering), so an `or`-only list would let a
+/// single-param numeric probe through a WAF that is meant to block the
+/// whole single-param family. HPP tests are unaffected (first value stays
+/// the benign `1` there).
 fn hpp_waf_responder(req: &wiremock::Request) -> ResponseTemplate {
     let url = req.url.to_string().to_ascii_lowercase();
     let baseline = baseline_body();
@@ -52,7 +59,7 @@ fn hpp_waf_responder(req: &wiremock::Request) -> ResponseTemplate {
     let Some(first) = ids.first() else {
         return ResponseTemplate::new(200).set_body_string(baseline);
     };
-    if first.contains("or") || first.contains("%27") {
+    if first.contains("or") || first.contains("and") || first.contains("%27") {
         // WAF block: true and false look identical.
         return ResponseTemplate::new(200).set_body_string(baseline);
     }
@@ -73,10 +80,10 @@ async fn hpp_bypasses_first_value_waf() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.hpp = true;
-    cfg.allow_private = true;
+    cfg.evasion.hpp = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -108,10 +115,10 @@ async fn without_hpp_first_value_waf_blocks() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.hpp = false;
-    cfg.allow_private = true;
+    cfg.evasion.hpp = false;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -179,10 +186,10 @@ async fn chunked_body_bypasses_content_length_waf() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.chunked = true;
-    cfg.allow_private = true;
+    cfg.evasion.chunked = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -218,10 +225,10 @@ async fn without_chunked_content_length_waf_blocks_body() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.chunked = false;
-    cfg.allow_private = true;
+    cfg.evasion.chunked = false;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -278,11 +285,11 @@ async fn hpp_plus_equaltolike_combined_bypass() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.hpp = true;
-    cfg.tampers = vec![Tamper::EqualToLike];
-    cfg.allow_private = true;
+    cfg.evasion.hpp = true;
+    cfg.evasion.tampers = vec![Tamper::EqualToLike];
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -319,11 +326,11 @@ async fn hpp_alone_insufficient_against_like_only_backend() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.hpp = true;
-    cfg.tampers = Vec::new();
-    cfg.allow_private = true;
+    cfg.evasion.hpp = true;
+    cfg.evasion.tampers = Vec::new();
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);

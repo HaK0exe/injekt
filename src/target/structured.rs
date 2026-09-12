@@ -174,6 +174,32 @@ pub fn xml_tags(body: &str) -> Vec<(String, String)> {
 /// ou cible non-scalaire (objet/tableau préservés).
 #[must_use]
 pub fn inject_json_path(body: &str, path: &str, payload: &str) -> Option<String> {
+    inject_json_value(body, path, &Value::String(payload.to_owned()))
+}
+
+/// Remplace une feuille `JSON` par un opérateur arbitraire et resérialise.
+///
+/// Variante `NoSQL` de [`inject_json_path`] : la feuille scalaire
+/// (`{"user":"admin"}`) devient un objet opérateur (`{"user":{"$gt":""}}`)
+/// au lieu d'une chaîne. C'est le vecteur `{"user": {"$gt": ""}}` des logins
+/// MongoDB : `$gt ""` est toujours vrai → bypass sans identifiants.
+///
+/// Mêmes règles de chemin que [`inject_json_path`] (pointeur `/a/0/b` ou
+/// point/crochets `a.b[0]`, préfixe `json:` accepté). `None` si : corps
+/// invalide, chemin vide/racine, clé/indice absent, traversée d'un scalaire,
+/// ou cible déjà objet/tableau (préservés : on ne remplace jamais un
+/// opérateur existant par un autre, pour éviter les faux positifs).
+#[must_use]
+pub fn inject_json_operator(
+    body: &str,
+    path: &str,
+    operator: &serde_json::Value,
+) -> Option<String> {
+    inject_json_value(body, path, operator)
+}
+
+/// Cœur partagé de [`inject_json_path`] / [`inject_json_operator`].
+fn inject_json_value(body: &str, path: &str, replacement: &Value) -> Option<String> {
     let segments = json_path_segments(path);
     if segments.is_empty() {
         return None;
@@ -188,7 +214,7 @@ pub fn inject_json_path(body: &str, path: &str, payload: &str) -> Option<String>
     if slot.is_object() || slot.is_array() {
         return None;
     }
-    *slot = Value::String(payload.to_owned());
+    *slot = replacement.clone();
     serde_json::to_string(&value).ok()
 }
 
@@ -233,14 +259,10 @@ pub fn inject_xml_tag(body: &str, tag: &str, payload: &str) -> Option<String> {
             continue;
         }
         // End of the opening tag: first `>` (attributes cannot contain `>`).
-        let Some(gt_rel) = after_tag.find('>') else {
-            return None;
-        };
+        let gt_rel = after_tag.find('>')?;
         let content_start = open_idx + 1 + bare.len() + gt_rel + 1;
         // Content runs to the next `<` and must be followed by strict `</tag>`.
-        let Some(lt_rel) = body[content_start..].find('<') else {
-            return None;
-        };
+        let lt_rel = body[content_start..].find('<')?;
         let content_end = content_start + lt_rel;
         if body[content_end..].starts_with(&closer) {
             let mut out = String::with_capacity(body.len() + payload.len());
@@ -502,6 +524,27 @@ mod tests {
         assert!(inject_json_path(body, "a", "x").is_none());
         assert!(inject_json_path("{oops", "a", "x").is_none());
         assert!(inject_json_path("{\"c\":[1]}", "c.5", "x").is_none());
+    }
+
+    #[test]
+    fn inject_json_operator_replaces_leaf_with_object() {
+        let body = "{\"user\":\"admin\",\"pass\":\"secret\"}";
+        let gt: Value = serde_json::from_str("{\"$gt\": \"\"}").unwrap_or(Value::Null);
+        let lt: Value = serde_json::from_str("{\"$lt\": \"\"}").unwrap_or(Value::Null);
+        // `serde_json` sans `preserve_order` trie les clés (BTree) : `pass` avant `user`.
+        assert_eq!(
+            inject_json_operator(body, "user", &gt),
+            Some("{\"pass\":\"secret\",\"user\":{\"$gt\":\"\"}}".to_owned())
+        );
+        assert_eq!(
+            inject_json_operator(body, "json:/pass", &lt),
+            Some("{\"pass\":{\"$lt\":\"\"},\"user\":\"admin\"}".to_owned())
+        );
+        // Objet existant préservé (pas de double injection).
+        let nested = "{\"user\":{\"$gt\":\"\"}}";
+        assert!(inject_json_operator(nested, "user", &gt).is_none());
+        assert!(inject_json_operator(body, "", &gt).is_none());
+        assert!(inject_json_operator("{oops", "user", &gt).is_none());
     }
 
     #[test]

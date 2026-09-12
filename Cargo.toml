@@ -1,11 +1,12 @@
 [package]
 name = "injekt"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Modern SQL injection detection & exploitation — zero persistence, anonymisation by design"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/HaK0exe/injekt"
 keywords = ["security", "sql-injection", "pentest", "opsec"]
 categories = ["command-line-utilities"]
 

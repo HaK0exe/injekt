@@ -138,8 +138,27 @@ impl TargetUrl {
         url_str: &str,
         allow_private: bool,
     ) -> Result<Self, UrlError> {
+        Self::validate_redirect_location_with_remote_dns(url_str, allow_private, false).await
+    }
+
+    /// Same as [`Self::validate_redirect_location`], but `remote_dns=true`
+    /// skips the local DNS-time resolution (proxy resolves remotely, e.g.
+    /// `socks5h://`): no local hostname leak, `.onion` works, and no false
+    /// TOCTOU guarantee is implied. Lexical + IP-literal checks still apply.
+    ///
+    /// # Errors
+    /// Returns an error if `url_str` fails to parse, uses a non-http(s)
+    /// scheme, or is lexically private while `allow_private` is `false`.
+    pub async fn validate_redirect_location_with_remote_dns(
+        url_str: &str,
+        allow_private: bool,
+        remote_dns: bool,
+    ) -> Result<Self, UrlError> {
         let parsed = Self::parse(url_str, allow_private)?;
-        if !allow_private && let Some(host) = parsed.inner().host_str() {
+        if !allow_private
+            && !remote_dns
+            && let Some(host) = parsed.inner().host_str()
+        {
             // `host_str()` strips IPv6 brackets; `resolve_and_check`
             // handles both IP literals and domain names.
             Self::resolve_and_check(host, false).await?;

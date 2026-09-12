@@ -102,11 +102,11 @@ async fn union_order_by_infers_3_and_finds_union() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["union".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
-    cfg.extract = false;
+    cfg.enumeration.extract = false;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
     let target = format!("{}/?id=1", server.uri());
@@ -157,11 +157,11 @@ async fn union_order_by_no_error_fallback_still_finds_union() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["union".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
-    cfg.extract = false;
+    cfg.enumeration.extract = false;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
     let target = format!("{}/?id=1", server.uri());
@@ -189,11 +189,11 @@ async fn union_no_marker_no_error_yields_no_finding() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 2;
+    cfg.budget.threads = 2;
     cfg.techniques = vec!["union".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
-    cfg.extract = false;
+    cfg.enumeration.extract = false;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
     let target = format!("{}/?id=1", server.uri());
@@ -231,11 +231,11 @@ async fn union_order_by_only_first_error_is_inconclusive() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["union".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
-    cfg.extract = false;
+    cfg.enumeration.extract = false;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
     let target = format!("{}/?id=1", server.uri());

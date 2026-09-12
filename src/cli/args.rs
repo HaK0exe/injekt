@@ -4,6 +4,44 @@ use crate::cli::profile::Profile;
 use clap::{Parser, Subcommand, ValueEnum};
 use secrecy::SecretString;
 
+/// Upper bound for `--max-duration` (24h, 86400s). Rejects absurd values at
+/// parse time so [`crate::engine::orchestrator::BudgetConfig::detection_deadline`]
+/// `checked_add` can never overflow from user input (overflow beforehand
+/// silently became `None` = unlimited).
+pub const MAX_DURATION_SECS: u64 = 86_400;
+/// Upper bound for `--request-budget` (1M requests). Rejects absurd values at
+/// parse time; the A1 evasion ceiling (~1032 req live) stays far below it.
+pub const MAX_REQUEST_BUDGET: usize = 1_000_000;
+
+/// Parse `--max-duration` / `INJEKT_MAX_DURATION`: `0..=86400` seconds.
+/// `0` trips immediately (early-break path, tested); absent = unlimited.
+fn parse_max_duration_secs(s: &str) -> Result<u64, String> {
+    let v: u64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid --max-duration '{s}': expected 0..={MAX_DURATION_SECS}"))?;
+    if v > MAX_DURATION_SECS {
+        return Err(format!(
+            "invalid --max-duration '{v}': max is {MAX_DURATION_SECS}s (24h)"
+        ));
+    }
+    Ok(v)
+}
+
+/// Parse `--request-budget` / `INJEKT_REQUEST_BUDGET`: `0..=1000000` requests.
+/// `0` trips immediately (cooperative stop, tested); absent = unlimited.
+fn parse_request_budget(s: &str) -> Result<usize, String> {
+    let v: usize = s.trim().parse().map_err(|_| {
+        format!("invalid --request-budget '{s}': expected 0..={MAX_REQUEST_BUDGET}")
+    })?;
+    if v > MAX_REQUEST_BUDGET {
+        return Err(format!(
+            "invalid --request-budget '{v}': max is {MAX_REQUEST_BUDGET}"
+        ));
+    }
+    Ok(v)
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 #[non_exhaustive]
 pub enum TechniqueOpt {
@@ -14,7 +52,36 @@ pub enum TechniqueOpt {
     Stacked,
     Oob,
     Json,
+    Nosql,
     All,
+}
+
+/// Report serialization selected by `--format` (C7 intelligent reporting).
+/// Controls `--output` file content (and `--bulk-file` aggregated reports);
+/// console output is unchanged. Default is `json` (historical behaviour).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+#[non_exhaustive]
+pub enum ReportFormat {
+    /// Historical `JsonReport` schema (extended with C7 calibrated fields).
+    #[default]
+    Json,
+    /// SARIF 2.1.0 for CI code-scanning ingestion.
+    Sarif,
+    /// `JUnit` XML for CI test-case dashboards.
+    Junit,
+    /// Human-sendable Markdown with remediation.
+    Md,
+}
+
+impl core::fmt::Display for ReportFormat {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Json => write!(f, "json"),
+            Self::Sarif => write!(f, "sarif"),
+            Self::Junit => write!(f, "junit"),
+            Self::Md => write!(f, "md"),
+        }
+    }
 }
 
 #[derive(Parser, Clone)]
@@ -147,6 +214,19 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub output: Option<String>,
 
+    /// Report serialization for `--output` files: `json` (default, historical
+    /// `JsonReport` schema + C7 calibrated fields), `sarif` (2.1.0, CI
+    /// code-scanning), `junit` (CI test cases), `md` (human-sendable with
+    /// remediation). Console output is unchanged. All formats are scrubbed.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "json",
+        env = "INJEKT_FORMAT"
+    )]
+    pub format: ReportFormat,
+
     #[arg(long, global = true, env = "INJEKT_RATE_LIMIT")]
     pub rate_limit: Option<f64>,
 
@@ -179,12 +259,69 @@ pub struct Cli {
     #[arg(long, global = true, value_parser = clap::value_parser!(u8).range(1..=5), env = "INJEKT_LEVEL")]
     pub level: Option<u8>,
 
-    /// Strict second-pass confirmation (opt-in): after detection, replay each
-    /// finding's technique for that single parameter against a fresh session
-    /// and keep only re-confirmed findings (OOB skipped: async collaborator
-    /// evidence is not replayable). Roughly doubles request cost.
+    /// Global detection time budget in seconds (`--max-duration 120`, range
+    /// `0..=86400`, OPT-IN).
+    /// SCOPE: detection phase only — the clock starts in `run_detection`,
+    /// AFTER baseline + context (baseline/context/fingerprint/enumeration are
+    /// NOT covered; `--max-duration` never bounds the total run).
+    /// `None` (default) = unlimited, historical behaviour byte-identical.
+    /// OPT-IN hors profils/config-file: `--profile` and `injekt.toml` never
+    /// set it; only `--max-duration N` / `INJEKT_MAX_DURATION` enables the
+    /// cooperative stop. Values above 86400s (24h) are rejected at parse time.
+    /// When set, the per-parameter detection loop breaks early once the
+    /// shared detection clock exceeds it (warn + clean `Done`, no new
+    /// findings invented).
+    #[arg(long = "max-duration", global = true, env = "INJEKT_MAX_DURATION", value_parser = parse_max_duration_secs)]
+    pub max_duration: Option<u64>,
+
+    /// Global request budget for a run (`--request-budget 25`, range
+    /// `0..=1000000`, OPT-IN).
+    /// `None` (default) = unlimited, historical behaviour byte-identical
+    /// (A1 evasion needs ~1032 req live: never cap by default).
+    /// OPT-IN hors profils/config-file: `--profile` and `injekt.toml` never
+    /// set it; only `--request-budget N` / `INJEKT_REQUEST_BUDGET` enables
+    /// the cooperative global stop. Values above 1000000 are rejected.
+    /// When set, detection stops cooperatively once the shared
+    /// `SessionState::request_count` reaches it: current technique finishes,
+    /// no new technique starts (warn + clean `Done`, never an error, never
+    /// a new finding). Per-parameter [`RequestBudget`] is seeded with the
+    /// same value for scheduler visibility (`budget_total`), so the
+    /// authoritative global check lives in the orchestrator (concurrent
+    /// params may overshoot by one technique each).
+    #[arg(long = "request-budget", global = true, env = "INJEKT_REQUEST_BUDGET", value_parser = parse_request_budget)]
+    pub request_budget: Option<usize>,
+
+    /// Strict second-pass confirmation (C6 real): re-sondes every confirmed
+    /// finding with fresh payloads + derived seed after detection (OOB
+    /// excluded, ~2x requests worst-case, documented). Never creates new
+    /// findings — only drops those that fail re-validation. In-detection
+    /// 3-trial confirmation still applies regardless of this flag.
     #[arg(long, global = true)]
     pub confirm: bool,
+
+    /// Disable the C5-tardif mini-mutation second-pass (escape hatch).
+    /// Default is mutation ON but strictly scoped: only on already-confirmed
+    /// findings, only from the `--confirm` second-pass, ≤4 variants / ≤8
+    /// requests per finding, seeded, traced (`mutation:<famille>`), silent
+    /// failure (the original finding is kept). No mutation ever runs in
+    /// first-pass detection or on unconfirmed targets.
+    #[arg(long = "no-mutation", global = true)]
+    pub no_mutation: bool,
+
+    /// One-line reasoning verdict for a finding (`--explain id@query`):
+    /// prints `TRUE≈baseline 0.91, FALSE≠baseline 0.22, 3/3, waf=none,
+    /// 14 req, seed 42` after the scan (or from `replay --file`).
+    /// No extra requests; reads the RAM-only trace + evidence.
+    #[arg(long, global = true, env = "INJEKT_EXPLAIN")]
+    pub explain: Option<String>,
+
+    /// Deterministic run seed, recorded in the JSON report (`seed`) for
+    /// reproducibility (C1 metrology). Seeds all non-cryptographic RNG
+    /// (tamper scripts, request jitter, UA rotation, retry backoff): runs
+    /// with the same seed are deterministic. Crypto randomness (export
+    /// salt/nonce) always stays on OS randomness and ignores this seed.
+    #[arg(long, global = true, env = "INJEKT_SEED")]
+    pub seed: Option<u64>,
 
     /// HTTP status codes treated as negative probes during detection
     /// (e.g. --ignore-code 429,503): an ignored response never yields a
@@ -205,7 +342,7 @@ pub struct Cli {
     #[arg(long, global = true, env = "INJEKT_OOB_WAIT_SECS")]
     pub oob_wait_secs: Option<u64>,
 
-    /// WAF tamper scripts (comma-separated): space2comment,space2plus,randomcase,versionedcomment,versionedmorekeywords,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,betweencomment,randomcomments,equaltolike,base64encode (opt-in: breaks boolean differentials)
+    /// WAF tamper scripts (comma-separated): space2comment,space2plus,randomcase,versionedcomment,versionedmorekeywords,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,betweencomment,randomcomments,equaltolike,space2paren,versionedfuzz,jsonunicodeescape,numericobfuscate,linecomment,base64encode (opt-in: breaks boolean differentials). Presets: cloudflare-generic (=randomcase,space2comment,versionedmorekeywords), aggressive (=randomcase,space2paren,versionedfuzz,equaltolike)
     #[arg(long, global = true, value_delimiter = ',', env = "INJEKT_TAMPER")]
     pub tamper: Vec<String>,
 
@@ -220,6 +357,8 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub export_encrypted: Option<String>,
 
+    /// Legacy flag: `scan --import` is rejected (use `replay --file` to
+    /// inspect an encrypted export, `recon import --file` for candidates).
     #[arg(long, global = true)]
     pub import: Option<String>,
 
@@ -228,6 +367,48 @@ pub struct Cli {
 
     #[arg(long, global = true)]
     pub allow_private: bool,
+
+    /// C13 Knowledge Engine opt-in (défaut OFF = RAM-only, 0 lecture/écriture,
+    /// boost 1.0 neutre byte-identique). Activé : lecture au boot de
+    /// `~/.cache/injekt/knowledge.json` (ou `--knowledge-path` /
+    /// `INJEKT_KNOWLEDGE_PATH`), boost `1+alpha` borné `[0.5,1.5]` puis clamp
+    /// scheduler `[0.5,2.0]`, écriture post-run (fusion, fsync, perms 0600).
+    /// Agrégats anonymes `(technique, dbms, contexte)` uniquement — jamais de
+    /// cible/param/seed/secret persisté.
+    #[arg(long, global = true, env = "INJEKT_ALLOW_KNOWLEDGE")]
+    pub allow_knowledge: bool,
+
+    /// Chemin du store knowledge (défaut `~/.cache/injekt/knowledge.json`).
+    /// Inutilisé quand `--allow-knowledge` est absent (aucune IO).
+    #[arg(long, global = true, env = "INJEKT_KNOWLEDGE_PATH")]
+    pub knowledge_path: Option<String>,
+
+    /// Second-order actif borné (Option B, lab only, même-origine) : stocke
+    /// un marqueur bénin `u+8hex` (payload `'<marker>'` style union, jamais
+    /// de RCE/stacked) puis revisite `--second-order-revisit-url` (ex:
+    /// `/admin`, max 2 GET séquentiels). OFF par défaut = 0 requête extra,
+    /// chemin byte-identique.
+    #[arg(long = "second-order", global = true, env = "INJEKT_SECOND_ORDER")]
+    pub second_order: bool,
+
+    /// URL de revisit second-order : chemin même-origine (ex: `/admin`) ou
+    /// URL absolue même-origine que la cible. Schéma/host/port différent =
+    /// erreur. Requis quand `--second-order` est actif.
+    #[arg(long, global = true, env = "INJEKT_SECOND_ORDER_REVISIT_URL")]
+    pub second_order_revisit_url: Option<String>,
+
+    /// Nombre max de params Body/Query/Header stockés en second-order [default: 8, range 1..=32].
+    /// 1 store + max 2 revisits GET par param, séquentiel, `RequestClass::Default`.
+    /// Les headers exotiques (User-Agent/X-Forwarded-For/Referer, souvent loggés
+    /// en base) sont couverts comme les Body/Query.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u8).range(1..=32),
+        env = "INJEKT_SECOND_ORDER_MAX_STORES"
+    )]
+    pub second_order_max_stores: u8,
 
     /// Raw HTTP request file (Burp/ZAP) — alternative to --target
     #[arg(long, global = true)]
@@ -317,6 +498,7 @@ impl core::fmt::Debug for Cli {
             .field("stop", &self.stop)
             .field("count", &self.count)
             .field("output", &self.output)
+            .field("format", &self.format)
             .field("rate_limit", &self.rate_limit)
             .field("jitter", &self.jitter)
             .field("marker", &self.marker)
@@ -325,7 +507,12 @@ impl core::fmt::Debug for Cli {
             .field("code", &self.code)
             .field("text_only", &self.text_only)
             .field("level", &self.level)
+            .field("max_duration", &self.max_duration)
+            .field("request_budget", &self.request_budget)
             .field("confirm", &self.confirm)
+            .field("no_mutation", &self.no_mutation)
+            .field("explain", &self.explain)
+            .field("seed", &self.seed)
             .field("ignore_codes", &self.ignore_codes)
             .field("oob_domain", &self.oob_domain)
             .field("oob_poll_url", &redacted_opt(&self.oob_poll_url))
@@ -337,6 +524,11 @@ impl core::fmt::Debug for Cli {
             .field("import", &self.import)
             .field("no_redact", &self.no_redact)
             .field("allow_private", &self.allow_private)
+            .field("allow_knowledge", &self.allow_knowledge)
+            .field("knowledge_path", &self.knowledge_path)
+            .field("second_order", &self.second_order)
+            .field("second_order_revisit_url", &self.second_order_revisit_url)
+            .field("second_order_max_stores", &self.second_order_max_stores)
             .field("raw_file", &self.raw_file)
             .field("raw_dir", &self.raw_dir)
             .field("stdin", &self.stdin)
@@ -400,6 +592,11 @@ pub struct ReconCrawlArgs {
     /// burning the whole --max-pages budget on redundant instances.
     #[arg(long, default_value_t = 3)]
     pub max_per_template: usize,
+    /// Cap on the total discovered parameters kept: listing/gallery/proxy
+    /// families otherwise queue hundreds of near-identical candidates that
+    /// burn scan budget. Redundant sink shapes are dropped first.
+    #[arg(long, default_value_t = 500)]
+    pub max_candidates: usize,
     #[arg(long)]
     pub include_subdomains: bool,
     #[arg(long)]
@@ -633,6 +830,62 @@ impl Cli {
         self.active_profile().map_or(1, Profile::level)
     }
 
+    /// Effective deterministic seed. Precedence: CLI/env > file.
+    /// Profiles never set a seed (reproducibility is explicit opt-in).
+    #[must_use]
+    pub fn effective_seed(&self) -> Option<u64> {
+        if let Some(v) = self.seed {
+            return Some(v);
+        }
+        self.file_snapshot().seed
+    }
+
+    /// Effective global detection time budget in seconds (Phase 3).
+    /// `None` (default) = unlimited, historical behaviour byte-identical.
+    /// Profiles / config file never set it (explicit opt-in only).
+    #[must_use]
+    pub const fn effective_max_duration(&self) -> Option<u64> {
+        self.max_duration
+    }
+
+    /// Effective global request budget (CODE calibration).
+    /// `None` (default) = unlimited, historical behaviour byte-identical.
+    /// Profiles / config file never set it (explicit opt-in only, like
+    /// `--max-duration`): only `--request-budget N` / `INJEKT_REQUEST_BUDGET`
+    /// enables the cooperative global stop.
+    #[must_use]
+    pub const fn effective_request_budget(&self) -> Option<usize> {
+        self.request_budget
+    }
+
+    /// C13 opt-in gate: `false` par défaut → RAM-only, aucune IO knowledge,
+    /// boost neutre `1.0` (chemin byte-identique au sans-knowledge).
+    #[must_use]
+    pub const fn knowledge_enabled(&self) -> bool {
+        self.allow_knowledge
+    }
+
+    /// Borne effective second-order `1..=32` (clap garantit déjà la range ;
+    /// clamp défensif pour les constructions manuelles). Défaut 8.
+    #[must_use]
+    pub const fn effective_second_order_max_stores(&self) -> usize {
+        let v = self.second_order_max_stores as usize;
+        if v < 1 {
+            1
+        } else if v > 32 {
+            32
+        } else {
+            v
+        }
+    }
+
+    /// Chemin effectif du store (`--knowledge-path` > `INJEKT_KNOWLEDGE_PATH` >
+    /// `~/.cache/injekt/knowledge.json`). Non résolu / non touché quand OFF.
+    #[must_use]
+    pub fn effective_knowledge_path(&self) -> std::path::PathBuf {
+        crate::reasoning::knowledge::resolve_knowledge_path(self.knowledge_path.as_deref())
+    }
+
     /// Effective technique list. Non-empty CLI `--techniques` always wins
     /// (explicit, non-breaking); then config file; then profile; then `["all"]`.
     #[must_use]
@@ -818,6 +1071,122 @@ impl Cli {
             }
         }
     }
+
+    /// Fused raw request: `--raw-file` base + `--method` / `--headers` /
+    /// `--cookies` / `--data` overlays. CLI flags win over the file; the file
+    /// wins over `--data` (with a warning when both carry a body).
+    #[must_use]
+    pub fn merged_raw_request(&self) -> Option<crate::target::raw_request::RawRequest> {
+        let mut base = self.raw_request();
+        // `--data` alone becomes a synthetic POST raw (same path as raw-file).
+        if base.is_none()
+            && let Some(data) = self.data.as_deref()
+        {
+            let trimmed = data.trim();
+            if !trimmed.is_empty() {
+                base = crate::engine::orchestrator::synthetic_raw_from_data(trimmed);
+            }
+        }
+        // `--headers`/`--cookies` alone (no file, no `--data`) still need a
+        // raw to fuse into, otherwise cookie/header params are never
+        // discovered and the flags only ride along passively.
+        if base.is_none()
+            && (!self.headers.is_empty()
+                || self
+                    .cookies
+                    .as_deref()
+                    .is_some_and(|c| !c.trim().is_empty()))
+        {
+            base = Some(crate::target::raw_request::RawRequest {
+                method: "GET".to_owned(),
+                path: "/".to_owned(),
+                headers: std::collections::HashMap::new(),
+                body: None,
+                http_version: "HTTP/1.1".to_owned(),
+            });
+        }
+        let mut req = base?;
+        // `--method` overrides the file method (validated later; uppercased here).
+        if let Some(m) = self.method.as_deref() {
+            let m = m.trim();
+            if !m.is_empty() {
+                req.method = m.to_ascii_uppercase();
+            }
+        }
+        // `--headers "Name: value"` override / extend the file headers
+        // (keys are lowercased, matching `RawRequest::parse` canonical form).
+        for h in &self.headers {
+            let Some((name, value)) = h.split_once(':') else {
+                continue;
+            };
+            let key = name.trim().to_ascii_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            req.headers.insert(key, value.trim().to_owned());
+        }
+        // `--cookies` merges with the file `Cookie` header (`; `-joined),
+        // preserving both the Burp session and the CLI session.
+        if let Some(cookies) = self.cookies.as_deref() {
+            let cookies = cookies.trim();
+            if !cookies.is_empty() {
+                let merged = match req.headers.get("cookie") {
+                    Some(existing) if !existing.trim().is_empty() => {
+                        format!("{}; {cookies}", existing.trim())
+                    }
+                    _ => cookies.to_owned(),
+                };
+                req.headers.insert("cookie".to_owned(), merged);
+            }
+        }
+        // `--data` fills an empty body only; a file body always wins.
+        if let Some(data) = self.data.as_deref() {
+            let trimmed = data.trim();
+            let file_has_body = req.body.as_deref().is_some_and(|b| !b.trim().is_empty());
+            if !trimmed.is_empty() && !file_has_body {
+                req.body = Some(trimmed.to_owned());
+                if !req.headers.contains_key("content-type") {
+                    let kind = crate::target::structured::sniff_kind(None, trimmed);
+                    let ct = match kind {
+                        crate::target::structured::StructuredKind::Json => "application/json",
+                        crate::target::structured::StructuredKind::Xml => "application/xml",
+                        _ => "application/x-www-form-urlencoded",
+                    };
+                    req.headers.insert("content-type".to_owned(), ct.to_owned());
+                }
+            }
+        }
+        Some(req)
+    }
+
+    /// `true` when the proxy performs remote DNS (`socks5h://`): local
+    /// DNS-time SSRF resolution must be skipped (no local leak, no false
+    /// `.onion` failure). Lexical + IP-literal checks still apply.
+    #[must_use]
+    pub fn uses_remote_dns(&self) -> bool {
+        self.effective_proxy()
+            .is_some_and(|p| p.to_ascii_lowercase().starts_with("socks5h://"))
+    }
+
+    /// Normalized `--dbms` hint (`mysql|postgres|mssql|oracle`) or `None`
+    /// when absent/unknown (unknown warns, falls back to auto-fingerprint).
+    #[must_use]
+    pub fn normalized_dbms_hint(&self) -> Option<String> {
+        let raw = self.dbms.as_deref()?;
+        let v = raw.trim().to_ascii_lowercase();
+        // Accept common aliases.
+        let norm = match v.as_str() {
+            "mysql" | "mariadb" | "my" => "mysql",
+            "postgres" | "postgresql" | "pg" | "pgsql" => "postgres",
+            "mssql" | "sqlserver" | "sql-server" | "tsql" => "mssql",
+            "oracle" | "ora" => "oracle",
+            _ => {
+                tracing::warn!(dbms=%raw, "unknown --dbms, ignoring (auto-fingerprint)");
+                return None;
+            }
+        };
+        Some(norm.to_owned())
+    }
 }
 
 #[cfg(test)]
@@ -869,6 +1238,7 @@ mod tests {
             stop: None,
             count: false,
             output: None,
+            format: ReportFormat::Json,
             rate_limit: None,
             jitter: None,
             marker: None,
@@ -877,7 +1247,12 @@ mod tests {
             code: None,
             text_only: false,
             level: None,
+            max_duration: None,
+            request_budget: None,
             confirm: false,
+            no_mutation: false,
+            explain: None,
+            seed: None,
             ignore_codes: Vec::new(),
             oob_domain: None,
             oob_poll_url: None,
@@ -889,6 +1264,11 @@ mod tests {
             import: None,
             no_redact: false,
             allow_private: false,
+            allow_knowledge: false,
+            knowledge_path: None,
+            second_order: false,
+            second_order_revisit_url: None,
+            second_order_max_stores: 8,
             raw_file: None,
             raw_dir: None,
             stdin: false,
@@ -944,6 +1324,31 @@ mod tests {
     }
 
     #[test]
+    fn seed_defaults_to_none_and_ignores_profile() {
+        let cli = blank_cli();
+        assert_eq!(cli.effective_seed(), None);
+        let mut cli = blank_cli();
+        cli.profile = Some(Profile::Stealth);
+        assert_eq!(cli.effective_seed(), None);
+    }
+
+    #[test]
+    fn seed_cli_wins_over_file() {
+        use std::io::Write as _;
+        let mut path = std::env::temp_dir();
+        path.push(format!("injekt-test-seed-{}.toml", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "seed = 42\n").unwrap();
+        drop(file);
+        let mut cli = blank_cli();
+        cli.config = Some(path.to_string_lossy().into_owned());
+        assert_eq!(cli.effective_seed(), Some(42));
+        cli.seed = Some(7);
+        assert_eq!(cli.effective_seed(), Some(7));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn config_file_wins_over_profile() {
         use std::io::Write as _;
         let mut path = std::env::temp_dir();
@@ -969,5 +1374,83 @@ mod tests {
         assert!(cli.validate_explicit_config().is_err());
         cli.config = None;
         assert!(cli.validate_explicit_config().is_ok());
+    }
+
+    #[test]
+    fn max_duration_defaults_to_none_byte_identical() {
+        // Phase 3: default None = unlimited, historical behaviour.
+        let cli = blank_cli();
+        assert_eq!(cli.effective_max_duration(), None);
+        let mut cli = blank_cli();
+        cli.max_duration = Some(120);
+        assert_eq!(cli.effective_max_duration(), Some(120));
+    }
+
+    #[test]
+    fn max_duration_parses_from_cli() {
+        use clap::Parser as _;
+        let cli =
+            Cli::try_parse_from(["injekt", "--max-duration", "60"]).unwrap_or_else(|_| blank_cli());
+        assert_eq!(cli.effective_max_duration(), Some(60));
+        let cli_default = Cli::try_parse_from(["injekt"]).unwrap_or_else(|_| blank_cli());
+        // Explicit config slot may shadow auto-discovery in this harness;
+        // the flag itself must be None when absent.
+        assert!(
+            cli_default.max_duration.is_none(),
+            "default --max-duration must be None"
+        );
+    }
+
+    #[test]
+    fn request_budget_defaults_to_none_byte_identical() {
+        // CODE calibration: default None = unlimited, historical behaviour
+        // (A1 evasion ~1032 req live must never trip a default cap).
+        let cli = blank_cli();
+        assert_eq!(cli.effective_request_budget(), None);
+        let mut cli = blank_cli();
+        cli.request_budget = Some(25);
+        assert_eq!(cli.effective_request_budget(), Some(25));
+    }
+
+    #[test]
+    fn request_budget_parses_from_cli() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["injekt", "--request-budget", "25"])
+            .unwrap_or_else(|_| blank_cli());
+        assert_eq!(cli.effective_request_budget(), Some(25));
+        let cli_default = Cli::try_parse_from(["injekt"]).unwrap_or_else(|_| blank_cli());
+        assert!(
+            cli_default.request_budget.is_none(),
+            "default --request-budget must be None"
+        );
+    }
+
+    #[test]
+    fn budget_parsers_reject_absurd_values() {
+        // PR20: absurd CLI values are rejected at parse time (no silent
+        // `checked_add` overflow → unlimited, no unbounded request flood).
+        assert_eq!(super::parse_max_duration_secs("0"), Ok(0));
+        assert_eq!(super::parse_max_duration_secs("86400"), Ok(86_400));
+        assert!(super::parse_max_duration_secs("86401").is_err());
+        assert!(super::parse_max_duration_secs("99999999").is_err());
+        assert!(super::parse_max_duration_secs("nope").is_err());
+        assert_eq!(super::parse_request_budget("0"), Ok(0));
+        assert_eq!(super::parse_request_budget("1000000"), Ok(1_000_000));
+        assert!(super::parse_request_budget("1000001").is_err());
+        assert!(super::parse_request_budget("nope").is_err());
+    }
+
+    #[test]
+    fn budget_flags_reject_absurd_cli_values() {
+        // End-to-end through clap (flags + env share the same value_parser).
+        use clap::Parser as _;
+        assert!(Cli::try_parse_from(["injekt", "--max-duration", "99999999"]).is_err());
+        assert!(Cli::try_parse_from(["injekt", "--request-budget", "99999999"]).is_err());
+        assert_eq!(
+            Cli::try_parse_from(["injekt", "--max-duration", "120"])
+                .unwrap_or_else(|_| blank_cli())
+                .effective_max_duration(),
+            Some(120)
+        );
     }
 }

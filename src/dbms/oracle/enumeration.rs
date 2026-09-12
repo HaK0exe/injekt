@@ -22,16 +22,29 @@ pub fn list_columns(db: &str, table: &str) -> String {
 
 #[must_use]
 pub fn dump_table(db: &str, table: &str, columns: &[String], start: usize, stop: usize) -> String {
-    let cols = if columns.is_empty() {
-        "*".to_owned()
+    let limit = stop.saturating_sub(start);
+    // Scalar-only oracle: aggregate to 1×1 via `LISTAGG` over a paginated
+    // subquery. `db` is the owner (schema), correct in `FROM` here.
+    if columns.is_empty() {
+        format!(
+            "SELECT * FROM (SELECT a.*, ROWNUM rn FROM (SELECT * FROM \"{db}\".\"{table}\") a WHERE ROWNUM <= {}) WHERE rn > {start}",
+            start + 1
+        )
+    } else if columns.len() == 1 {
+        let col = &columns[0];
+        format!(
+            "SELECT LISTAGG(\"{col}\", chr(30)) WITHIN GROUP (ORDER BY \"{col}\") FROM (SELECT \"{col}\" FROM \"{db}\".\"{table}\" OFFSET {start} ROWS FETCH NEXT {limit} ROWS ONLY)"
+        )
     } else {
-        columns.join(",")
-    };
-    let _limit = stop.saturating_sub(start);
-    // Oracle uses ROWNUM for pagination
-    format!(
-        "SELECT {cols} FROM (SELECT a.*, ROWNUM rn FROM (SELECT {cols} FROM \"{db}\".\"{table}\") a WHERE ROWNUM <= {stop}) WHERE rn > {start}"
-    )
+        let concat = columns
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join("||chr(31)||");
+        format!(
+            "SELECT LISTAGG(row_data, chr(30)) WITHIN GROUP (ORDER BY row_data) FROM (SELECT ({concat}) AS row_data FROM \"{db}\".\"{table}\" OFFSET {start} ROWS FETCH NEXT {limit} ROWS ONLY)"
+        )
+    }
 }
 
 #[must_use]

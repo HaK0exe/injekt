@@ -75,9 +75,11 @@ async fn recon_crawler_discovers_links_forms_and_js_candidates() {
             depth: 1,
             max_pages: 10,
             max_per_template: 3,
+            max_candidates: 500,
             include_subdomains: false,
             respect_robots: true,
             allow_private: true,
+            remote_dns: false,
         },
     );
     let report = crawler
@@ -127,9 +129,11 @@ async fn recon_crawler_respects_robots_disallow() {
             depth: 2,
             max_pages: 10,
             max_per_template: 3,
+            max_candidates: 500,
             include_subdomains: false,
             respect_robots: true,
             allow_private: true,
+            remote_dns: false,
         },
     );
     let report = crawler
@@ -143,6 +147,86 @@ async fn recon_crawler_respects_robots_disallow() {
             .iter()
             .all(|candidate| !candidate.url.path().starts_with("/private"))
     );
+}
+
+#[tokio::test]
+async fn recon_crawler_drops_placeholders_tracking_and_caps_sink_templates() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/robots.txt"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/html")
+                .set_body_string(
+                    r#"
+            <a href="/s?search={model}">placeholder</a>
+            <a href="/t?utm_source=newsletter&id=5">tracking</a>
+            <a href="/j?callback=jQuery123&id=1">jsonp</a>
+            <a href="/api/g/1?locale=HK_EN">g1</a>
+            <a href="/api/g/2?locale=HK_EN">g2</a>
+            <a href="/api/g/3?locale=HK_EN">g3</a>
+            <a href="/api/g/4?locale=HK_EN">g4</a>
+            "#,
+                ),
+        )
+        .mount(&server)
+        .await;
+    for leaf in [
+        "/s", "/t", "/j", "/api/g/1", "/api/g/2", "/api/g/3", "/api/g/4",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(leaf))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string("<p>leaf</p>"),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let crawler = Crawler::new(
+        fast_client(),
+        CrawlConfig {
+            depth: 1,
+            max_pages: 20,
+            max_per_template: 2,
+            max_candidates: 500,
+            include_subdomains: false,
+            respect_robots: true,
+            allow_private: true,
+            remote_dns: false,
+        },
+    );
+    let report = crawler
+        .crawl(&server.uri(), &CancellationToken::new())
+        .await
+        .expect("crawl");
+
+    let names: Vec<&str> = report
+        .candidates
+        .iter()
+        .map(|candidate| candidate.param_name.as_str())
+        .collect();
+    // Placeholder values and tracking/JSONP names never become candidates.
+    assert!(!names.iter().any(|name| name.contains('{')), "{names:?}");
+    assert!(!names.contains(&"utm_source"), "{names:?}");
+    assert!(!names.contains(&"callback"), "{names:?}");
+    // Business params survive.
+    assert!(names.contains(&"id"), "{names:?}");
+    // Four instances of the same sink shape (host|/api/g/{id}|locale) with
+    // max_per_template=2 keep exactly two representatives.
+    let locale_count = report
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.param_name == "locale")
+        .count();
+    assert_eq!(locale_count, 2, "{names:?}");
 }
 
 #[tokio::test]
@@ -208,9 +292,11 @@ async fn recon_crawler_caps_pages_per_template() {
             depth: 5,
             max_pages: 50,
             max_per_template: 2,
+            max_candidates: 500,
             include_subdomains: false,
             respect_robots: true,
             allow_private: true,
+            remote_dns: false,
         },
     );
     let report = crawler

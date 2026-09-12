@@ -42,6 +42,23 @@ fn stacked_responder(req: &wiremock::Request) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_string(response_body)
 }
 
+/// Search-style page: reflects the raw query input verbatim inside a
+/// markedly different page. The stacked marker IS present in the response
+/// (it was part of our input), but so is the full payload syntax — a
+/// reflection, not an execution. Must never report.
+fn stacked_responder_echo(req: &wiremock::Request) -> ResponseTemplate {
+    let url = req.url.to_string();
+    let url_lower = url.to_ascii_lowercase();
+    if !url_lower.contains("select") && !url_lower.contains("stacked") {
+        return ResponseTemplate::new(200).set_body_string("welcome page id=1 normal content");
+    }
+    let query = req.url.query().unwrap_or_default();
+    let response_body = format!(
+        "search results for '{query}' did you mean it EXTRA DYNAMIC CONTENT TIMESTAMP NOISE PADDING"
+    );
+    ResponseTemplate::new(200).set_body_string(response_body)
+}
+
 fn stacked_responder_no_vuln(req: &wiremock::Request) -> ResponseTemplate {
     let url = req.url.to_string().to_ascii_lowercase();
     if url.contains("select") || url.contains("stacked") {
@@ -61,11 +78,11 @@ async fn stacked_finds_vulnerability() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["stacked".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
-    cfg.extract = false;
+    cfg.enumeration.extract = false;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
     let target = format!("{}/?id=1", server.uri());
@@ -99,11 +116,11 @@ async fn stacked_no_false_positive() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["stacked".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
-    cfg.extract = false;
+    cfg.enumeration.extract = false;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
     let target = format!("{}/?id=1", server.uri());
@@ -120,6 +137,36 @@ async fn stacked_no_false_positive() {
 }
 
 #[tokio::test]
+async fn stacked_no_false_positive_on_reflected_input() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(stacked_responder_echo)
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.budget.threads = 1;
+    cfg.techniques = vec!["stacked".to_owned()];
+    cfg.net.allow_private = true;
+    cfg.no_redact = true;
+    cfg.enumeration.extract = false;
+    let cancel = CancellationToken::new();
+    let engine = Engine::new(cfg, client, cancel);
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    let stacked_findings: Vec<_> = findings
+        .iter()
+        .filter(|f| f.technique == injekt::session::state::TechniqueKind::Stacked)
+        .collect();
+    assert!(
+        stacked_findings.is_empty(),
+        "reflected input must not report stacked findings, got {stacked_findings:?}"
+    );
+}
+
+#[tokio::test]
 async fn stacked_in_all_techniques() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -129,11 +176,11 @@ async fn stacked_in_all_techniques() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["all".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
-    cfg.extract = false;
+    cfg.enumeration.extract = false;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
     let target = format!("{}/?id=1", server.uri());

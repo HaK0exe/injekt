@@ -1,0 +1,105 @@
+# .github/workflows/bench-smoke.yml — fast offline smoke for the bench harness.
+#
+# What CI can honestly run (no docker, no network, no target):
+#   - run.py --help / compare --help / matrix --help exit 0
+#   - runner/selftest.py: parser fixtures, cross-check, compare/matrix over
+#     fixture histories, json-lines validity, `versions` subcommand
+#   - scenarios.toml ground truth check (A1–A7+N1–N2, N1/N2 negative,
+#     repeats/seed defaults) — pure stdlib, no docker, no network
+#   - versions.lock exists and has the pinned_at header + all 3 tool lines
+#
+# The live docker path (compose up, reset, run A1+N1) is guarded by a
+# `command -v docker` check and skipped when docker is unavailable, so this
+# workflow stays green on stock GitHub runners while still exercising the
+# live path on self-hosted runners that have the lab up. With the C1 canary
+# gate, a tripped canary fails the live step (exit 3) instead of passing
+# silently.
+
+name: bench-smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "bench/**"
+      - ".github/workflows/bench-smoke.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "bench/**"
+      - ".github/workflows/bench-smoke.yml"
+  workflow_dispatch:
+
+jobs:
+  bench-smoke:
+    name: bench harness offline smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python (stdlib only, no deps to install)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: CLI help smoke (no docker, no network)
+        run: |
+          set -euo pipefail
+          python3 bench/runner/run.py --help
+          python3 bench/runner/run.py run --help
+          python3 bench/runner/run.py compare --help
+          python3 bench/runner/run.py matrix --help
+          python3 bench/runner/run.py versions
+
+      - name: Harness selftest (parser fixtures, compare/matrix, jsonl validity)
+        run: |
+          set -euo pipefail
+          python3 bench/runner/selftest.py
+
+      - name: scenarios.toml ground truth (A1–A7+N1–N2, no docker)
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import tomllib
+          with open("bench/runner/scenarios.toml", "rb") as f:
+              cfg = tomllib.load(f)
+          ids = [s["id"] for s in cfg["scenario"]]
+          assert ids == ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "N1", "N2"], ids
+          by_id = {s["id"]: s for s in cfg["scenario"]}
+          for n in ("N1", "N2"):
+              assert by_id[n].get("negative") is True, n
+              assert by_id[n]["expected"] == [], n
+          assert cfg["defaults"]["repeats"] == 5, cfg["defaults"]
+          assert cfg["defaults"]["seed"] == 42, cfg["defaults"]
+          print("scenarios.toml ground truth OK:", ",".join(ids))
+          EOF
+
+      - name: versions.lock sanity (frozen refs present, new format)
+        run: |
+          set -euo pipefail
+          test -f bench/versions.lock
+          grep -q '^# pinned_at ' bench/versions.lock
+          grep -q '^tool:injekt  injekt ' bench/versions.lock
+          grep -q '^tool:sqlmap' bench/versions.lock
+          grep -q '^tool:ghauri' bench/versions.lock
+          echo "versions.lock format OK"
+
+      - name: Live docker path (guarded — skipped without docker/lab)
+        run: |
+          set -euo pipefail
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "docker unavailable in CI — skipping live lab path (honest skip)"
+            exit 0
+          fi
+          if ! docker compose version >/dev/null 2>&1; then
+            echo "docker compose unavailable — skipping live lab path (honest skip)"
+            exit 0
+          fi
+          if ! curl -sf --max-time 5 http://127.0.0.1:8000/api/health?id=1 >/dev/null; then
+            echo "bench lab not up on this runner — skipping live run (honest skip)"
+            exit 0
+          fi
+          cd bench
+          python3 runner/run.py check-canary
+          python3 runner/run.py run --tool injekt --scenario A1 --mode power --repeats 1
+          python3 runner/run.py run --tool injekt --scenario N1 --mode power --repeats 1

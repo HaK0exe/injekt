@@ -106,15 +106,8 @@ mod tests {
     #[test]
     fn guess_from_findings_mysql() {
         use crate::session::state::{Finding, TechniqueKind};
-        let f = Finding {
-            target: "http://a".into(),
-            parameter: "id@query".into(),
-            technique: TechniqueKind::Error,
-            confidence: 0.9,
-            dbms: Some("mysql".into()),
-            evidence: "XPATH".into(),
-            timestamp: chrono::Utc::now(),
-        };
+        let mut f = Finding::new("http://a", "id@query", TechniqueKind::Error, 0.9, "XPATH");
+        f.dbms = Some("mysql".into());
         assert_eq!(guess_from_findings(&[f]), Some(Kind::MySql));
     }
 }

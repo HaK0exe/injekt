@@ -65,9 +65,9 @@ fn body_responder(req: &wiremock::Request) -> ResponseTemplate {
 
 fn boolean_cfg() -> EngineConfig {
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     cfg
 }
@@ -83,7 +83,7 @@ async fn suffix_passthrough_keeps_finding_and_marks_evidence() {
     let mut cfg = boolean_cfg();
     let mut popts = PayloadOpts::default();
     popts.suffix = Some(" -- -".to_owned());
-    cfg.payload_opts = popts;
+    cfg.evasion.payload_opts = popts;
     let engine = Engine::new(cfg, test_client(), CancellationToken::new());
     let target = format!("{}/?id=1", server.uri());
     engine.run(&target).await.expect("engine run");

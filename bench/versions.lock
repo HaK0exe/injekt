@@ -1,0 +1,9 @@
+# bench/versions.lock — frozen official-run references.
+# pinned_at 2026-09-09T21:08:54Z (UTC). Regenerate: python3 runner/run.py pin
+mysql:8.4  [mysql@sha256:3466ba4a4828aa8d46fb7c3bc16b67b781c98413cf4ea0fac6feaa6e881faa26]
+postgres:17-alpine  [postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73]
+mcr.microsoft.com/mssql/server:2022-latest  [mcr.microsoft.com/mssql/server@sha256:97b448857967be55e005424a660056fe6d51814435804dc07e8f79f028bab5fb]
+owasp/modsecurity-crs:nginx  [owasp/modsecurity-crs@sha256:ccec5e3ecd1dcf6b48903268f4fe415fd17914e8bf30fc21263fd05cc7045f29]
+tool:injekt  injekt 0.3.0
+tool:sqlmap  1.10.7#stable
+tool:ghauri  (unavailable: [Errno 2] No such file or directory: 'ghauri')

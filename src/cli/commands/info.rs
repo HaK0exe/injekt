@@ -29,6 +29,7 @@ pub fn info() -> InfoResult {
             "stacked".to_string(),
             "oob".to_string(),
             "json".to_string(),
+            "nosql".to_string(),
         ],
         tampers: crate::techniques::tamper::Tamper::all_names()
             .iter()

@@ -14,7 +14,7 @@ use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -47,7 +47,60 @@ struct Snapshot {
     extracted: Vec<String>,
     request_count: u64,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Reasoning trace (C6): hashes only, never clear payload/body/secrets.
+    /// `#[serde(default)]` keeps v1/v2 exports readable (empty trace).
+    #[serde(default)]
+    trace: Vec<crate::reasoning::ProbeRecord>,
+    /// Effective run seed (`--seed`) for replay determinism.
+    #[serde(default)]
+    seed: Option<u64>,
 }
+
+impl Zeroize for Snapshot {
+    fn zeroize(&mut self) {
+        // Mirror `SessionState::zeroize`: wipe cleartext findings/extracted
+        // clones before drop (the serialized `json` bytes are already
+        // `Zeroizing`; this covers the transient struct itself).
+        for finding in &mut self.findings {
+            finding.target.zeroize();
+            finding.parameter.zeroize();
+            finding.evidence.zeroize();
+            finding.remediation.summary.zeroize();
+            finding.remediation.parameterized_example.zeroize();
+            for h in &mut finding.evidence_detail.hashes {
+                h.zeroize();
+            }
+            if let Some(diff) = finding.evidence_detail.diff.as_mut() {
+                diff.zeroize();
+            }
+            if let Some(trace_ref) = finding.evidence_detail.trace_ref.as_mut() {
+                trace_ref.zeroize();
+            }
+            if let Some(vendor) = finding.waf.vendor.as_mut() {
+                vendor.zeroize();
+            }
+            if let Some(dbms) = &mut finding.dbms {
+                dbms.zeroize();
+            }
+        }
+        self.findings.clear();
+        for s in &mut self.extracted {
+            s.zeroize();
+        }
+        self.extracted.clear();
+        self.trace.zeroize();
+        self.trace.clear();
+        self.request_count.zeroize();
+        self.started_at = None;
+        self.seed = None;
+    }
+}
+
+/// Current encrypted-export blob version (C6: trace + seed added).
+/// Readers accept v1 (legacy), v2 (argon2id explicit) and v3 (trace).
+/// v1.0-rc freeze: bump only with a migration test (legacy v1/v2 blobs must
+/// still decrypt — see `legacy_v1_snapshot_still_deserializes`).
+pub const EXPORT_BLOB_VERSION: u8 = 3;
 
 /// Encrypted export (OPT-IN only). Snapshot XChaCha20-Poly1305, key derived Argon2id.
 #[derive(Debug)]
@@ -65,16 +118,27 @@ impl EncryptedExport {
         passphrase: &SecretString,
         path: &str,
     ) -> Result<(), ExportError> {
-        let snapshot = Snapshot {
+        let mut snapshot = Snapshot {
             findings: state.findings().to_vec(),
             extracted: state.extracted_exposed(),
             request_count: state.request_count(),
             started_at: state.started_at(),
+            trace: state.trace().records().to_vec(),
+            seed: state.seed(),
         };
         let json = Zeroizing::new(
             serde_json::to_vec(&snapshot).map_err(|e| ExportError::Serialization(e.to_string()))?,
         );
+        // Wipe the transient cleartext snapshot (findings + extracted clones)
+        // before any fallible crypto/IO below — the `json` bytes stay
+        // `Zeroizing` until encryption consumes them.
+        snapshot.zeroize();
 
+        // SECURITY: salt/nonce MUST stay on OS randomness (`rand::random`) and
+        // must NEVER be routed through the seeded run RNG
+        // (`crate::seeded_rng::make_rng`): a deterministic salt/nonce from
+        // `--seed` would reuse keystream material across runs and break the
+        // XChaCha20-Poly1305 security contract.
         let salt: [u8; 16] = rand::random();
         let key = Zeroizing::new(Self::derive_key_argon2id(passphrase, &salt)?);
 
@@ -90,7 +154,7 @@ impl EncryptedExport {
             salt_b64: BASE64.encode(salt),
             nonce_b64: BASE64.encode(nonce_bytes),
             ciphertext_b64: BASE64.encode(ciphertext),
-            v: 2,
+            v: EXPORT_BLOB_VERSION,
             kdf: Some("argon2id-m65536-t3-p1-v19".to_owned()),
         };
         let out = serde_json::to_vec_pretty(&blob)
@@ -122,7 +186,7 @@ impl EncryptedExport {
         let data = std::fs::read(path).map_err(|e| ExportError::Io(e.to_string()))?;
         let blob: EncryptedBlob =
             serde_json::from_slice(&data).map_err(|e| ExportError::Serialization(e.to_string()))?;
-        if blob.v != 1 && blob.v != 2 {
+        if blob.v != 1 && blob.v != 2 && blob.v != EXPORT_BLOB_VERSION {
             return Err(ExportError::Serialization(
                 "unsupported blob version".to_owned(),
             ));
@@ -208,6 +272,8 @@ mod tests {
     }
 
     fn temp_path() -> String {
+        // Test-only temp filename: stays on OS randomness so parallel test
+        // workers never collide; never seeded (uniqueness, not determinism).
         let path = std::env::temp_dir()
             .join(format!("injekt_test_export_{}.enc", rand::random::<u64>()))
             .to_string_lossy()
@@ -281,5 +347,83 @@ mod tests {
             );
             let _ = fs::remove_file(&path);
         }
+    }
+
+    #[test]
+    fn trace_and_seed_survive_roundtrip() {
+        use crate::reasoning::ProbeRecord;
+        let mut state = test_state();
+        state.set_seed(Some(42));
+        state.push_trace(ProbeRecord::from_clear(
+            0,
+            "id@query",
+            "boolean",
+            "none",
+            Some(42),
+            "' OR 1=1",
+            "welcome",
+            0.9,
+            12.0,
+        ));
+        let passphrase = SecretString::from("passphrase123456");
+        let path = temp_path();
+
+        EncryptedExport::encrypt_to_file(&state, &passphrase, &path).unwrap();
+        let json_bytes = EncryptedExport::decrypt_from_file(&passphrase, &path).unwrap();
+        let snapshot: Snapshot = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(snapshot.seed, Some(42));
+        assert_eq!(snapshot.trace.len(), 1);
+        assert_eq!(snapshot.trace[0].seq, 0);
+        // Trace stores hashes only — never the clear payload/body.
+        let dbg = format!("{:?}", snapshot.trace[0]);
+        assert!(!dbg.contains("OR 1=1"), "payload leaked: {dbg}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_v1_snapshot_still_deserializes() {
+        // v1 shape: no `extracted`/`trace`/`seed` keys (pre-C6 export).
+        // `#[serde(default)]` must keep old blobs readable (v1.0-rc compat).
+        let legacy = serde_json::json!({
+            "findings": [],
+            "request_count": 7,
+            "started_at": null,
+        });
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let snapshot: Snapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snapshot.request_count, 7);
+        assert!(snapshot.extracted.is_empty());
+        assert!(snapshot.trace.is_empty());
+        assert_eq!(snapshot.seed, None);
+    }
+
+    #[test]
+    fn unsupported_blob_version_is_rejected() {
+        let state = test_state();
+        let passphrase = SecretString::from("passphrase123456");
+        let path = temp_path();
+        EncryptedExport::encrypt_to_file(&state, &passphrase, &path).unwrap();
+        // Rewrite the envelope with a future version (99): decrypt must refuse.
+        let data = fs::read(&path).unwrap();
+        let mut blob: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        blob["v"] = serde_json::Value::from(99);
+        fs::write(&path, serde_json::to_vec(&blob).unwrap()).unwrap();
+        let err = EncryptedExport::decrypt_from_file(&passphrase, &path).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported blob version"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wrong_passphrase_fails_decryption() {
+        let state = test_state();
+        let passphrase = SecretString::from("passphrase123456");
+        let wrong = SecretString::from("wrong-passphrase-000");
+        let path = temp_path();
+        EncryptedExport::encrypt_to_file(&state, &passphrase, &path).unwrap();
+        assert!(EncryptedExport::decrypt_from_file(&wrong, &path).is_err());
+        let _ = fs::remove_file(&path);
     }
 }

@@ -1,0 +1,106 @@
+# bench/runner/scenarios.toml — Phase 1 ground truth.
+# `via` selects which HTTP entrypoint serves the SAME app sink:
+# direct = app:8000, waf-pl1 = :8081 (CRS PL1), waf-pl2 = :8082 (CRS PL2).
+# Group B (UNION/JSON/OOB) and Oracle are Phase 2 — not in this file.
+
+[defaults]
+repeats = 5
+timeout_s = 600
+# Base deterministic seed for `run.py run --seed` (repeat i uses seed+i).
+# Recorded in every history.jsonl line; passed as injekt --seed when supported.
+seed = 42
+
+[[scenario]]
+id = "A1"
+url = "http://127.0.0.1:8000/api/users?id=1"
+via = "direct"
+dbms = "mysql"
+sink = "query:id"
+expected = ["boolean", "time"]
+evasion = ["--tamper", "space2comment"]
+note = "naive signature filter (' or '/select/union with spaces)->400. /**/ bypass, '-- -' intact."
+
+[[scenario]]
+id = "A2"
+url = "http://127.0.0.1:8000/api/search?q=alice"
+via = "direct"
+dbms = "postgres"
+sink = "query:q"
+expected = ["boolean", "time"]
+evasion = ["--tamper", "equaltolike"]
+note = "'='->400, equality sink. LIKE-based exfil required."
+
+[[scenario]]
+id = "A3"
+url = "http://127.0.0.1:8000/api/login"
+via = "direct"
+dbms = "mssql"
+method = "POST"
+data = "user=alice&pass=x"
+sink = "body:user,body:pass"
+expected = ["boolean", "stacked"]
+note = "case-sensitive blocklist (;|sleep|benchmark|waitfor), 5/s rate-limit->429."
+
+[[scenario]]
+id = "A4"
+url = "http://127.0.0.1:8000/api/track"
+via = "direct"
+dbms = "postgres"
+cookies = "sess=1"
+sink = "cookie:sess"
+expected = ["boolean", "time"]
+note = "Cookie injection; needs level>=2 tooling."
+
+[[scenario]]
+id = "A5"
+url = "http://127.0.0.1:8000/api/debug"
+via = "direct"
+dbms = "mysql"
+headers = "X-User-Id: 1"
+sink = "header:x-user-id"
+expected = ["boolean", "time"]
+evasion = ["--tamper", "space2comment"]
+note = "Header injection; needs level>=3 tooling + sig-filter bypass."
+
+[[scenario]]
+id = "A6"
+url = "http://127.0.0.1:8081/api/debug"
+via = "waf-pl1"
+dbms = "mysql"
+headers = "X-User-Id: 1"
+sink = "header:x-user-id"
+expected = ["boolean", "time"]
+evasion = ["--tamper", "space2comment"]
+note = "Vector-shift bypass: CRS PL1 does not inspect custom headers (query/cookie sinks are 403). App sig filter still needs /**/."
+
+[[scenario]]
+id = "A7"
+url = "http://127.0.0.1:8082/api/debug"
+via = "waf-pl2"
+dbms = "mysql"
+headers = "X-User-Id: 1"
+sink = "header:x-user-id"
+expected = ["boolean", "time"]
+evasion = ["--tamper", "space2comment"]
+note = "Same vector-shift as A6 behind CRS PL2 (also blind to custom headers). Query/cookie sinks are 403 controls (see README)."
+
+# Negative controls: any finding here is a FALSE POSITIVE.
+[[scenario]]
+id = "N1"
+url = "http://127.0.0.1:8000/api/health?id=1"
+via = "direct"
+dbms = "mysql"
+sink = "query:id"
+expected = []
+negative = true
+note = "Fully parameterized. Finding = FP."
+
+[[scenario]]
+id = "N2"
+url = "http://127.0.0.1:8000/api/canary?id=1"
+via = "direct"
+dbms = "mysql"
+sink = "query:id"
+expected = []
+negative = true
+note = "Parameterized echo of input length only. Finding = FP."

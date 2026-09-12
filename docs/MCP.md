@@ -20,10 +20,11 @@ JSON-RPC channel and is never polluted.
 bodies), `marker` (`*`/`§` modes), `method` override, `import`, `bulk_file`
 and `export_encrypted` are also CLI-only on purpose: they need local file
 access, a TTY passphrase, or ad-hoc request shaping that does not map cleanly
-to a stdio tool surface. `--level` / `--confirm` / `--ignore-code` are not in
-the tool schema either — MCP runs at level 1 with no second-pass confirm.
-Use the CLI for those. `timeout` / `retries` / `delay` are accepted in the
-`scan` schema but currently run with compiled defaults (30s / 3 / 500ms).
+to a stdio tool surface. `--level` / `--confirm` / `--seed` / `--ignore-code`
+are not in the tool schema either — MCP runs at level 1 with no second-pass
+confirm, unseeded. Use the CLI for those. `timeout` / `retries` / `delay`
+are accepted in the `scan` schema and honoured via the shared client builder
+(effective defaults 30s / 3 / 500ms when absent).
 
 ## Output redaction
 

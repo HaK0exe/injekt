@@ -61,10 +61,10 @@ async fn tamper_space2comment_bypasses_waf_boolean() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.tampers = vec![Tamper::Space2Comment];
-    cfg.allow_private = true;
+    cfg.evasion.tampers = vec![Tamper::Space2Comment];
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -101,10 +101,10 @@ async fn without_tamper_waf_blocks_boolean() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.tampers = Vec::new(); // no tamper
-    cfg.allow_private = true;
+    cfg.evasion.tampers = Vec::new(); // no tamper
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -148,10 +148,10 @@ async fn tamper_versionedcomment_produces_evidence() {
     // ensure engine with versionedcomment still runs (no panic) even if not vulnerable
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["error".to_owned()];
-    cfg.tampers = vec![Tamper::VersionedComment];
-    cfg.allow_private = true;
+    cfg.evasion.tampers = vec![Tamper::VersionedComment];
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -220,10 +220,10 @@ async fn tamper_space2dash_bypasses_waf_boolean() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.tampers = vec![Tamper::Space2Dash];
-    cfg.allow_private = true;
+    cfg.evasion.tampers = vec![Tamper::Space2Dash];
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -276,10 +276,10 @@ async fn tamper_equaltolike_bypasses_equals_waf_boolean() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.tampers = vec![Tamper::EqualToLike];
-    cfg.allow_private = true;
+    cfg.evasion.tampers = vec![Tamper::EqualToLike];
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -311,10 +311,10 @@ async fn without_equaltolike_equals_waf_blocks_boolean() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.tampers = Vec::new();
-    cfg.allow_private = true;
+    cfg.evasion.tampers = Vec::new();
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -359,10 +359,10 @@ async fn tamper_space2mssqlblank_bypasses_waf_boolean() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.tampers = vec![Tamper::Space2MssqlBlank];
-    cfg.allow_private = true;
+    cfg.evasion.tampers = vec![Tamper::Space2MssqlBlank];
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -394,10 +394,10 @@ async fn tamper_randomcomments_bypasses_waf_boolean() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.tampers = vec![Tamper::RandomComments];
-    cfg.allow_private = true;
+    cfg.evasion.tampers = vec![Tamper::RandomComments];
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -450,10 +450,10 @@ async fn tamper_versionedmorekeywords_bypasses_waf_boolean() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.tampers = vec![Tamper::VersionedMoreKeywords];
-    cfg.allow_private = true;
+    cfg.evasion.tampers = vec![Tamper::VersionedMoreKeywords];
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);
@@ -486,10 +486,10 @@ async fn tamper_base64_skipped_for_boolean_without_poisoning() {
 
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["boolean".to_owned()];
-    cfg.tampers = vec![Tamper::Base64Encode, Tamper::Space2Comment];
-    cfg.allow_private = true;
+    cfg.evasion.tampers = vec![Tamper::Base64Encode, Tamper::Space2Comment];
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel);

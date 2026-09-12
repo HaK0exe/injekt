@@ -18,6 +18,14 @@ pub struct Baseline {
     pub mean_ms: f64,
     pub stddev_ms: f64,
     pub representative_body: Vec<u8>,
+    /// WAF/CDN vendor observed across samples (`"cloudflare"`, …), if any.
+    pub waf_vendor: Option<String>,
+    /// Signal names that fired (header/body markers, never values).
+    pub waf_hits: Vec<String>,
+    /// `true` when a *blocking* signal (challenge/deny/rate-limit) was seen
+    /// in any sample. Mere CDN presence (`cf-ray` alone) records
+    /// `waf_vendor`/`waf_hits` but leaves this `false`.
+    pub waf_blocking: bool,
 }
 
 impl Baseline {
@@ -53,6 +61,33 @@ impl Baseline {
             sorted.sort_by_key(|s| s.body.len());
             sorted[sorted.len() / 2].body.clone()
         };
+        // Aggregate WAF signals across samples (headers + body per sample).
+        // A specific vendor wins over `Generic` when both appear; hits are
+        // deduplicated in first-seen order; blocking sticks if any sample
+        // blocked.
+        let mut waf_vendor: Option<String> = None;
+        let mut waf_hits: Vec<String> = Vec::new();
+        let mut waf_blocking = false;
+        for sample in samples {
+            let signals =
+                super::waf::detect_cloudflare_flat(sample.status, &sample.headers, &sample.body);
+            if let Some(vendor) = signals.vendor {
+                let label = vendor.to_string();
+                match &waf_vendor {
+                    None => waf_vendor = Some(label),
+                    Some(current) if current == "generic" && label != "generic" => {
+                        waf_vendor = Some(label);
+                    }
+                    _ => {}
+                }
+                for hit in &signals.hits {
+                    if !waf_hits.contains(hit) {
+                        waf_hits.push(hit.clone());
+                    }
+                }
+            }
+            waf_blocking = waf_blocking || signals.blocking;
+        }
         Self {
             status_codes,
             body_hashes,
@@ -61,6 +96,9 @@ impl Baseline {
             mean_ms: mean,
             stddev_ms: stddev,
             representative_body,
+            waf_vendor,
+            waf_hits,
+            waf_blocking,
         }
     }
 
@@ -72,7 +110,17 @@ impl Baseline {
 
     #[must_use]
     pub fn threshold_ms(&self, sigma: f64) -> f64 {
-        // Unified floor 100ms per 2026 audit (time detector uses 100)
+        // Unified floor 100ms per 2026 audit (time detector uses 100).
+        // PR20 divergence note: this static floor is intentional for generic
+        // (fast-differential) use. `TimeDetector::threshold` reuses the same
+        // mean/stddev via `from_baseline` but swaps the floor for
+        // `adaptive_stddev_floor_ms` (`max(100ms, mean*0.1)`): byte-identical
+        // below/at 1s mean, proportionally wider above (e.g. mean 5s →
+        // threshold 6000 vs 5200 here). Rationale: on slow targets a static
+        // 100ms floor flags every ±200ms wobble as anomalous for sleep
+        // probes, while boolean/error differentials still want the tight
+        // static bar — so the time channel alone adapts, this helper stays
+        // put.
         self.mean_ms + sigma * self.stddev_ms.max(100.0)
     }
 
@@ -90,6 +138,35 @@ impl Baseline {
             .count();
         blocked >= MIN_WAF_BLOCKS
     }
+
+    /// Any WAF/CDN presence (headers or challenge markers observed).
+    /// Drives the informational warn + light auto-tamper.
+    #[must_use]
+    pub const fn is_waf_suspected(&self) -> bool {
+        self.waf_vendor.is_some()
+    }
+
+    /// A *blocking* signal (challenge/deny/rate-limit) was observed.
+    /// Drives finding confidence downgrade (see `waf::downgrade_for_waf`).
+    #[must_use]
+    pub const fn is_waf_blocking(&self) -> bool {
+        self.waf_blocking
+    }
+
+    /// Short evidence fragment (`" waf=cloudflare:… blocking=…"`) or `""`
+    /// when nothing was detected. Appended to finding evidence strings.
+    #[must_use]
+    pub fn waf_evidence_suffix(&self) -> String {
+        let Some(vendor) = self.waf_vendor.as_deref() else {
+            return String::new();
+        };
+        format!(
+            " waf={}:{} blocking={}",
+            vendor,
+            self.waf_hits.join(","),
+            self.waf_blocking
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +174,11 @@ pub struct Sample {
     pub status: u16,
     pub body: Vec<u8>,
     pub duration: Duration,
+    /// Response headers as `(lowercased-name, value-prefix ≤128 chars)`.
+    /// Values are truncated at collection time (OPSEC: bounds retention of
+    /// `Set-Cookie` tokens in RAM); detection only needs `contains` on
+    /// markers such as `__cf_bm`.
+    pub headers: Vec<(String, String)>,
 }
 
 /// Collect 3-5 baseline samples via client.
@@ -111,4 +193,69 @@ where
         samples.push(fetcher().await);
     }
     Baseline::new(&samples)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(status: u16, body: &[u8], headers: &[(&str, &str)]) -> Sample {
+        Sample {
+            status,
+            body: body.to_vec(),
+            duration: Duration::from_millis(50),
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn baseline_without_signals_is_clean() {
+        let samples = vec![
+            sample(200, b"<html>hello</html>", &[]),
+            sample(200, b"<html>hello</html>", &[]),
+            sample(200, b"<html>hello</html>", &[]),
+        ];
+        let bl = Baseline::new(&samples);
+        assert!(!bl.is_waf_blocked());
+        assert!(!bl.is_waf_suspected());
+        assert!(!bl.is_waf_blocking());
+        assert_eq!(bl.waf_evidence_suffix(), "");
+    }
+
+    #[test]
+    fn baseline_propagates_cf_presence_without_blocking() {
+        let headers = [("cf-ray", "abc-IAD"), ("server", "cloudflare")];
+        let samples = vec![
+            sample(200, b"<html>hello</html>", &headers),
+            sample(200, b"<html>hello</html>", &headers),
+            sample(200, b"<html>hello</html>", &headers),
+        ];
+        let bl = Baseline::new(&samples);
+        assert!(!bl.is_waf_blocked());
+        assert!(bl.is_waf_suspected());
+        assert!(
+            !bl.is_waf_blocking(),
+            "mere CDN presence must not downgrade"
+        );
+        assert_eq!(bl.waf_vendor.as_deref(), Some("cloudflare"));
+        assert!(bl.waf_evidence_suffix().contains("waf=cloudflare:"));
+    }
+
+    #[test]
+    fn baseline_blocking_challenge_propagates() {
+        let headers = [("cf-ray", "abc-IAD")];
+        let body = b"<html><title>Just a moment...</title>managed challenge</html>";
+        let samples = vec![
+            sample(200, body, &headers),
+            sample(200, body, &headers),
+            sample(200, body, &headers),
+        ];
+        let bl = Baseline::new(&samples);
+        assert!(bl.is_waf_suspected());
+        assert!(bl.is_waf_blocking());
+        assert!(bl.waf_evidence_suffix().contains("blocking=true"));
+    }
 }

@@ -28,14 +28,14 @@ fn engine_with_oob(
 ) -> (Engine, CancellationToken) {
     let client = test_client();
     let mut cfg = EngineConfig::default();
-    cfg.threads = 1;
+    cfg.budget.threads = 1;
     cfg.techniques = vec!["oob".to_owned()];
-    cfg.allow_private = true;
+    cfg.net.allow_private = true;
     cfg.no_redact = true;
-    cfg.extract = false;
-    cfg.oob_domain = oob_domain;
-    cfg.oob_poll_url = oob_poll_url;
-    cfg.oob_wait_secs = 0;
+    cfg.enumeration.extract = false;
+    cfg.oob.oob_domain = oob_domain;
+    cfg.oob.oob_poll_url = oob_poll_url;
+    cfg.oob.oob_wait_secs = 0;
     let cancel = CancellationToken::new();
     let engine = Engine::new(cfg, client, cancel.clone());
     (engine, cancel)

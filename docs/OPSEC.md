@@ -9,7 +9,9 @@
 
 ### Proxy & DNS
 - `--proxy socks5h://127.0.0.1:9050` (Tor) — **obligatoire `h`** pour DNS distant. `socks5://` rejeté (`ProxyError::DnsLeak`) pour éviter fuite DNS locale.
+- Avec `socks5h://`, la résolution DNS locale pré-envoi est sautée (pas de fuite, `.onion` fonctionne) ; contrôles lexicaux + IP littérale conservés. Sans proxy, validation lexicale + DNS-time à chaque hop (fenêtre TOCTOU résiduelle sans pinning d'IP — limite connue).
 - `--proxy http://proxy:8080` pour HTTP. Vérifier `http::proxy::ProxyConfig`.
+- Redirections : `--headers`/`--cookies` opérateur envoyés uniquement same-origin avec la cible initiale ; headers par-requête supprimés cross-host, `CookieJar` scopé par URL.
 
 ### Jitter humain
 - `http/jitter.rs` : `Normal(mean=750ms, sd=250ms, min=200ms)`. `Jitter::next_delay()` + `sleep().await` entre requêtes. Jamais d'intervalle fixe.
@@ -27,19 +29,19 @@
 ```sh
 injekt --target "https://example.com/?id=1" --export-encrypted ./session.enc
 # passphrase demandée, dérivation Argon2id → XChaCha20-Poly1305, salt 16B, nonce 24B
-injekt --import ./session.enc
+INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc  # inspection déchiffrée
 ```
 - Artefact sensible : prévenir utilisateur, `warn!` log. Clé jamais stockée, `SecretString` zeroized.
 
 ## Logs & preuves
 
-- `reporting/evidence.rs` : toute sortie passe `Scrubber::scrub()`. `--no-redact` uniquement en local explicite.
+- `reporting/evidence.rs` : findings/cibles/preuves via `Scrubber::scrub()`. Données DB extraites (`--extract`/`--dump`) affichées en clair par design (opt-in d'exfiltration). `--no-redact` uniquement en local explicite.
 - `tracing` niveau `info` par défaut, `verbose` → `debug`. Aucun secret en log.
 
 ## Limitations connues
 
 - **JA3** : `rustls` JA3 stable. Pour anonymisation TLS avancée, utiliser proxy `boringssl` externe. Documenté.
-- **WAF** : détection 403/406 répétitifs → `Baseline::is_waf_blocked()`, ajuster threads/jitter.
+- **WAF** : fingerprint par statuts, headers et corps de challenge. Seul un blocage actif déclenche le tamper automatique et la baisse de confiance ; une simple présence CDN reste informative. Ajuster threads/jitter si nécessaire.
 - **OOB** (`techniques/oob`, OPT-IN) : exfil DNS/HTTP via `--oob-domain <collaborateur>` + `--oob-poll-url <url>` (placeholder `{token}`). Sans `--oob-poll-url`, sondes envoyées mais jamais auto-confirmées (vérif manuelle UI collaborateur, aucun finding sans preuve). L'egress part du **serveur DB cible** (non proxyfiable) — collaborateur auto-hébergé recommandé, jamais de domaine tiers non contrôlé.
 
 ## Checklist opérateur

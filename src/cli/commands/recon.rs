@@ -2,9 +2,10 @@
 
 use crate::{
     cli::args::{Cli, Commands, ReconCommands},
+    cli::client_builder::jitter_from_str,
     cli::output::file::write_output_file_sync,
     engine::orchestrator::EngineConfig,
-    http::{client::HttpClient, jitter::Jitter, rate_limit::RateLimiter},
+    http::{client::HttpClient, rate_limit::RateLimiter},
     recon::{
         CrawlConfig, CrawlReport, Crawler,
         discovery::{DiscoveryReport, scan_candidates},
@@ -78,6 +79,8 @@ pub async fn run_scan(
     let client = build_client(cli)?;
     let crawl_report = crawl(cli, client.clone(), &args.crawl, &cancel).await?;
     let engine_config = engine_config(cli, args.auto_enumerate);
+    let learn_techniques = engine_config.techniques.clone();
+    let learn_dbms = engine_config.dbms_hint.clone();
     // `scan_candidates` clones candidates internally, so pass the raw list and
     // scrub afterwards to avoid double work on the crawl path.
     let discovery = scan_candidates(
@@ -87,6 +90,25 @@ pub async fn run_scan(
         cancel,
     )
     .await;
+    // C13 post-run (opt-in uniquement) : même delta anonyme que `scan`
+    // (`learn_from_run` + fusion + `fsync` + perms 0600). OFF = aucune IO.
+    if cli.knowledge_enabled() {
+        let mut delta = crate::reasoning::knowledge::KnowledgeStore::empty();
+        crate::reasoning::knowledge::learn_from_run(
+            &mut delta,
+            &discovery.findings,
+            &learn_techniques,
+            learn_dbms.as_deref(),
+            discovery.request_count,
+        );
+        if let Err(e) = crate::reasoning::knowledge::save_delta_if_enabled(
+            &delta,
+            true,
+            cli.knowledge_path.as_deref(),
+        ) {
+            tracing::warn!(error=%e, "knowledge save failed (run results kept in RAM)");
+        }
+    }
     let scrubber = crate::session::scrubber::Scrubber::new(cli.no_redact);
     Ok(ReconScanResult {
         crawl: crawl_report.scrubbed(&scrubber),
@@ -134,13 +156,28 @@ pub async fn run_import(
     let client = build_client(cli)?;
     let content = read_limited_import(&args.file)?;
     let candidates = parse_candidates(&content)?;
-    let discovery = scan_candidates(
-        candidates,
-        engine_config(cli, args.enumerate),
-        client,
-        cancel,
-    )
-    .await;
+    let cfg = engine_config(cli, args.enumerate);
+    let learn_techniques = cfg.techniques.clone();
+    let learn_dbms = cfg.dbms_hint.clone();
+    let discovery = scan_candidates(candidates, cfg, client, cancel).await;
+    // C13 post-run opt-in : delta anonyme fusionné (`fsync`, 0600). OFF = 0 IO.
+    if cli.knowledge_enabled() {
+        let mut delta = crate::reasoning::knowledge::KnowledgeStore::empty();
+        crate::reasoning::knowledge::learn_from_run(
+            &mut delta,
+            &discovery.findings,
+            &learn_techniques,
+            learn_dbms.as_deref(),
+            discovery.request_count,
+        );
+        if let Err(e) = crate::reasoning::knowledge::save_delta_if_enabled(
+            &delta,
+            true,
+            cli.knowledge_path.as_deref(),
+        ) {
+            tracing::warn!(error=%e, "knowledge save failed (run results kept in RAM)");
+        }
+    }
     let scrubber = crate::session::scrubber::Scrubber::new(cli.no_redact);
     Ok(discovery.scrubbed(&scrubber))
 }
@@ -165,30 +202,7 @@ fn read_limited_import(path: &str) -> anyhow::Result<String> {
 /// Returns an error if no recon subcommand is given or the underlying operation fails.
 pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
     if cli.dry_run {
-        println!("dry-run: recon plan (no request sent)");
-        println!("  resolution: {}", cli.resolution_summary());
-        if let Some(Commands::Recon(args)) = &cli.command {
-            match &args.command {
-                ReconCommands::Crawl(a) => {
-                    println!(
-                        "  mode: crawl target={} depth={} max-pages={}",
-                        a.target, a.depth, a.max_pages
-                    );
-                }
-                ReconCommands::Scan(a) => {
-                    println!(
-                        "  mode: scan target={} depth={} max-pages={} auto-enumerate={}",
-                        a.crawl.target, a.crawl.depth, a.crawl.max_pages, a.auto_enumerate
-                    );
-                }
-                ReconCommands::Import(a) => {
-                    println!(
-                        "  mode: import file={} test={} enumerate={}",
-                        a.file, a.test, a.enumerate
-                    );
-                }
-            }
-        }
+        dry_run(&cli);
         return Ok(());
     }
     let command = match &cli.command {
@@ -223,6 +237,110 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Offline recon plan (C11): 0 requête, no `HttpClient` built.
+/// - `crawl`: crawl envelope only (params unknown until crawl).
+/// - `scan`: crawl envelope + scan plan for the seed URL's lexical params.
+/// - `import`: offline candidate count when `--test=false`, else test envelope.
+fn dry_run(cli: &Cli) {
+    use crate::session::scrubber::Scrubber;
+    let scrubber = Scrubber::new(cli.no_redact);
+    println!("dry-run: recon plan (no request sent)");
+    println!("  resolution: {}", cli.resolution_summary());
+    let Some(Commands::Recon(args)) = &cli.command else {
+        println!("  mode: none (recon subcommand required)");
+        println!("  0 requête envoyée (HttpClient.send jamais appelé)");
+        return;
+    };
+    match &args.command {
+        ReconCommands::Crawl(a) => {
+            println!(
+                "  mode: crawl target={} depth={} max-pages={} max-per-template={} max-candidates={}",
+                scrubber.scrub(&a.target),
+                a.depth,
+                a.max_pages,
+                a.max_per_template,
+                a.max_candidates
+            );
+            println!("  params: unknown until crawl (crawl requires network; dry-run sends 0)");
+            println!(
+                "  seed={} threads={}",
+                cli.effective_seed()
+                    .map_or("none".to_owned(), |s| s.to_string()),
+                cli.effective_threads(),
+            );
+        }
+        ReconCommands::Scan(a) => {
+            println!(
+                "  mode: scan target={} depth={} max-pages={} max-candidates={} auto-enumerate={}",
+                scrubber.scrub(&a.crawl.target),
+                a.crawl.depth,
+                a.crawl.max_pages,
+                a.crawl.max_candidates,
+                a.auto_enumerate
+            );
+            let cfg = engine_config(cli, a.auto_enumerate);
+            if a.crawl.target.contains("://") {
+                match crate::cli::plan::build_plan(&a.crawl.target, &cfg) {
+                    Ok(plan) => print!(
+                        "{}",
+                        crate::cli::plan::render_human(
+                            &plan.scrubbed(&scrubber),
+                            &cli.resolution_summary(),
+                            true
+                        )
+                    ),
+                    Err(e) => println!("  seed-target plan failed: {e}"),
+                }
+            } else {
+                println!(
+                    "  seed target is a bare host ({}): params unknown until crawl, 0 req",
+                    scrubber.scrub(&a.crawl.target)
+                );
+                println!(
+                    "  scan techniques={} level={} seed={} budget_total={}",
+                    if cfg.techniques.is_empty() {
+                        "all".to_owned()
+                    } else {
+                        cfg.techniques.join(",")
+                    },
+                    cfg.budget.level,
+                    cfg.seed.map_or("none".to_owned(), |s| s.to_string()),
+                    cfg.budget
+                        .request_budget
+                        .map_or("unlimited".to_owned(), |b| b.to_string()),
+                );
+            }
+        }
+        ReconCommands::Import(a) => {
+            println!(
+                "  mode: import file={} test={} enumerate={}",
+                scrubber.scrub(&a.file),
+                a.test,
+                a.enumerate
+            );
+            if a.test {
+                let cfg = engine_config(cli, a.enumerate);
+                println!(
+                    "  test envelope (dry-run, 0 req): techniques={} level={} seed={}",
+                    if cfg.techniques.is_empty() {
+                        "all".to_owned()
+                    } else {
+                        cfg.techniques.join(",")
+                    },
+                    cfg.budget.level,
+                    cfg.seed.map_or("none".to_owned(), |s| s.to_string()),
+                );
+            } else {
+                match run_import_offline(a, cli.no_redact) {
+                    Ok(cands) => println!("  candidates (offline, 0 req): {}", cands.len()),
+                    Err(e) => println!("  offline import failed: {e}"),
+                }
+            }
+        }
+    }
+    println!("  0 requête envoyée (HttpClient.send jamais appelé)");
+}
+
 async fn crawl(
     cli: &Cli,
     client: HttpClient,
@@ -232,6 +350,9 @@ async fn crawl(
     if args.max_pages == 0 {
         anyhow::bail!("--max-pages must be greater than zero");
     }
+    if args.max_candidates == 0 {
+        anyhow::bail!("--max-candidates must be greater than zero");
+    }
     tracing::warn!(
         target = %args.target,
         "recon crawl and scan must only be used against systems you are authorized to test"
@@ -240,9 +361,11 @@ async fn crawl(
         depth: args.depth.min(16),
         max_pages: args.max_pages.min(100_000),
         max_per_template: args.max_per_template.max(1),
+        max_candidates: args.max_candidates.min(100_000),
         include_subdomains: args.include_subdomains,
         respect_robots: !args.ignore_robots,
         allow_private: cli.allow_private,
+        remote_dns: cli.uses_remote_dns(),
     };
     Crawler::new(client, config)
         .crawl(&args.target, cancel)
@@ -278,7 +401,46 @@ fn engine_config(cli: &Cli, enumerate: bool) -> EngineConfig {
         );
     }
     EngineConfig {
-        threads: cli.effective_threads(),
+        budget: crate::engine::orchestrator::BudgetConfig {
+            threads: cli.effective_threads(),
+            level: cli.effective_level(),
+            request_budget: cli.effective_request_budget(),
+            max_duration_secs: cli.effective_max_duration(),
+        },
+        evasion: crate::engine::orchestrator::EvasionConfig {
+            payload_opts: cli.payload_opts(),
+            tampers,
+            hpp: cli.hpp,
+            chunked: cli.chunked,
+        },
+        net: crate::engine::orchestrator::NetConfig {
+            allow_private: cli.allow_private,
+            remote_dns: cli.uses_remote_dns(),
+            ignore_codes: cli.ignore_codes.clone(),
+            method_override: cli.method.clone(),
+        },
+        oob: crate::engine::orchestrator::OobConfig {
+            oob_domain: cli.oob_domain.clone(),
+            oob_poll_url: cli.oob_poll_url.clone(),
+            oob_wait_secs: cli.effective_oob_wait_secs(),
+        },
+        enumeration: crate::engine::orchestrator::EnumConfig {
+            extract: cli.extract,
+            dbs: enumerate && cli.dbs,
+            tables: enumerate && cli.tables,
+            columns: enumerate && cli.columns,
+            dump: enumerate && cli.dump,
+            banner: enumerate && cli.banner,
+            current_user: enumerate && cli.current_user,
+            current_db: enumerate && cli.current_db,
+            hostname: enumerate && cli.hostname,
+            db: cli.db.clone(),
+            table: cli.table.clone(),
+            column: cli.column.clone(),
+            start: cli.start,
+            stop: cli.stop,
+            count: enumerate && cli.count,
+        },
         techniques: if !cli.techniques.is_empty() {
             cli.techniques.clone()
         } else if cli
@@ -296,54 +458,47 @@ fn engine_config(cli: &Cli, enumerate: bool) -> EngineConfig {
         },
         test_params: cli.params.clone(),
         post_data: cli.data.clone(),
-        payload_opts: cli.payload_opts(),
         matcher: cli.matcher_config(),
-        tampers,
-        level: cli.effective_level(),
         confirm: cli.confirm,
-        ignore_codes: cli.ignore_codes.clone(),
-        oob_domain: cli.oob_domain.clone(),
-        oob_poll_url: cli.oob_poll_url.clone(),
-        oob_wait_secs: cli.effective_oob_wait_secs(),
-        hpp: cli.hpp,
-        chunked: cli.chunked,
-        allow_private: cli.allow_private,
+        no_mutation: cli.no_mutation,
+        seed: cli.effective_seed(),
+        explain: cli.explain.clone(),
         no_redact: cli.no_redact,
-        extract: cli.extract,
-        dbs: enumerate && cli.dbs,
-        tables: enumerate && cli.tables,
-        columns: enumerate && cli.columns,
-        dump: enumerate && cli.dump,
-        banner: enumerate && cli.banner,
-        current_user: enumerate && cli.current_user,
-        current_db: enumerate && cli.current_db,
-        hostname: enumerate && cli.hostname,
-        db: cli.db.clone(),
-        table: cli.table.clone(),
-        column: cli.column.clone(),
-        start: cli.start,
-        stop: cli.stop,
-        count: enumerate && cli.count,
+        dbms_hint: cli.normalized_dbms_hint(),
+        marker: cli.marker.clone(),
+        raw_request: cli.merged_raw_request(),
+        // C13 : même porte opt-in que `scan` (OFF = None, aucune IO).
+        knowledge: crate::reasoning::knowledge::load_if_enabled(
+            cli.knowledge_enabled(),
+            cli.knowledge_path.as_deref(),
+        ),
+        second_order: crate::engine::orchestrator::SecondOrderConfig {
+            enabled: cli.second_order,
+            revisit_url: cli.second_order_revisit_url.clone(),
+            max_stores: cli.effective_second_order_max_stores(),
+            ..crate::engine::orchestrator::SecondOrderConfig::default()
+        },
     }
 }
 
 fn build_client(cli: &Cli) -> anyhow::Result<HttpClient> {
+    let value = cli.effective_jitter();
     let jitter = {
-        let value = cli.effective_jitter();
-        let parts: Vec<f64> = value
+        let parsed = jitter_from_str(&value);
+        // Preserve the historical warning on unparseable input (the shared
+        // helper already fell back to the floored default).
+        if value
             .split(',')
-            .filter_map(|part| part.trim().parse().ok())
-            .collect();
-        match parts.as_slice() {
-            [mean, standard_deviation] => Jitter::new(*mean, *standard_deviation),
-            _ => {
-                tracing::warn!(
-                    value = %value,
-                    "invalid jitter (expected \"mean_ms,std_ms\"), using default 750,250"
-                );
-                Jitter::default()
-            }
+            .filter_map(|p| p.trim().parse::<f64>().ok())
+            .count()
+            != 2
+        {
+            tracing::warn!(
+                value = %value,
+                "invalid jitter (expected \"mean_ms,std_ms\"), using default 750,250"
+            );
         }
+        parsed
     };
     let limiter = Arc::new(RateLimiter::new(cli.effective_rate_limit()));
     let retry = crate::http::retry::RetryPolicy {
@@ -351,11 +506,18 @@ fn build_client(cli: &Cli) -> anyhow::Result<HttpClient> {
         base_delay: Duration::from_millis(cli.effective_delay()),
         max_delay: Duration::from_secs(5),
     };
+    // Seeded UA + jitter/retry (same contract as `client_builder::build_client`).
+    let seed = cli.effective_seed();
+    let mut seed_rng = crate::seeded_rng::make_rng(seed);
     let mut builder = HttpClient::builder()
         .timeout(Duration::from_secs(cli.effective_timeout()))
+        .identity(crate::http::identity::Identity::random_with_rng(
+            &mut seed_rng,
+        ))
         .jitter(jitter)
         .rate_limiter(limiter)
         .retry_policy(retry)
+        .seed(seed)
         .allow_private(cli.allow_private);
     if let Some(proxy) = cli.effective_proxy() {
         builder = builder.proxy(crate::http::proxy::ProxyConfig::parse(&proxy)?);
@@ -364,13 +526,13 @@ fn build_client(cli: &Cli) -> anyhow::Result<HttpClient> {
         let Some((name, value)) = header.split_once(':') else {
             anyhow::bail!("invalid --headers value, expected 'Name: value'");
         };
-        builder = builder.header(
+        builder = builder.user_header(
             HeaderName::from_bytes(name.trim().as_bytes())?,
             HeaderValue::from_str(value.trim())?,
         );
     }
     if let Some(cookies) = &cli.cookies {
-        builder = builder.header(
+        builder = builder.user_header(
             http::header::COOKIE,
             HeaderValue::from_str(cookies)
                 .map_err(|error| anyhow::anyhow!("invalid --cookies header value: {error}"))?,

@@ -2,7 +2,7 @@
 
 **Détection et exploitation d'injections SQL moderne en Rust — zéro persistance, anonymisation by design.**
 
-> Supérieur à `sqlmap`/`ghauri` en performance, maintenabilité et discrétion. Tout vit en RAM et est wipé à la sortie.
+> Architecture Rust async moderne (concurrence bornée, session RAM-only, MCP, OOB avec preuve). Aucun benchmark comparatif contre `sqlmap`/`ghauri` n'est livré dans ce dépôt — vérifiez toute affirmation de performance par vos propres mesures reproductibles.
 
 [![Rust 1.88](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org) [![Édition 2024](https://img.shields.io/badge/edition-2024-blue)](https://doc.rust-lang.org/edition-guide/) [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-green)](LICENSE) [![unsafe_code deny](https://img.shields.io/badge/unsafe-deny-success)](https://doc.rust-lang.org/rustc/lints/listing/allowed-by-default.html)
 
@@ -29,8 +29,8 @@
 
 - **Cibles** : parsing URL strict (`url` crate), rejet IPs privées/loopback anti-SSRF, parser raw-request Burp/ZAP, `ParameterLocation{Query,Body,Header,Cookie}`, marqueurs `*` / `§` / `{{}}`.
 - **HTTP** (`src/http/`) : builder type-state (`timeout()` obligatoire avant `build()`), `Arc<reqwest::Client>` rustls, jitter, `RateLimiter` token-bucket, `CookieJar` mémoire (`zeroize`), rotation `Identity`, `ProxyConfig` Tor `socks5h://`, retry exponentiel + jitter, gzip/br.
-- **Détection** (`src/detection/`) : baseline 3-5 requêtes → SHA-256 + moyenne/écart-type + détection WAF 403/406, diff Levenshtein + Jaccard (`DiffResult{similarity,time_delta,confidence}`), confirmation TRUE/FALSE inversés (3 essais min).
-- **Techniques** (`src/techniques/`) : `boolean` (`OR 1=1` / `AND 1=1`, commentaires par SGBD), `time` (`SLEEP/pg_sleep/WAITFOR/BENCHMARK`, seuil `baseline+2σ`), `error` (`EXTRACTVALUE/CONVERT/CAST`), `union` (énumération ORDER BY), `stacked` (marqueur `; SELECT`), `oob` (OPT-IN DNS/HTTP via `--oob-domain`, polling collaborateur), `json` (boolean + erreurs sur `JSON_EXTRACT`/`->>`/`JSON_VALUE`/`OPENJSON`/`JSON_EXISTS` par SGBD), `tamper` évasion WAF (`--tamper space2comment,randomcase,versionedcomment,versionedmorekeywords,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,equaltolike,...` + auto `space2comment` sur WAF 403/406), tampers requête (`--hpp` pollution `?id=1&id=PAYLOAD`, `--chunked` `Transfer-Encoding: chunked` streamé).
+- **Détection** (`src/detection/`) : baseline 3-5 requêtes → SHA-256 + moyenne/écart-type + fingerprint WAF/CDN par statut, headers et corps de challenge ; diff Levenshtein + Jaccard (`DiffResult{similarity,time_delta,confidence}`) ; masquage des payloads d'erreur reflétés et confirmation TRUE/FALSE.
+- **Techniques** (`src/techniques/`) : `boolean` (`OR 1=1` / `AND 1=1`, commentaires par SGBD), `time` (`SLEEP/pg_sleep/WAITFOR/BENCHMARK`, seuil `baseline+2σ`), `error` (`EXTRACTVALUE/CONVERT/CAST`), `union` (énumération ORDER BY), `stacked` (marqueur `; SELECT`), `oob` (OPT-IN DNS/HTTP via `--oob-domain`, polling collaborateur), `json` (boolean + erreurs sur `JSON_EXTRACT`/`->>`/`JSON_VALUE`/`OPENJSON`/`JSON_EXISTS` par SGBD), `tamper` évasion WAF (`--tamper space2comment,randomcase,versionedcomment,versionedmorekeywords,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,equaltolike,space2paren,versionedfuzz,jsonunicodeescape,numericobfuscate,linecomment,...` + presets `cloudflare-generic`/`aggressive` + auto `space2comment,randomcase` uniquement sur blocage WAF actif), tampers requête (`--hpp` pollution `?id=1&id=PAYLOAD`, `--chunked` `Transfer-Encoding: chunked` streamé).
 - **SGBD** (`src/dbms/`) : trait `DbmsDetector` en `async fn` natifs, fingerprint MySQL 8.x (`@@version`), Postgres 15+ (`version()`), MSSQL 2022 (`@@version`), Oracle 21c (`v$version`).
 - **Extraction** (`src/extraction/`) : recherche binaire ASCII 32-126, `buffer_unordered` borné, vérification longueur + checksum, `SecretString` wipé après rapport.
 - **Recon** (`src/recon/`) : crawler statique pour liens, formulaires et endpoints JS basiques ; périmètre same-origin, support robots.txt, déduplication des candidats et passage rate-limité vers scan/énumération.
@@ -143,8 +143,7 @@ injekt --target "http://192.168.1.10/?id=1" --allow-private
 
 # Export chiffré de session (OPT-IN) — crée un artefact sensible
 injekt --target "https://example.com/?id=1" --export-encrypted ./session.enc
-injekt --import ./session.enc --target "https://example.com/?id=1"  # reprise
-injekt replay --file ./session.enc
+INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc  # inspection déchiffrée
 injekt info
 
 # Serveur MCP (assistants IA) — voir docs/MCP.md
@@ -188,9 +187,9 @@ Options:
       --delay <MS>                Délai retry de base, backoff exponentiel [défaut: 500]
       --rate-limit <RPS>          Token-bucket req/s [défaut: 10]
       --jitter <MOY,ECART>        Millisecondes, ex. "750,250" [défaut: 750,250 — actif même sans le flag]
-      --techniques <LISTE>        boolean,time,error,union,stacked,oob,json,all [défaut: all]
+      --techniques <LISTE>        boolean,time,error,union,stacked,oob,json,nosql,all [défaut: all]
       --fetch-using <MODE>        Oracle forcé : direct, boolean ou time
-      --tamper <LISTE>            Tampers WAF : space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,randomcase,versionedcomment,versionedmorekeywords,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,base64encode(opt-in) [défaut: aucun, auto space2comment sur WAF 403/406]
+      --tamper <LISTE>            Tampers WAF : space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,randomcase,versionedcomment,versionedmorekeywords,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2paren,versionedfuzz,jsonunicodeescape,numericobfuscate,linecomment,base64encode(opt-in) [défaut: aucun, auto space2comment,randomcase sur blocage WAF actif]
       --hpp                       Pollution paramètres : duplique ?id=1&id=PAYLOAD (Query/Body)
       --chunked                   Transfert chunked : body streamé Transfer-Encoding: chunked (Body uniquement)
       --prefix/--suffix <STR>     Préfixe/suffixe payload appliqués après les tampers
@@ -200,7 +199,8 @@ Options:
       --code <N>                  Le statut réponse doit égaler N, sinon veto
       --text-only                 Strip tags/entités HTML avant matching
       --level <1-5>               Agressivité [défaut: 1]
-      --confirm                   Confirmation stricte second passage (~2x requêtes, OOB exclu)
+      --seed <N>                  Seed RNG déterministe (enregistré dans le rapport)
+      --confirm                   Confirmation stricte second passage (planifié C6 ; actuellement warning seul)
       --ignore-code <LISTE>       Statuts traités comme sondes négatives (ex. 429,503)
       --oob-domain <DOMAINE>      Domaine collaborateur (active sondes OOB, OPT-IN)
       --oob-poll-url <URL>        URL de polling avec placeholder {token} (auto-confirmation)
@@ -278,7 +278,7 @@ src/
 ├── target/{url,raw_request,parameters,markers}
 ├── http/{client,identity,proxy,cookies,redirects,retry,jitter,rate_limit}
 ├── detection/{baseline,response_diff,confirmation,scanner/{engine,scheduler}}
-├── techniques/{boolean,time,error,union,stacked,oob,json}/{detector,payloads} (+oob/verifier) + tamper (évasion WAF) + request_tamper (HPP/chunked)
+├── techniques/{boolean,time,error,union,stacked,oob,json,nosql}/{detector,payloads} (+oob/verifier) + tamper (évasion WAF) + request_tamper (HPP/chunked)
 ├── dbms/{common,mysql,postgres,mssql,oracle}/{fingerprint,payloads,queries}
 ├── extraction/{engine,inference,verification}
 ├── recon/{crawler,discovery,filters,parameter}

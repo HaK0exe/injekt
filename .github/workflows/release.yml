@@ -9,8 +9,31 @@ env:
   BIN_NAME: injekt
 
 jobs:
+  verify:
+    name: verify tag and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tag matches Cargo package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test "v${version}" = "${GITHUB_REF_NAME}"
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: cargo test
+        run: cargo test --all-targets --locked -- --test-threads=4
+
   build:
     name: ${{ matrix.target }}
+    needs: verify
     strategy:
       fail-fast: false
       matrix:

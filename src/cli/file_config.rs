@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 /// delay = 800
 /// level = 1
 /// techniques = ["boolean", "error"]
+/// seed = 42
 /// proxy = "socks5h://127.0.0.1:9050"
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -42,6 +43,7 @@ pub struct FileConfig {
     pub techniques: Option<Vec<String>>,
     pub proxy: Option<String>,
     pub oob_wait_secs: Option<u64>,
+    pub seed: Option<u64>,
 }
 
 impl FileConfig {
@@ -143,6 +145,12 @@ techniques = ["boolean", "error"]
     #[test]
     fn parse_invalid_type_errors() {
         assert!(FileConfig::parse("threads = \"many\"\n").is_err());
+    }
+
+    #[test]
+    fn parse_seed() {
+        let cfg = FileConfig::parse("seed = 42\n").unwrap_or_default();
+        assert_eq!(cfg.seed, Some(42));
     }
 
     #[test]

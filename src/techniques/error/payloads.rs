@@ -28,7 +28,7 @@ pub struct ErrorPayload {
 ///   `TO_NUMBER(banner)` (ORA-01722), `XMLTYPE(banner)`, `DBMS_XDB`
 /// - Generic/`None`: the four legacies first (mysql/pg/mssql historically,
 ///   oracle appended), then one representative variant per DBMS so L1 stays
-///  Compat (`take(2)` = historical mysql + pg) while L2/L3 sweep new channels.
+///   Compat (`take(2)` = historical mysql + pg) while L2/L3 sweep new channels.
 #[must_use]
 pub fn error_payloads_for(dbms: Option<&str>) -> Vec<ErrorPayload> {
     match dbms {
@@ -162,14 +162,16 @@ mod tests {
         );
         let pg = error_payloads_for(Some("postgres"));
         assert!(pg.iter().any(|p| p.payload.contains("chr(126)")), "{pg:?}");
-        let mssql = error_payloads_for(Some("mssql"));
+        let sql_server = error_payloads_for(Some("mssql"));
         assert!(
-            mssql.iter().any(|p| p.payload.contains("FOR XML PATH")),
-            "{mssql:?}"
+            sql_server
+                .iter()
+                .any(|p| p.payload.contains("FOR XML PATH")),
+            "{sql_server:?}"
         );
         assert!(
-            mssql.iter().any(|p| p.payload.contains("CAST")),
-            "{mssql:?}"
+            sql_server.iter().any(|p| p.payload.contains("CAST")),
+            "{sql_server:?}"
         );
         let oracle = error_payloads_for(Some("oracle"));
         assert!(
