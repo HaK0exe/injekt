@@ -49,6 +49,7 @@ pub fn info() -> InfoResult {
             "postgres".to_string(),
             "mssql".to_string(),
             "oracle".to_string(),
+            "sqlite".to_string(),
         ],
         docs: "docs/OPSEC.md (JA3, jitter, proxy socks5h)".to_string(),
     }

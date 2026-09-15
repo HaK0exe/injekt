@@ -90,6 +90,7 @@ fn is_sensitive_header(name: &str) -> bool {
             | "set-cookie"
             | "set-cookie2"
             | "x-api-key"
+            | "x-api-token"
             | "x-api-secret"
             | "x-auth-token"
             | "x-access-token"
@@ -97,26 +98,32 @@ fn is_sensitive_header(name: &str) -> bool {
             | "x-csrf-token"
             | "x-csrftoken"
             | "api-key"
+            | "api-secret"
+            | "api-token"
             | "apikey"
             | "access-token"
             | "refresh-token"
             | "id-token"
             | "client-secret"
             | "session-token"
+            | "csrf-token"
     )
 }
 
 fn scrub_headers(input: &str) -> String {
-    static RE: OnceLock<Regex> = OnceLock::new();
+    static RE: OnceLock<Option<Regex>> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        #[allow(clippy::unwrap_used)]
-        {
-            Regex::new(
-                r"(?i)(authorization|proxy-authorization|proxy-authenticate|www-authenticate|authentication|cookie2?|set-cookie2?|x-api-key|x-api-secret|x-auth-token|x-access-token|x-session-token|x-csrf-token|x-csrftoken|api-key|apikey|access-token|refresh-token|id-token|client-secret|session-token)\s*:\s*[^\r\n]+",
-            )
-            .unwrap_or_else(|_| Regex::new(r"(?i)authorization\s*:\s*[^\r\n]+").unwrap())
-        }
+        // Both patterns are static; if either fails to compile, skip header
+        // scrubbing for this input — never panic in prod.
+        Regex::new(
+            r"(?i)(authorization|proxy-authorization|proxy-authenticate|www-authenticate|authentication|cookie2?|set-cookie2?|x-api-key|x-api-token|x-api-secret|x-auth-token|x-access-token|x-session-token|x-csrf-token|x-csrftoken|api-key|api-secret|api-token|apikey|access-token|refresh-token|id-token|client-secret|session-token|csrf-token)\s*:\s*[^\r\n]+",
+        )
+        .or_else(|_| Regex::new(r"(?i)authorization\s*:\s*[^\r\n]+"))
+        .ok()
     });
+    let Some(re) = re.as_ref() else {
+        return input.to_owned();
+    };
     re.replace_all(input, |caps: &regex::Captures<'_>| {
         format!("{}: [REDACTED]", &caps[1])
     })
@@ -131,7 +138,8 @@ fn scrub_url_userinfo(input: &str) -> String {
     let re = RE.get_or_init(|| {
         #[allow(clippy::expect_used)]
         {
-            Regex::new(r"(?i)((?:https?|socks5h?|ftp)://)[^/\s@]+@").expect("userinfo regex")
+            Regex::new(r"(?i)((?:https?|socks5h?|socks4a?|socks|ftp)://)[^/\s@]+@")
+                .expect("userinfo regex")
         }
     });
     re.replace_all(input, "$1[REDACTED]@").into_owned()
@@ -146,7 +154,7 @@ fn scrub_query_secrets(input: &str) -> String {
         #[allow(clippy::expect_used)]
         {
             Regex::new(
-                r#"(?i)([?&;](?:sessionid|phpsessid|jsessionid|aspsessionid|asp_net_sessionid|sid|sessid|session|token|access_token|auth_token|api_key|apikey|secret|client_secret|password|passwd|pwd|auth|session_token|refresh_token|id_token)=)[^&\s"'<>]+"#,
+                r#"(?i)([?&;](?:sessionid|phpsessid|jsessionid|aspsessionid|asp_net_sessionid|sid|sessid|session|token|access_token|accesstoken|auth_token|authtoken|api_key|api-key|api_secret|api-secret|apisecret|apikey|api_token|api-token|apitoken|x-api-key|x-api-token|x-api-secret|secret|client_secret|clientsecret|password|passwd|pwd|auth|session_token|sessiontoken|refresh_token|refreshtoken|id_token|idtoken|csrf|csrf_token|csrf-token|private_key|privatekey)=)[^&\s"'<>]+"#,
             )
             .expect("query secrets regex")
         }
@@ -164,7 +172,7 @@ fn scrub_json_secrets(input: &str) -> String {
         #[allow(clippy::expect_used)]
         {
             Regex::new(
-                r#"(?i)("(?:password|passwd|pwd|secret|client_secret|api_key|apikey|access_token|auth_token|session_token|refresh_token|id_token|token|sessionid|session|cookie|authorization|set-cookie|x-api-key|x-auth-token|private_key|aws_secret|aws_session_token)"\s*:\s*")[^"]*(")"#,
+                r#"(?i)("(?:password|passwd|pwd|secret|client_secret|clientsecret|api_key|api-key|api_secret|api-secret|apisecret|apikey|api_token|api-token|apitoken|access_token|accesstoken|auth_token|authtoken|session_token|sessiontoken|refresh_token|refreshtoken|id_token|idtoken|token|sessionid|session|cookie|authorization|set-cookie|x-api-key|x-api-token|x-api-secret|x-auth-token|csrf|csrf_token|csrf-token|private_key|privatekey|private-key|aws_secret|aws_session_token)"\s*:\s*")[^"]*(")"#,
             )
             .expect("json str secrets regex")
         }
@@ -173,7 +181,7 @@ fn scrub_json_secrets(input: &str) -> String {
         #[allow(clippy::expect_used)]
         {
             Regex::new(
-                r#"(?i)("(?:password|passwd|pwd|secret|client_secret|api_key|apikey|access_token|auth_token|session_token|refresh_token|id_token|token|sessionid|session)"\s*:\s*)(-?\d+(?:\.\d+)?|true|false|null)"#,
+                r#"(?i)("(?:password|passwd|pwd|secret|client_secret|clientsecret|api_key|api-key|api_secret|api-secret|apisecret|apikey|api_token|api-token|apitoken|access_token|accesstoken|auth_token|authtoken|session_token|sessiontoken|refresh_token|refreshtoken|id_token|idtoken|token|sessionid|session|csrf|csrf_token|csrf-token)"\s*:\s*)(-?\d+(?:\.\d+)?|true|false|null)"#,
             )
             .expect("json raw secrets regex")
         }
@@ -190,7 +198,7 @@ fn scrub_form_secrets(input: &str) -> String {
         #[allow(clippy::expect_used)]
         {
             Regex::new(
-                r#"(?i)\b(password|passwd|pwd|secret|client_secret|api_key|apikey|access_token|auth_token|session_token|refresh_token|id_token|token|sessionid|phpsessid|jsessionid|sid|sessid|session|auth)\s*=\s*[^&\s,;"'<>]+"#,
+                r#"(?i)\b(password|passwd|pwd|secret|client_secret|clientsecret|api_key|api-key|api_secret|api-secret|apisecret|apikey|api_token|api-token|apitoken|x-api-key|x-api-token|x-api-secret|access_token|accesstoken|auth_token|authtoken|session_token|sessiontoken|refresh_token|refreshtoken|id_token|idtoken|token|sessionid|phpsessid|jsessionid|sid|sessid|session|auth|csrf|csrf_token|csrf-token|private_key|privatekey|private-key)\s*=\s*[^&\s,;"'<>]+"#,
             )
             .expect("form secrets regex")
         }
@@ -489,6 +497,35 @@ mod tests {
         ] {
             assert!(!out.contains(secret), "{secret} leaked: {out}");
         }
+    }
+
+    #[test]
+    fn scrubs_extended_secret_key_variants() {
+        let sc = Scrubber::new(false);
+        // Previously-missed variants from the audit: hyphen/underscore/camelCase.
+        for secret in [
+            "X-Api-Token: hunter2-value",
+            "X-Api-Secret: hunter2-value",
+            "Api-Secret: hunter2-value",
+            "Csrf-Token: hunter2-value",
+            "https://example.com/?x-api-token=abc123&api-secret=def456&csrf-token=ghi789",
+            r#"{"privateKey": "hunter2", "apiSecret": "hunter2b"}"#,
+            "data apiSecret=hunter2&privateKey=hunter2b&csrf-token=hunter2c",
+            "proxy socks://user:p4ss@127.0.0.1:1080",
+        ] {
+            let out = sc.scrub(secret);
+            assert!(
+                !out.contains("hunter2")
+                    && !out.contains("abc123")
+                    && !out.contains("def456")
+                    && !out.contains("ghi789")
+                    && !out.contains("p4ss@"),
+                "leaked: {secret} -> {out}"
+            );
+        }
+        // Host preserved for userinfo redact.
+        let out = sc.scrub("proxy socks://user:p4ss@127.0.0.1:1080");
+        assert!(out.contains("127.0.0.1"), "{out}");
     }
 
     #[test]
