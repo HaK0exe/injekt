@@ -19,7 +19,7 @@
 //!
 //! Clé d'agrégat : `(technique, dbms, context_class)` — vocabulaire fermé :
 //! - `technique`: `boolean|time|error|union|stacked|oob|json|nosql`
-//! - `dbms`: `mysql|postgres|mssql|oracle|unknown`
+//! - `dbms`: `mysql|postgres|mssql|oracle|sqlite|unknown`
 //! - `context_class`: `numeric|single-quote|double-quote|parenthesis|json|order_by|generic`
 //!
 //! Valeurs : `{success, trials, avg_req}` (compteurs + moyenne mobile des
@@ -455,6 +455,7 @@ pub fn normalize_dbms(raw: &str) -> &str {
         "postgres" | "postgresql" | "pg" | "pgsql" => "postgres",
         "mssql" | "sqlserver" | "sql-server" | "tsql" => "mssql",
         "oracle" | "ora" => "oracle",
+        "sqlite" => "sqlite",
         _ => "unknown",
     }
 }
@@ -862,6 +863,16 @@ mod tests {
         let loaded = load_if_enabled(true, Some(&explicit)).expect("missing -> neutral");
         assert!(loaded.is_empty());
         assert!(!path.exists(), "load must not create the file");
+    }
+
+    #[test]
+    fn normalize_dbms_covers_sqlite() {
+        // P0-3: `sqlite` is a first-class DBMS label (was: `unknown`, which
+        // collapsed SQLite learning into the generic bucket).
+        assert_eq!(normalize_dbms("sqlite"), "sqlite");
+        assert_eq!(normalize_dbms("  SQLITE "), "sqlite");
+        assert_eq!(normalize_dbms("pg"), "postgres");
+        assert_eq!(normalize_dbms("nope"), "unknown");
     }
 
     #[test]
