@@ -39,6 +39,7 @@ pub fn stacked_payloads_for(dbms: Option<&str>) -> Vec<StackedPayload> {
         Some("postgres") => " --",
         Some("mssql") => " --",
         Some("oracle") => " --",
+        Some("sqlite") => " --",
         _ => " -- -",
     };
     let mut out = Vec::new();
@@ -114,6 +115,18 @@ mod tests {
         assert!(!payloads.is_empty());
         for p in &payloads {
             assert!(p.marker.contains("stacked_"));
+        }
+    }
+
+    #[test]
+    fn sqlite_uses_dashdash_comment() {
+        // P0-3: sqlite stacked probes close with `--` (never MySQL `-- -`).
+        let payloads = stacked_payloads_for(Some("sqlite"));
+        assert!(!payloads.is_empty());
+        for p in &payloads {
+            assert_eq!(p.dbms, "sqlite");
+            assert!(p.payload.ends_with(" --"), "{}", p.payload);
+            assert!(!p.payload.ends_with(" -- -"), "{}", p.payload);
         }
     }
 }

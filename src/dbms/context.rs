@@ -110,6 +110,7 @@ pub struct DbmsBelief {
     pub postgres: f64,
     pub mssql: f64,
     pub oracle: f64,
+    pub sqlite: f64,
 }
 
 impl Default for DbmsBelief {
@@ -122,10 +123,11 @@ impl DbmsBelief {
     #[must_use]
     pub const fn uniform() -> Self {
         Self {
-            mysql: 0.25,
-            postgres: 0.25,
-            mssql: 0.25,
-            oracle: 0.25,
+            mysql: 0.20,
+            postgres: 0.20,
+            mssql: 0.20,
+            oracle: 0.20,
+            sqlite: 0.20,
         }
     }
 
@@ -139,24 +141,35 @@ impl DbmsBelief {
                 postgres: 0.0,
                 mssql: 0.0,
                 oracle: 0.0,
+                sqlite: 0.0,
             },
             "postgres" | "postgresql" | "pgsql" => Self {
                 mysql: 0.0,
                 postgres: 1.0,
                 mssql: 0.0,
                 oracle: 0.0,
+                sqlite: 0.0,
             },
             "mssql" | "sqlserver" => Self {
                 mysql: 0.0,
                 postgres: 0.0,
                 mssql: 1.0,
                 oracle: 0.0,
+                sqlite: 0.0,
             },
             "oracle" | "ora" => Self {
                 mysql: 0.0,
                 postgres: 0.0,
                 mssql: 0.0,
                 oracle: 1.0,
+                sqlite: 0.0,
+            },
+            "sqlite" => Self {
+                mysql: 0.0,
+                postgres: 0.0,
+                mssql: 0.0,
+                oracle: 0.0,
+                sqlite: 1.0,
             },
             _ => Self::uniform(),
         }
@@ -169,6 +182,7 @@ impl DbmsBelief {
             (DbmsKind::Postgres, self.postgres),
             (DbmsKind::MsSql, self.mssql),
             (DbmsKind::Oracle, self.oracle),
+            (DbmsKind::Sqlite, self.sqlite),
         ];
         // Phase 0 bugfix (documenté) : l'ancien `max_by` retournait le
         // *dernier* max en cas d'égalité (`oracle` sur belief uniforme),
@@ -222,24 +236,35 @@ impl DbmsBelief {
                 self.postgres = (self.postgres * rem).clamp(0.0, 1.0);
                 self.mssql = (self.mssql * rem).clamp(0.0, 1.0);
                 self.oracle = (self.oracle * rem).clamp(0.0, 1.0);
+                self.sqlite = (self.sqlite * rem).clamp(0.0, 1.0);
             }
             DbmsKind::Postgres => {
                 self.postgres = conf;
                 self.mysql = (self.mysql * rem).clamp(0.0, 1.0);
                 self.mssql = (self.mssql * rem).clamp(0.0, 1.0);
                 self.oracle = (self.oracle * rem).clamp(0.0, 1.0);
+                self.sqlite = (self.sqlite * rem).clamp(0.0, 1.0);
             }
             DbmsKind::MsSql => {
                 self.mssql = conf;
                 self.mysql = (self.mysql * rem).clamp(0.0, 1.0);
                 self.postgres = (self.postgres * rem).clamp(0.0, 1.0);
                 self.oracle = (self.oracle * rem).clamp(0.0, 1.0);
+                self.sqlite = (self.sqlite * rem).clamp(0.0, 1.0);
             }
             DbmsKind::Oracle => {
                 self.oracle = conf;
                 self.mysql = (self.mysql * rem).clamp(0.0, 1.0);
                 self.postgres = (self.postgres * rem).clamp(0.0, 1.0);
                 self.mssql = (self.mssql * rem).clamp(0.0, 1.0);
+                self.sqlite = (self.sqlite * rem).clamp(0.0, 1.0);
+            }
+            DbmsKind::Sqlite => {
+                self.sqlite = conf;
+                self.mysql = (self.mysql * rem).clamp(0.0, 1.0);
+                self.postgres = (self.postgres * rem).clamp(0.0, 1.0);
+                self.mssql = (self.mssql * rem).clamp(0.0, 1.0);
+                self.oracle = (self.oracle * rem).clamp(0.0, 1.0);
             }
             DbmsKind::Unknown => {}
         }
@@ -247,12 +272,13 @@ impl DbmsBelief {
     }
 
     fn normalize(&mut self) {
-        let sum = self.mysql + self.postgres + self.mssql + self.oracle;
+        let sum = self.mysql + self.postgres + self.mssql + self.oracle + self.sqlite;
         if sum > 0.0 {
             self.mysql /= sum;
             self.postgres /= sum;
             self.mssql /= sum;
             self.oracle /= sum;
+            self.sqlite /= sum;
         } else {
             *self = Self::uniform();
         }
@@ -265,6 +291,7 @@ impl DbmsBelief {
             DbmsKind::Postgres => self.postgres,
             DbmsKind::MsSql => self.mssql,
             DbmsKind::Oracle => self.oracle,
+            DbmsKind::Sqlite => self.sqlite,
             DbmsKind::Unknown => 0.0,
         }
     }
@@ -291,6 +318,7 @@ pub fn check_sql_errors(body: &str) -> Option<(DbmsKind, String)> {
     static PG_ERR: OnceLock<Regex> = OnceLock::new();
     static MSSQL_ERR: OnceLock<Regex> = OnceLock::new();
     static ORA_ERR: OnceLock<Regex> = OnceLock::new();
+    static SQLITE_ERR: OnceLock<Regex> = OnceLock::new();
 
     let mysql_re = MYSQL_ERR.get_or_init(|| {
         #[allow(clippy::expect_used)]
@@ -308,6 +336,10 @@ pub fn check_sql_errors(body: &str) -> Option<(DbmsKind, String)> {
         #[allow(clippy::expect_used)]
         Regex::new(r"(?i)(ora-01756|ora-00933|ora-00936|quoted string not properly terminated|oracle error)").expect("oracle error regex")
     });
+    let sqlite_re = SQLITE_ERR.get_or_init(|| {
+        #[allow(clippy::expect_used)]
+        Regex::new(r"(?i)(unrecognized token|sqlite3\.(OperationalError|IntegrityError|DataError|ProgrammingError)|sqlite3\.warning|integer overflow|no such column|no such table|malformed json)").expect("sqlite error regex")
+    });
 
     if let Some(m) = mysql_re.find(body) {
         return Some((DbmsKind::MySql, m.as_str().to_owned()));
@@ -320,6 +352,9 @@ pub fn check_sql_errors(body: &str) -> Option<(DbmsKind, String)> {
     }
     if let Some(m) = ora_re.find(body) {
         return Some((DbmsKind::Oracle, m.as_str().to_owned()));
+    }
+    if let Some(m) = sqlite_re.find(body) {
+        return Some((DbmsKind::Sqlite, m.as_str().to_owned()));
     }
 
     None
@@ -828,13 +863,18 @@ mod tests {
         let ora = DbmsBelief::from_hint("oracle");
         assert_eq!(ora.oracle, 1.0);
         assert_eq!(ora.top_candidate().0, DbmsKind::Oracle);
+
+        let sqlite = DbmsBelief::from_hint("sqlite");
+        assert_eq!(sqlite.sqlite, 1.0);
+        assert_eq!(sqlite.top_candidate().0, DbmsKind::Sqlite);
     }
 
     #[test]
     fn test_dbms_belief_uniform_and_update() {
         let mut b = DbmsBelief::uniform();
-        assert_eq!(b.mysql, 0.25);
-        assert_eq!(b.postgres, 0.25);
+        assert_eq!(b.mysql, 0.2);
+        assert_eq!(b.postgres, 0.2);
+        assert_eq!(b.sqlite, 0.2);
 
         b.update_with_signal(DbmsKind::Postgres, 0.9);
         assert!(b.postgres > 0.8);
@@ -907,21 +947,23 @@ mod tests {
         let uniform = DbmsBelief::uniform();
         let (kind, prob) = uniform.top_candidate();
         assert_eq!(kind, DbmsKind::Unknown);
-        assert!((prob - 0.25).abs() < 1e-12);
+        assert!((prob - 0.20).abs() < 1e-12);
         // Near-tie sous 1e-9 → Unknown.
         let near = DbmsBelief {
-            mysql: 0.250_000_000_000_5,
-            postgres: 0.25,
-            mssql: 0.25,
-            oracle: 0.25,
+            mysql: 0.200_000_000_000_5,
+            postgres: 0.20,
+            mssql: 0.20,
+            oracle: 0.20,
+            sqlite: 0.20,
         };
         assert_eq!(near.top_candidate().0, DbmsKind::Unknown);
         // Top-2 ex æquo (mysql == postgres >> autres) → Unknown.
         let duel = DbmsBelief {
             mysql: 0.4,
             postgres: 0.4,
-            mssql: 0.1,
+            mssql: 0.0,
             oracle: 0.1,
+            sqlite: 0.1,
         };
         assert_eq!(duel.top_candidate().0, DbmsKind::Unknown);
         // Gagnant franc inchangé.

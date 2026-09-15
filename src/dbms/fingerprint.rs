@@ -26,6 +26,9 @@ pub fn banner_to_kind(s: &str) -> DbmsKind {
     if lower.contains("oracle") || lower.contains("ora-") {
         return Kind::Oracle;
     }
+    if lower.contains("sqlite") || lower.contains("sqlite_version") {
+        return Kind::Sqlite;
+    }
     // Fallback: bare @@version without vendor hint — keep Unknown to avoid
     // misclassifying MSSQL banners, but preserve legacy MySql fallback for
     // callers that treat Unknown as MySql. Callers should treat this as low confidence.
@@ -44,6 +47,7 @@ pub fn guess_from_findings(findings: &[crate::session::state::Finding]) -> Optio
                 "postgres" => return Some(Kind::Postgres),
                 "mssql" => return Some(Kind::MsSql),
                 "oracle" => return Some(Kind::Oracle),
+                "sqlite" => return Some(Kind::Sqlite),
                 _ => {}
             }
         }
@@ -65,8 +69,10 @@ pub fn extract_banner_version(body: &str) -> Option<(DbmsKind, String)> {
     let re = RE.get_or_init(|| {
         #[allow(clippy::expect_used)]
         {
-            Regex::new(r"(?i)(mysql|postgres|microsoft sql server|oracle)[^<\n]*?(\d+\.\d+[^<\s]*)")
-                .expect("banner regex")
+            Regex::new(
+                r"(?i)(mysql|postgres|microsoft sql server|oracle|sqlite)[^<\n]*?(\d+\.\d+[^<\s]*)",
+            )
+            .expect("banner regex")
         }
     });
     re.captures(body).and_then(|c| {
@@ -77,6 +83,7 @@ pub fn extract_banner_version(body: &str) -> Option<(DbmsKind, String)> {
             s if s.contains("postgres") => Kind::Postgres,
             s if s.contains("microsoft") => Kind::MsSql,
             s if s.contains("oracle") => Kind::Oracle,
+            s if s.contains("sqlite") => Kind::Sqlite,
             _ => Kind::Unknown,
         };
         Some((kind, ver))
@@ -92,6 +99,7 @@ pub fn get_detector(kind: DbmsKind) -> Box<dyn crate::dbms::common::DbmsDetector
         DbmsKind::Postgres => Box::new(crate::dbms::postgres::PostgresDetector),
         DbmsKind::MsSql => Box::new(crate::dbms::mssql::MsSqlDetector),
         DbmsKind::Oracle => Box::new(crate::dbms::oracle::OracleDetector),
+        DbmsKind::Sqlite => Box::new(crate::dbms::sqlite::SqliteDetector),
         DbmsKind::Unknown => Box::new(crate::dbms::mysql::MySqlDetector),
     }
 }
@@ -102,6 +110,43 @@ mod tests {
     #[test]
     fn detects_mysql() {
         assert_eq!(banner_to_kind("MySQL 8.0.32"), Kind::MySql);
+    }
+    #[test]
+    fn banner_kinds_pg18_mysql97() {
+        // 2026 fixtures: PostgreSQL 18.6 / 17.5, MySQL 9.7.1 / 8.4.0 LTS.
+        assert_eq!(
+            banner_to_kind("PostgreSQL 18.6 on x86_64-pc-linux-gnu"),
+            Kind::Postgres
+        );
+        assert_eq!(
+            banner_to_kind("PostgreSQL 17.5 on x86_64-pc-linux-gnu"),
+            Kind::Postgres
+        );
+        assert_eq!(banner_to_kind("MySQL 9.7.1"), Kind::MySql);
+        assert_eq!(banner_to_kind("MySQL 8.4.0"), Kind::MySql);
+    }
+    #[test]
+    fn banner_versions_pg18_mysql97() {
+        let r = extract_banner_version("PostgreSQL 18.6 on x86_64-pc-linux-gnu");
+        assert!(
+            r.is_some_and(|(k, v)| k == Kind::Postgres && v.contains("18.6")),
+            "PG 18.6 banner must extract"
+        );
+        let r = extract_banner_version("PostgreSQL 17.5 on x86_64-pc-linux-gnu");
+        assert!(
+            r.is_some_and(|(k, v)| k == Kind::Postgres && v.contains("17.5")),
+            "PG 17.5 banner must extract"
+        );
+        let r = extract_banner_version("MySQL 9.7.1");
+        assert!(
+            r.is_some_and(|(k, v)| k == Kind::MySql && v.contains("9.7.1")),
+            "MySQL 9.7.1 banner must extract"
+        );
+        let r = extract_banner_version("MySQL 8.4.0");
+        assert!(
+            r.is_some_and(|(k, v)| k == Kind::MySql && v.contains("8.4.0")),
+            "MySQL 8.4.0 banner must extract"
+        );
     }
     #[test]
     fn guess_from_findings_mysql() {

