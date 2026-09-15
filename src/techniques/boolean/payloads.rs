@@ -45,6 +45,7 @@ pub fn boolean_payloads_for(dbms: Option<&str>) -> Vec<BooleanPayload> {
         Some("postgres") => " --",
         Some("mssql") => " --",
         Some("oracle") => " --",
+        Some("sqlite") => " --",
         _ => " -- -",
     };
     vec![
@@ -252,7 +253,14 @@ mod tests {
 
     #[test]
     fn p0_pairs_follow_dbms_comment() {
-        for dbms in [Some("mysql"), Some("postgres"), None] {
+        for dbms in [
+            Some("mysql"),
+            Some("postgres"),
+            Some("mssql"),
+            Some("oracle"),
+            Some("sqlite"),
+            None,
+        ] {
             let payloads = boolean_payloads_for(dbms);
             let xor = payloads
                 .iter()

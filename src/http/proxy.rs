@@ -59,7 +59,7 @@ impl ProxyConfig {
         }
         // Plain `socks://` / `socks4://` are ambiguous (no remote-DNS guarantee).
         if lowered.starts_with("socks://") || lowered.starts_with("socks4://") {
-            return Err(ProxyError::Invalid(input.to_owned()));
+            return Err(ProxyError::Invalid(redact_credentials(input)));
         }
         if lowered.starts_with("socks5h://") {
             return Ok(Self::Socks5h(input.to_owned()));
@@ -67,7 +67,7 @@ impl ProxyConfig {
         if lowered.starts_with("http://") || lowered.starts_with("https://") {
             return Ok(Self::Http(input.to_owned()));
         }
-        Err(ProxyError::Invalid(input.to_owned()))
+        Err(ProxyError::Invalid(redact_credentials(input)))
     }
 
     #[must_use]

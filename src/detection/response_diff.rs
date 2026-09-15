@@ -126,7 +126,9 @@ pub fn levenshtein_similarity(a: &str, b: &str) -> f64 {
         return 0.0;
     }
     let dist = levenshtein_distance(a_trunc, b_trunc);
-    let max_len = a_trunc.len().max(b_trunc.len()).max(1) as f64;
+    // `dist` counts chars (see `levenshtein_distance`); the denominator must
+    // too — `.len()` is bytes and overstates similarity on CJK/emoji.
+    let max_len = a_trunc.chars().count().max(b_trunc.chars().count()).max(1) as f64;
     1.0 - (dist as f64 / max_len)
 }
 

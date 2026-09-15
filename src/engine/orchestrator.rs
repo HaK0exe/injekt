@@ -29,7 +29,10 @@ use crate::{
     techniques::{
         boolean::{detector::BooleanDetector, payloads::boolean_payloads_for},
         error::detector::ErrorDetector,
-        json::{detector::JsonDetector, payloads::json_payloads_for},
+        json::{
+            detector::JsonDetector,
+            payloads::{JsonPayload, graphql_probes_for, json_payloads_for},
+        },
         nosql::{detector::NosqlDetector, payloads::nosql_payloads},
         oob::{
             detector::OobDetector,
@@ -149,6 +152,22 @@ pub fn payload_budget(level: u8, default_take: usize, total: usize) -> usize {
 #[must_use]
 pub fn is_ignored(status: u16, codes: &[u16]) -> bool {
     codes.contains(&status)
+}
+
+/// App-level signature filter status (e.g. bench A1 `400 {"error":"invalid
+/// parameter"}` on spaced keywords). Distinct from WAF `403`/`406` (see
+/// `Baseline::is_waf_blocked`): the baseline sees clean `200`s so no
+/// auto-tamper fires, yet every spaced boolean payload returns `400`/`400`.
+/// Callers use this to prune the payload loop early instead of burning the
+/// full L3 matrix on an obviously filtered sink. Narrow to `400`/`400` only
+/// so N1/N2 (`200`) and WAF blocks (`403`/`406`) never trip it.
+pub const APP_FILTER_STATUS: u16 = 400;
+/// Consecutive fully-filtered `(payload, tamper-set)` probes before pruning.
+pub const FILTER_STREAK_LIMIT: usize = 3;
+
+#[must_use]
+pub const fn is_app_filter_block(true_status: u16, false_status: u16) -> bool {
+    true_status == APP_FILTER_STATUS && false_status == APP_FILTER_STATUS
 }
 
 /// `true` when every baseline sample is a server error (5xx: origin down,
@@ -1106,6 +1125,7 @@ impl Engine {
             "postgres" | "postgresql" | "pg" | "pgsql" => Some(crate::dbms::DbmsKind::Postgres),
             "mssql" | "sqlserver" | "sql-server" | "tsql" => Some(crate::dbms::DbmsKind::MsSql),
             "oracle" | "ora" => Some(crate::dbms::DbmsKind::Oracle),
+            "sqlite" => Some(crate::dbms::DbmsKind::Sqlite),
             _ => {
                 warn!(dbms=%hint, "unknown --dbms hint, ignoring (auto-fingerprint)");
                 None
@@ -1265,6 +1285,9 @@ impl Engine {
                     }
                     BaselineOutcome::TransportFailed(msg) => {
                         warn!(error=%msg, "baseline request failed");
+                        // A request was sent: count it so `--request-budget`
+                        // cannot be bypassed by failing baselines.
+                        self.state.write().await.increment_requests();
                     }
                 }
                 if samples.len() >= 3 {
@@ -1286,7 +1309,14 @@ impl Engine {
             )));
         }
         pb.finish_and_clear();
-        let baseline = baseline::Baseline::new(&samples);
+        let mut baseline = baseline::Baseline::new(&samples);
+        // CT-mismatch (P0-4): a `--raw-file` API call (`Content-Type:
+        // application/json`) answered with HTML/text means a challenge/deny
+        // page intercepted the call. Presence-level alone, blocking only
+        // with a corroborating status (see `Baseline::apply_ct_mismatch`).
+        if let Some(expected_ct) = raw_request.and_then(|r| r.content_type()) {
+            baseline.apply_ct_mismatch(&samples, expected_ct);
+        }
         {
             let req_done = self.state.read().await.request_count();
             let req_delta = req_done.saturating_sub(req_before);
@@ -2130,9 +2160,24 @@ fn detection_order(context: &InjectionContext) -> [TechniqueKind; 8] {
     }
 }
 
+/// JSON scan payloads: direct `json_payloads_for` first, then the GraphQL
+/// `variables`-envelope probes (P0-2).
+///
+/// The envelope probes reuse the same TRUE/FALSE/error shape with the SQL
+/// breakout riding inside `"variables"` instead of the query text, so WAFs
+/// keyed on `query:` miss them while vulnerable resolvers still interpolate
+/// them. Appended last (never first) so L1 (`take(2)`) stays byte-identical
+/// to the historical direct sweep and `mutation_base_payload` (`.first()`)
+/// keeps pointing at a direct probe.
+fn json_scan_payloads(label: Option<&str>) -> Vec<JsonPayload> {
+    let mut out = json_payloads_for(label);
+    out.extend(graphql_probes_for(label));
+    out
+}
+
 /// DBMS label for `*_payloads_for(Some(..))` once the belief is actionable.
 ///
-/// Returns `Some("mysql" | "postgres" | "mssql" | "oracle")` when the top
+/// Returns `Some("mysql" | "postgres" | "mssql" | "oracle" | "sqlite")` when the top
 /// candidate reaches the `0.85` fill threshold (same bar as the early
 /// `fill_missing_dbms` in `run_internal`), else `None` (generic polyglots).
 /// Threaded into every `test_*_bounded` so quote/comment styles stay
@@ -2147,6 +2192,7 @@ fn dbms_payload_label(belief: &DbmsBelief) -> Option<&'static str> {
         crate::dbms::common::DbmsKind::Postgres => Some("postgres"),
         crate::dbms::common::DbmsKind::MsSql => Some("mssql"),
         crate::dbms::common::DbmsKind::Oracle => Some("oracle"),
+        crate::dbms::common::DbmsKind::Sqlite => Some("sqlite"),
         crate::dbms::common::DbmsKind::Unknown => None,
     }
 }
@@ -2162,6 +2208,7 @@ fn parse_finding_dbms(label: Option<&str>) -> Option<crate::dbms::common::DbmsKi
         "postgres" | "postgresql" | "pgsql" => Some(crate::dbms::common::DbmsKind::Postgres),
         "mssql" | "sqlserver" | "sql-server" | "tsql" => Some(crate::dbms::common::DbmsKind::MsSql),
         "oracle" | "ora" => Some(crate::dbms::common::DbmsKind::Oracle),
+        "sqlite" => Some(crate::dbms::common::DbmsKind::Sqlite),
         _ => None,
     }
 }
@@ -3256,6 +3303,7 @@ impl Engine {
             crate::dbms::DbmsKind::Postgres => "SELECT version()",
             crate::dbms::DbmsKind::MsSql => "SELECT @@version",
             crate::dbms::DbmsKind::Oracle => "SELECT banner FROM v$version WHERE ROWNUM=1",
+            crate::dbms::DbmsKind::Sqlite => "SELECT sqlite_version()",
             crate::dbms::DbmsKind::Unknown => "SELECT @@version",
         };
 
@@ -3293,6 +3341,9 @@ impl Engine {
                 }
                 crate::dbms::DbmsKind::Oracle => {
                     format!("' AND LENGTH(({version_query}))>={len_guess} --")
+                }
+                crate::dbms::DbmsKind::Sqlite => {
+                    format!("' AND LENGTH(({version_query})::text)>={len_guess} --")
                 }
                 crate::dbms::DbmsKind::Unknown => {
                     format!("' AND LENGTH(({version_query}))>={len_guess} -- -")
@@ -3438,6 +3489,11 @@ impl Engine {
                     ),
                     crate::dbms::DbmsKind::Oracle => format!(
                         "' AND ASCII(SUBSTR(({version_query}),{},1))>={} --",
+                        pos + 1,
+                        mid
+                    ),
+                    crate::dbms::DbmsKind::Sqlite => format!(
+                        "' AND UNICODE(SUBSTR(({version_query}),{},1))>={} --",
                         pos + 1,
                         mid
                     ),
@@ -4468,7 +4524,14 @@ async fn test_boolean_bounded(
     // Boolean TRUE/FALSE pairs require coherent transforms: opaque tampers
     // (e.g. base64encode) are excluded via the boolean-safe sets.
     let tamper_sets = boolean_safe_transformation_sets(tampers);
-    for p in payloads
+    // App-filter pruning (A1-style `400` signature filter): every spaced
+    // payload returns `400`/`400` while the baseline is `200`, so the full
+    // L3 matrix would burn hundreds of requests for a certain 0-finding.
+    // After 3 consecutive fully-filtered probes, stop the technique early.
+    // Bypass payloads (`/**/`) return `200` and reset the streak, so evasion
+    // still detects; N1/N2 (`200`) never trip it.
+    let mut filter_streak: usize = 0;
+    'payload: for p in payloads
         .iter()
         .take(payload_budget(level, 2, payloads.len()))
     {
@@ -4510,6 +4573,7 @@ async fn test_boolean_bounded(
             let mut last_t_status: u16 = 0;
             #[allow(clippy::similar_names)]
             let mut last_f_status: u16 = 0;
+            let mut all_filter_blocked = true;
             for _ in 0..3 {
                 if cancel.is_cancelled() {
                     break;
@@ -4546,6 +4610,22 @@ async fn test_boolean_bounded(
                 )
                 .await;
                 let false_body = matcher.pre_process(&false_raw);
+                // Transport/body failure (`status == 0`, body `""`) must never
+                // be scored: TRUE=baseline vs FALSE="" yields a 1.0 gap and a
+                // 0.9-confidence false positive on network hiccups. Record a
+                // neutral trial (never confirms) like `confirm_error_with_boolean`.
+                if true_status == 0 || false_status == 0 {
+                    trials.push(crate::detection::confirmation::Trial {
+                        true_conf: 0.5,
+                        false_conf: 0.5,
+                    });
+                    last_true = true_body;
+                    last_false = false_body;
+                    last_t_status = true_status;
+                    last_f_status = false_status;
+                    all_filter_blocked = false;
+                    continue;
+                }
                 // `--ignore-code`: an ignored status counts as a negative trial, never a finding.
                 if is_ignored(true_status, ignore_codes) || is_ignored(false_status, ignore_codes) {
                     trials.push(crate::detection::confirmation::Trial {
@@ -4556,7 +4636,11 @@ async fn test_boolean_bounded(
                     last_false = false_body;
                     last_t_status = true_status;
                     last_f_status = false_status;
+                    all_filter_blocked = false;
                     continue;
+                }
+                if !is_app_filter_block(true_status, false_status) {
+                    all_filter_blocked = false;
                 }
                 let res = detector.evaluate(
                     &baseline_body,
@@ -4575,6 +4659,25 @@ async fn test_boolean_bounded(
                 last_false = false_body;
                 last_t_status = true_status;
                 last_f_status = false_status;
+            }
+            // App-filter pruning: a full `(payload, tamper-set)` probe that
+            // never left the `400` filter on either branch carries no
+            // differential signal. Three in a row means the sink filters this
+            // payload family (A1 spaces) — stop boolean early with 0 finding
+            // instead of burning the rest of the L3 matrix. Requires 3
+            // completed trials so cancel/ignore never prunes.
+            if all_filter_blocked && trials.len() == 3 {
+                filter_streak = filter_streak.saturating_add(1);
+            } else {
+                filter_streak = 0;
+            }
+            if filter_streak >= FILTER_STREAK_LIMIT {
+                debug!(
+                    param = param.key(),
+                    streak = filter_streak,
+                    "app signature filter (repeated 400) — pruning boolean early"
+                );
+                break 'payload;
             }
             let (conf, inverted) = crate::detection::confirmation::confirm_either(&trials);
             if conf.confirmed {
@@ -4805,14 +4908,14 @@ fn has_confirmed_finding(findings: &[Finding]) -> bool {
 }
 
 /// `true` when at least one finding justifies the heavy boolean-oracle
-/// extraction: an existing boolean finding, or an error finding with an
+/// extraction: a *confirmed* boolean finding, or an error finding with an
 /// extracted fragment (`extracted=yes`) or a confirmed boolean differential
 /// (`bool_confirm=true`). Unconfirmed 0.55 error findings alone never qualify
 /// — they would burn ~270-700 requests into `inference inconsistency`.
 #[must_use]
 fn is_extraction_eligible(findings: &[Finding]) -> bool {
     findings.iter().any(|f| {
-        f.technique == TechniqueKind::Boolean
+        (f.technique == TechniqueKind::Boolean && is_confirmed_finding(f))
             || (f.technique == TechniqueKind::Error
                 && (f.evidence.contains("extracted=yes")
                     || f.evidence.contains("bool_confirm=true")))
@@ -4877,6 +4980,7 @@ fn dbms_label_from_finding(finding: &Finding) -> Option<&'static str> {
         "postgres" | "postgresql" | "pgsql" => Some("postgres"),
         "mssql" | "sqlserver" | "sql-server" | "tsql" => Some("mssql"),
         "oracle" | "ora" => Some("oracle"),
+        "sqlite" => Some("sqlite"),
         _ => None,
     }
 }
@@ -6098,8 +6202,8 @@ async fn test_time_bounded(
     // Seeded tamper RNG (`--seed`): same seed yields identical payloads;
     // `None` preserves the historical OS-random behaviour.
     let mut rng = crate::seeded_rng::make_rng(seed);
-    // Blind sweep: L1 tries the 4 legacy payloads (one per DBMS),
-    // L2 doubles to legacies + first variants, L3+ exhausts all 9.
+    // Blind sweep: L1 tries the first 4 legacy payloads, L2 doubles to 8,
+    // L3+ exhausts all 16 (5 legacies + conditional/alternate/heavy variants).
     // Threshold reuses the baseline calibration (`from_baseline`); a
     // positive first shot is confirmed by an immediate second shot
     // (`evaluate_confirmed`) so a single jitter spike never reports.
@@ -6109,7 +6213,7 @@ async fn test_time_bounded(
     // concurrency is untouched.
     let detector = TimeDetector::from_baseline(baseline);
     // DBMS-aware blind sweep: a confident belief (>= 0.85) tries only that
-    // engine's sleep family; otherwise the historical 4-legacies-first sweep.
+    // engine's sleep family; otherwise the 5-legacies-first blind sweep.
     let candidates = dbms_payload_label(dbms_belief).map_or_else(
         || all_time_payloads(3),
         |label| crate::techniques::time::payloads::time_payloads_for(Some(label), 3),
@@ -6788,7 +6892,7 @@ async fn test_json_bounded(
     // (see `compute_calibrated_prior`) so the scheduler tries JSON early;
     // a confident DBMS belief additionally narrows to that engine's
     // JSON family instead of the generic 3-DBMS sweep.
-    let payloads = json_payloads_for(dbms_payload_label(dbms_belief));
+    let payloads = json_scan_payloads(dbms_payload_label(dbms_belief));
     let baseline_body = matcher.pre_process(&baseline.representative_body_str());
     // Same boolean-differential constraint as `test_boolean_bounded`: opaque
     // tampers (e.g. base64encode) would make TRUE/FALSE indistinguishable.
@@ -6864,6 +6968,19 @@ async fn test_json_bounded(
                 )
                 .await;
                 let false_body = matcher.pre_process(&false_raw);
+                // Transport failure (`status == 0`) is never scored — neutral
+                // trial, consistent with `test_boolean_bounded`.
+                if true_status == 0 || false_status == 0 {
+                    trials.push(crate::detection::confirmation::Trial {
+                        true_conf: 0.5,
+                        false_conf: 0.5,
+                    });
+                    last_true = true_body;
+                    last_false = false_body;
+                    last_t_status = true_status;
+                    last_f_status = false_status;
+                    continue;
+                }
                 // `--ignore-code`: an ignored status counts as a negative trial, never a finding.
                 if is_ignored(true_status, ignore_codes) || is_ignored(false_status, ignore_codes) {
                     trials.push(crate::detection::confirmation::Trial {
@@ -7131,6 +7248,19 @@ async fn test_nosql_bounded(
                 )
                 .await;
                 let false_body = matcher.pre_process(&false_raw);
+                // Transport failure (`status == 0`) is never scored — neutral
+                // trial, consistent with `test_boolean_bounded`.
+                if true_status == 0 || false_status == 0 {
+                    trials.push(crate::detection::confirmation::Trial {
+                        true_conf: 0.5,
+                        false_conf: 0.5,
+                    });
+                    last_true = true_body;
+                    last_false = false_body;
+                    last_t_status = true_status;
+                    last_f_status = false_status;
+                    continue;
+                }
                 if is_ignored(true_status, ignore_codes) || is_ignored(false_status, ignore_codes) {
                     trials.push(crate::detection::confirmation::Trial {
                         true_conf: 0.0,
@@ -7957,8 +8087,69 @@ mod orchestrator_gating_tests {
         );
         assert_eq!(parse_finding_dbms(Some("mssql")), Some(DbmsKind::MsSql));
         assert_eq!(parse_finding_dbms(Some("oracle")), Some(DbmsKind::Oracle));
+        assert_eq!(parse_finding_dbms(Some("sqlite")), Some(DbmsKind::Sqlite));
         assert_eq!(parse_finding_dbms(None), None);
         assert_eq!(parse_finding_dbms(Some("unknown-db")), None);
+    }
+
+    #[test]
+    fn finding_label_keeps_sqlite_quote_style() {
+        // P0-3: a confirmed sqlite finding must drive `--`-style confirm
+        // payloads (was: `None` → generic `-- -` polyglots).
+        use crate::session::state::{Finding, TechniqueKind};
+        let mut f = Finding::new("http://a", "id@query", TechniqueKind::Error, 0.9, "e");
+        f.dbms = Some("sqlite".to_owned());
+        assert_eq!(super::dbms_label_from_finding(&f), Some("sqlite"));
+        f.dbms = Some("  SQLITE ".to_owned());
+        assert_eq!(super::dbms_label_from_finding(&f), Some("sqlite"));
+        f.dbms = None;
+        assert_eq!(super::dbms_label_from_finding(&f), None);
+        f.dbms = Some("unknown-db".to_owned());
+        assert_eq!(super::dbms_label_from_finding(&f), None);
+    }
+
+    #[test]
+    fn json_scan_appends_graphql_after_direct() {
+        // P0-2: `variables`-envelope probes ride last so L1 (`take(2)`)
+        // stays byte-identical to the historical direct sweep.
+        let v = super::json_scan_payloads(None);
+        assert_eq!(v.len(), 5, "{v:?}");
+        assert!(
+            !v[0].true_payload.contains("variables"),
+            "{}",
+            v[0].true_payload
+        );
+        assert!(
+            !v[1].true_payload.contains("variables"),
+            "{}",
+            v[1].true_payload
+        );
+        assert!(
+            !v[2].true_payload.contains("variables"),
+            "{}",
+            v[2].true_payload
+        );
+        assert!(
+            v[3].true_payload.contains("\"variables\""),
+            "{}",
+            v[3].true_payload
+        );
+        assert!(
+            v[4].true_payload.contains("\"variables\""),
+            "{}",
+            v[4].true_payload
+        );
+        // DBMS-narrowed belief keeps only its own envelope probe.
+        let mysql = super::json_scan_payloads(Some("mysql"));
+        assert_eq!(mysql.len(), 3, "{mysql:?}");
+        assert!(mysql[2].true_payload.contains("\"variables\""));
+        // sqlite has no envelope probe (falls back to generic direct).
+        let sqlite = super::json_scan_payloads(Some("sqlite"));
+        assert_eq!(sqlite.len(), 3, "{sqlite:?}");
+        assert!(
+            sqlite.iter().all(|p| !p.true_payload.contains("variables")),
+            "{sqlite:?}"
+        );
     }
 
     #[test]
@@ -8277,5 +8468,18 @@ mod orchestrator_gating_tests {
         assert_eq!(super::resolve_effective_tampers(true, &user), user);
         // No block => user set unchanged (including empty).
         assert!(super::resolve_effective_tampers(false, &[]).is_empty());
+    }
+
+    #[test]
+    fn app_filter_block_needs_double_400() {
+        assert!(super::is_app_filter_block(400, 400));
+        assert!(!super::is_app_filter_block(400, 200));
+        assert!(!super::is_app_filter_block(200, 400));
+        assert!(!super::is_app_filter_block(200, 200));
+        // WAF statuses never count as app filter (separate gate).
+        assert!(!super::is_app_filter_block(403, 403));
+        assert!(!super::is_app_filter_block(406, 406));
+        assert_eq!(super::APP_FILTER_STATUS, 400);
+        assert_eq!(super::FILTER_STREAK_LIMIT, 3);
     }
 }

@@ -260,7 +260,8 @@ async fn scan_with_escalation(
         if cancel.is_cancelled() {
             break;
         }
-        tracing::info!(target = %target, step = step.label, level = step.config.budget.level, "auto pass");
+        let scrubbed_target = crate::session::scrubber::Scrubber::new(cli.no_redact).scrub(target);
+        tracing::info!(target = %scrubbed_target, step = step.label, level = step.config.budget.level, "auto pass");
         let client = crate::cli::client_builder::build_client(cli, cli.allow_private)?;
         let engine = Engine::new(step.config.clone(), client, cancel.clone());
         match engine.run(target).await {
@@ -305,7 +306,7 @@ async fn run_auto_recon(
         include_subdomains: false,
         ignore_robots: false,
     };
-    tracing::info!(target = %seed, "auto recon crawl");
+    tracing::info!(target = %scrubber.scrub(&seed), "auto recon crawl");
     let crawl = super::recon::run_crawl(cli, cancel.clone(), &crawl_args).await?;
     tracing::info!(
         candidates = crawl.report.candidates.len(),

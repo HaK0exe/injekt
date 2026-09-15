@@ -19,7 +19,7 @@
 //!
 //! Clé d'agrégat : `(technique, dbms, context_class)` — vocabulaire fermé :
 //! - `technique`: `boolean|time|error|union|stacked|oob|json|nosql`
-//! - `dbms`: `mysql|postgres|mssql|oracle|unknown`
+//! - `dbms`: `mysql|postgres|mssql|oracle|sqlite|unknown`
 //! - `context_class`: `numeric|single-quote|double-quote|parenthesis|json|order_by|generic`
 //!
 //! Valeurs : `{success, trials, avg_req}` (compteurs + moyenne mobile des
@@ -455,6 +455,7 @@ pub fn normalize_dbms(raw: &str) -> &str {
         "postgres" | "postgresql" | "pg" | "pgsql" => "postgres",
         "mssql" | "sqlserver" | "sql-server" | "tsql" => "mssql",
         "oracle" | "ora" => "oracle",
+        "sqlite" => "sqlite",
         _ => "unknown",
     }
 }
@@ -544,14 +545,19 @@ pub fn resolve_knowledge_path(explicit: Option<&str>) -> PathBuf {
     {
         return PathBuf::from(env);
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    // `HOME` on Unix, `USERPROFILE` on Windows (where `HOME` is usually unset).
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let mut p = PathBuf::from(home);
-        p.push(".cache/injekt");
+        p.push(".cache");
+        p.push("injekt");
         p.push(KNOWLEDGE_FILE_NAME);
         return p;
     }
+    // Last resort: same `injekt/knowledge.json` shape under the temp dir, so the
+    // file name stays stable on every platform.
     let mut p = std::env::temp_dir();
-    p.push("injekt-knowledge.json");
+    p.push("injekt");
+    p.push(KNOWLEDGE_FILE_NAME);
     p
 }
 
@@ -857,6 +863,16 @@ mod tests {
         let loaded = load_if_enabled(true, Some(&explicit)).expect("missing -> neutral");
         assert!(loaded.is_empty());
         assert!(!path.exists(), "load must not create the file");
+    }
+
+    #[test]
+    fn normalize_dbms_covers_sqlite() {
+        // P0-3: `sqlite` is a first-class DBMS label (was: `unknown`, which
+        // collapsed SQLite learning into the generic bucket).
+        assert_eq!(normalize_dbms("sqlite"), "sqlite");
+        assert_eq!(normalize_dbms("  SQLITE "), "sqlite");
+        assert_eq!(normalize_dbms("pg"), "postgres");
+        assert_eq!(normalize_dbms("nope"), "unknown");
     }
 
     #[test]

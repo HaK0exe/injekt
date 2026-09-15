@@ -32,18 +32,23 @@ pub const MAX_INGEST_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// 2 MiB already generous, rejects accidental binary dumps).
 pub const MAX_RAW_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Read a UTF-8 file with a `metadata().len()` pre-check (no unbounded
-/// `read_to_string`). Returns a descriptive error with the faulty path.
+/// Read a UTF-8 file with a hard byte cap enforced on the read itself
+/// (`open` + `take(max+1)`), not just a `metadata().len()` pre-check: the
+/// file can grow between `stat` and `read` (TOCTOU), bypassing a pre-check
+/// cap into OOM. Returns a descriptive error with the faulty path.
 fn read_limited_file(path: &str, max_bytes: u64) -> anyhow::Result<String> {
-    let meta =
-        std::fs::metadata(path).map_err(|e| anyhow::anyhow!("cannot stat file '{path}': {e}"))?;
-    if meta.len() > max_bytes {
-        anyhow::bail!(
-            "file '{path}' too large ({} bytes > {max_bytes} bytes)",
-            meta.len()
-        );
+    use std::io::Read as _;
+    let file =
+        std::fs::File::open(path).map_err(|e| anyhow::anyhow!("cannot read file '{path}': {e}"))?;
+    let mut limited = file.take(max_bytes.saturating_add(1));
+    let mut buf = String::new();
+    limited
+        .read_to_string(&mut buf)
+        .map_err(|e| anyhow::anyhow!("cannot read file '{path}': {e}"))?;
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
+        anyhow::bail!("file '{path}' too large (> {max_bytes} bytes)");
     }
-    std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("cannot read file '{path}': {e}"))
+    Ok(buf)
 }
 
 /// Merge every ingestion source from [`crate::cli::args::Cli`] into one
@@ -62,27 +67,42 @@ pub fn collect_targets(
 ) -> anyhow::Result<Vec<String>> {
     let mut seen = HashSet::<String>::new();
     let mut out = Vec::new();
-    let mut push = |url: String, allow_private: bool| {
+    // Fail-fast target cap: checked before every insert so a 10 MiB source
+    // (~500k URLs) bails instead of filling RAM before the end-of-function
+    // check below. Returns `true` when the cap is hit.
+    let mut push = |url: String, allow_private: bool| -> bool {
+        if out.len() >= MAX_BULK_TARGETS {
+            return true;
+        }
         let trimmed = url.trim().to_owned();
         if trimmed.is_empty() || !seen.insert(trimmed.clone()) {
-            return;
+            return false;
         }
         if let Err(e) = TargetUrl::parse(&trimmed, allow_private) {
-            tracing::warn!(target = %trimmed, error=%e, "skipping invalid ingestion target");
-            return;
+            // Scrubbed: targets may carry `?token=` / `user:pass@` secrets.
+            let scrubbed = crate::session::scrubber::Scrubber::new(false).scrub(&trimmed);
+            tracing::warn!(target = %scrubbed, error=%e, "skipping invalid ingestion target");
+            return false;
         }
         out.push(trimmed);
+        false
     };
 
     let allow_private = cli.allow_private;
 
     match cli.try_effective_target() {
-        Ok(Some(t)) => push(t, allow_private),
+        Ok(Some(t)) => {
+            if push(t, allow_private) {
+                anyhow::bail!("ingestion exceeds {MAX_BULK_TARGETS} targets");
+            }
+        }
         Ok(None) => {}
         Err(e) => anyhow::bail!("{e}"),
     }
-    if let Some(t) = extra_target {
-        push(t.to_owned(), allow_private);
+    if let Some(t) = extra_target
+        && push(t.to_owned(), allow_private)
+    {
+        anyhow::bail!("ingestion exceeds {MAX_BULK_TARGETS} targets");
     }
 
     if let Some(path) = cli.bulk_file.as_deref() {
@@ -93,32 +113,42 @@ pub fn collect_targets(
                 .map_err(|e| anyhow::anyhow!("cannot read bulk file '{path}': {e}"))?
         };
         for t in parse_targets_text(&content) {
-            push(t, allow_private);
+            if push(t, allow_private) {
+                anyhow::bail!("ingestion exceeds {MAX_BULK_TARGETS} targets");
+            }
         }
     }
     if cli.stdin && cli.bulk_file.as_deref() != Some("-") {
         let content = read_stdin_all()?;
         for t in parse_targets_text(&content) {
-            push(t, allow_private);
+            if push(t, allow_private) {
+                anyhow::bail!("ingestion exceeds {MAX_BULK_TARGETS} targets");
+            }
         }
     }
     if let Some(path) = cli.openapi_file.as_deref() {
         let content = read_limited_file(path, MAX_INGEST_FILE_BYTES)
             .map_err(|e| anyhow::anyhow!("cannot read OpenAPI file '{path}': {e}"))?;
         for t in parse_openapi_targets(&content) {
-            push(t, allow_private);
+            if push(t, allow_private) {
+                anyhow::bail!("ingestion exceeds {MAX_BULK_TARGETS} targets");
+            }
         }
     }
     if let Some(path) = cli.sitemap_file.as_deref() {
         let content = read_limited_file(path, MAX_INGEST_FILE_BYTES)
             .map_err(|e| anyhow::anyhow!("cannot read sitemap file '{path}': {e}"))?;
         for t in parse_sitemap_targets(&content) {
-            push(t, allow_private);
+            if push(t, allow_private) {
+                anyhow::bail!("ingestion exceeds {MAX_BULK_TARGETS} targets");
+            }
         }
     }
     if let Some(dir) = cli.raw_dir.as_deref() {
         for t in load_raw_dir_targets(dir)? {
-            push(t, allow_private);
+            if push(t, allow_private) {
+                anyhow::bail!("ingestion exceeds {MAX_BULK_TARGETS} targets");
+            }
         }
     }
 
@@ -213,7 +243,14 @@ pub fn parse_openapi_targets(content: &str) -> Vec<String> {
                                         .map(value_to_string)
                                 })
                                 .unwrap_or_else(|| "1".to_owned());
-                            queries.push(format!("{name}={example}"));
+                            // Percent-encode name/value: a raw `&`/`=`/`#` in
+                            // an OpenAPI parameter name would otherwise split
+                            // the query string or truncate the URL.
+                            queries.push(format!(
+                                "{}={}",
+                                crate::target::openapi_encode(name),
+                                crate::target::openapi_encode(&example)
+                            ));
                         }
                     }
                 }
@@ -351,13 +388,34 @@ pub fn load_raw_dir_targets(dir: &str) -> anyhow::Result<Vec<String>> {
             );
             continue;
         }
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error=%e, "skipping unreadable raw file");
-                continue;
+        // Hard cap on the read itself (`take`): the file can grow between
+        // the `symlink_metadata` size check above and the read (TOCTOU).
+        let content = {
+            use std::io::Read as _;
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error=%e, "skipping unreadable raw file");
+                    continue;
+                }
+            };
+            let mut limited = file.take(MAX_RAW_FILE_BYTES.saturating_add(1));
+            let mut buf = String::new();
+            match limited.read_to_string(&mut buf) {
+                Ok(_) => buf,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error=%e, "skipping unreadable raw file");
+                    continue;
+                }
             }
         };
+        if u64::try_from(content.len()).unwrap_or(u64::MAX) > MAX_RAW_FILE_BYTES {
+            tracing::warn!(
+                path = %path.display(),
+                "skipping raw file (exceeds 2 MiB cap)"
+            );
+            continue;
+        }
         let req = match RawRequest::parse(&content) {
             Ok(r) => r,
             Err(e) => {
@@ -365,7 +423,20 @@ pub fn load_raw_dir_targets(dir: &str) -> anyhow::Result<Vec<String>> {
                 continue;
             }
         };
-        if let Some(url) = req.to_url("https").or_else(|| req.to_url("http")) {
+        // Scheme by explicit port: `Host: x:80` is plain HTTP — trying
+        // `https://x:80` first would fail closed on a valid target.
+        // Absolute-form targets carry their own scheme already.
+        let is_absolute = req.path.starts_with("http://") || req.path.starts_with("https://");
+        let host_port_80 = req.headers.get("host").is_some_and(|h| h.ends_with(":80"));
+        if is_absolute {
+            if let Some(url) = req.to_url("https") {
+                out.push(url);
+            }
+        } else if host_port_80 {
+            if let Some(url) = req.to_url("http").or_else(|| req.to_url("https")) {
+                out.push(url);
+            }
+        } else if let Some(url) = req.to_url("https").or_else(|| req.to_url("http")) {
             out.push(url);
         }
     }

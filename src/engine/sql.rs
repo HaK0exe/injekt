@@ -97,12 +97,41 @@ fn has_read_only_prefix(upper: &str) -> bool {
         || starts_with_keyword(upper, "EXPLAIN SELECT")
 }
 
+/// Strip `/* ... */` block comments (replaced by a single space). Unclosed
+/// `/*` discards the remainder. Line comments (`--`, `#`) are intentionally
+/// left in place: the matcher stays fail-closed on them (a forbidden word
+/// inside a line comment still rejects), while block comments between
+/// `INTO` and `OUTFILE`/`DUMPFILE` no longer bypass the exfil gate
+/// (`INTO /*x*/ OUTFILE` normalizes to `INTO OUTFILE`).
+fn strip_block_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            // Skip until closing `*/` (or end of input if unclosed).
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            out.push(' ');
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// First forbidden keyword or phrase found in the upper-cased statement, if
 /// any. Token-based (whole-word) matching; the two multi-word file-exfil
-/// phrases are detected as consecutive tokens.
+/// phrases are detected as consecutive tokens after `/* ... */` block
+/// comments are stripped, so `INTO /*x*/ OUTFILE` no longer bypasses.
 fn find_forbidden_keyword(upper: &str) -> Option<String> {
+    let cleaned = strip_block_comments(upper);
     let mut prev_token: Option<&str> = None;
-    for token in upper
+    for token in cleaned
         .split(|c: char| !is_word_char(c))
         .filter(|t| !t.is_empty())
     {
@@ -194,6 +223,12 @@ pub fn validate_select_only(sql: &str, stacked_ok: bool) -> Result<String, Injek
 
 /// Reports whether any prior finding confirmed stacked-query execution.
 ///
+/// Fail-closed: only a `Stacked` finding with high confidence (`>= 0.85`,
+/// mirroring the `High` precision bar) and without an `unconfirmed` marker
+/// lifts the gate. A low-confidence or unconfirmed stacked probe (e.g.
+/// `0.55 unconfirmed`, `0.6 generic`) must never authorize
+/// `INSERT`/`UPDATE`/`DROP` via [`validate_select_only`].
+///
 /// # Panics
 ///
 /// Never panics: pure iteration with no indexing.
@@ -214,9 +249,11 @@ pub fn validate_select_only(sql: &str, stacked_ok: bool) -> Result<String, Injek
 /// ```
 #[must_use]
 pub fn stacked_confirmed(findings: &[Finding]) -> bool {
-    findings
-        .iter()
-        .any(|finding| finding.technique == TechniqueKind::Stacked)
+    findings.iter().any(|finding| {
+        finding.technique == TechniqueKind::Stacked
+            && finding.confidence >= 0.85
+            && !finding.evidence.contains("unconfirmed")
+    })
 }
 
 #[cfg(test)]
@@ -331,6 +368,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_into_outfile_behind_block_comment() {
+        // `INTO /*x*/ OUTFILE` must not bypass the exfil gate.
+        assert!(
+            validate_select_only("SELECT * FROM t INTO /*x*/ OUTFILE '/tmp/x'", false).is_err()
+        );
+        assert!(validate_select_only("SELECT * FROM t INTO/**/DUMPFILE '/tmp/x'", false).is_err());
+        // Unclosed `/*` comments out the remainder: no exfil keyword survives.
+        assert!(validate_select_only("SELECT * FROM t INTO /* OUTFILE '/tmp/x'", false).is_ok());
+    }
+
+    #[test]
     fn rejects_leading_paren_strict() {
         // Strict prefix: no leading `(` even around a read-only statement.
         assert!(validate_select_only("(SELECT 1)", false).is_err());
@@ -394,6 +442,36 @@ mod tests {
             ),
         ];
         assert!(stacked_confirmed(&with_stacked));
+    }
+
+    #[test]
+    fn stacked_confirmed_rejects_unconfirmed_and_low_confidence() {
+        // Fail-closed: low-confidence or `unconfirmed` stacked probes must not
+        // lift the write gate (would authorize INSERT/UPDATE/DROP).
+        let low = [Finding::new(
+            "http://target.test/?id=1",
+            "id",
+            TechniqueKind::Stacked,
+            0.55,
+            "stacked marker unconfirmed",
+        )];
+        assert!(!stacked_confirmed(&low));
+        let generic_cap = [Finding::new(
+            "http://target.test/?id=1",
+            "id",
+            TechniqueKind::Stacked,
+            0.6,
+            "second statement executed",
+        )];
+        assert!(!stacked_confirmed(&generic_cap));
+        let unconfirmed_high = [Finding::new(
+            "http://target.test/?id=1",
+            "id",
+            TechniqueKind::Stacked,
+            0.9,
+            "stacked hit unconfirmed",
+        )];
+        assert!(!stacked_confirmed(&unconfirmed_high));
     }
 
     #[test]

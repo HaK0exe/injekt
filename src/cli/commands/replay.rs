@@ -17,15 +17,20 @@ pub fn run(cli: crate::cli::args::Cli) -> anyhow::Result<()> {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--file or --import required"))?
     };
-    let meta =
-        std::fs::metadata(&file).with_context(|| format!("cannot stat replay file '{file}'"))?;
-    if meta.len() > MAX_REPLAY_BYTES {
-        anyhow::bail!(
-            "replay file '{file}' too large ({} bytes > {MAX_REPLAY_BYTES} bytes)",
-            meta.len()
-        );
-    }
-    let data = std::fs::read(&file).context("read replay file")?;
+    // Hard cap on the read itself (`take`), not a `metadata().len()`
+    // pre-check (TOCTOU: the file can grow between `stat` and `read`).
+    let data = {
+        use std::io::Read as _;
+        let f = std::fs::File::open(&file)
+            .with_context(|| format!("cannot read replay file '{file}'"))?;
+        let mut limited = f.take(MAX_REPLAY_BYTES.saturating_add(1));
+        let mut buf = Vec::new();
+        limited.read_to_end(&mut buf).context("read replay file")?;
+        if buf.len() as u64 > MAX_REPLAY_BYTES {
+            anyhow::bail!("replay file '{file}' too large (> {MAX_REPLAY_BYTES} bytes)");
+        }
+        buf
+    };
     // Encrypted session export (`--export-encrypted`, XChaCha20-Poly1305 +
     // Argon2id JSON blob): decrypt and print a scrubbed summary. This is an
     // inspection command, not a full scan resume — findings are shown so the

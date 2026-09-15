@@ -39,7 +39,11 @@ impl MarkerSet {
         Self {
             asterisk: input.contains('*') || lower.contains("%2a"),
             section: input.contains('§') || lower.contains("%c2%a7"),
-            double_brace: input.contains("{{") && input.contains("}}"),
+            // Ordered: `{{` must open before `}}` closes — independent
+            // `contains` checks FP on `}} ... {{` or unrelated braces.
+            double_brace: input
+                .find("{{")
+                .is_some_and(|open| input[open + 2..].contains("}}")),
         }
     }
 

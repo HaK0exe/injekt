@@ -100,6 +100,18 @@ impl TargetUrl {
             }
             return Ok(());
         }
+        // Non-canonical IPv4 forms (`2130706433`, `0x7f.0.0.1`,
+        // `0177.0.0.1`, `127.1`) stay `Host::Domain` in the `url` crate but
+        // `getaddrinfo`/libc resolve them to loopback/private. Parse them
+        // lexically here so the check below (and the `remote_dns` path that
+        // skips local resolution) cannot be bypassed via the proxy's resolver.
+        // Numerically public but non-canonical forms still fall through to
+        // the DNS rebinding check rather than trusting the lexical form.
+        if let Some(v4) = parse_lossy_ipv4(&normalized)
+            && is_private_ip(std::net::IpAddr::V4(v4))
+        {
+            return Err(UrlError::PrivateIp);
+        }
         // DNS-time: a lexically public domain may still resolve to a private
         // IP (DNS rebinding / libc-parsed forms like `0x7f.0.0.1` that
         // `getaddrinfo` maps to loopback). Reject if ANY record is private.
@@ -167,6 +179,79 @@ impl TargetUrl {
     }
 }
 
+/// Parse one numeric IPv4 part: decimal (`123`), hex (`0x7f`/`0X7F`), or
+/// octal (leading `0`, e.g. `0177`). Returns `None` on empty input, invalid
+/// digits, or overflow beyond `u32`.
+fn parse_ipv4_part(part: &str) -> Option<u32> {
+    if part.is_empty() {
+        return None;
+    }
+    if part.len() > 2 && (part.starts_with("0x") || part.starts_with("0X")) {
+        return u32::from_str_radix(&part[2..], 16)
+            .ok()
+            .filter(|_| !part[2..].is_empty());
+    }
+    if part.len() > 1 && part.starts_with('0') && part.bytes().all(|b| b.is_ascii_digit()) {
+        // Leading-zero octal per `inet_aton`; `08`/`09` are invalid octal.
+        if part.bytes().any(|b| b == b'8' || b == b'9') {
+            return None;
+        }
+        return u32::from_str_radix(part, 8).ok();
+    }
+    if part.bytes().all(|b| b.is_ascii_digit()) {
+        return part.parse::<u32>().ok();
+    }
+    // Bare hex without `0x` is not a libc form — reject.
+    None
+}
+
+/// Parse libc-style non-canonical IPv4 (`inet_aton` semantics): `2130706433`
+/// (single 32-bit decimal), `127.1` / `10.1` (short dotted), octal
+/// (`0177.0.0.1`) and hex (`0x7f.0.0.1`) parts. Returns `None` for real
+/// hostnames. Each part must fit its width (1-part: `<= u32::MAX`, 2-part
+/// last `<= 0xFF_FFFF`, 3-part last `<= 0xFFFF`, 4-part each `<= 0xFF`).
+fn parse_lossy_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
+    // Fast reject: must be all digits/dots/x-letters to be a numeric form.
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() || matches!(b, b'.' | b'x' | b'X'))
+    {
+        return None;
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() > 4 || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let nums: Option<Vec<u32>> = parts.iter().map(|p| parse_ipv4_part(p)).collect();
+    let nums = nums?;
+    let ip_u32: u32 = match nums.len() {
+        1 => nums[0],
+        2 => {
+            if nums[0] > 0xFF || nums[1] > 0xFF_FFFF {
+                return None;
+            }
+            (nums[0] << 24) | nums[1]
+        }
+        3 => {
+            if nums[0] > 0xFF || nums[1] > 0xFF || nums[2] > 0xFFFF {
+                return None;
+            }
+            (nums[0] << 24) | (nums[1] << 16) | nums[2]
+        }
+        4 => {
+            if nums.iter().any(|n| *n > 0xFF) {
+                return None;
+            }
+            (nums[0] << 24) | (nums[1] << 16) | (nums[2] << 8) | nums[3]
+        }
+        _ => return None,
+    };
+    Some(std::net::Ipv4Addr::from(ip_u32))
+}
+
 fn is_private_host(url: &Url) -> bool {
     use url::Host;
     match url.host() {
@@ -187,6 +272,14 @@ fn is_private_host(url: &Url) -> bool {
             // and still need DNS-time enforcement — see issues).
             if let Ok(ip) = normalized.parse::<std::net::IpAddr>() {
                 return is_private_ip(ip);
+            }
+            // Non-canonical IPv4 (`0x7f.0.0.1`, `0177.0.0.1`, `2130706433`,
+            // `127.1`): libc/`getaddrinfo` resolve these to loopback/private
+            // even though `url` keeps them as `Domain`. Reject lexically so
+            // the `remote_dns` (proxy-side resolution) path cannot SSRF the
+            // proxy's local network.
+            if let Some(v4) = parse_lossy_ipv4(&normalized) {
+                return is_private_ip(std::net::IpAddr::V4(v4));
             }
             false
         }
@@ -281,6 +374,35 @@ mod tests {
         assert!(TargetUrl::parse("http://[::ffff:100.64.0.1]/", false).is_err());
         assert!(TargetUrl::parse("http://[::ffff:0.1.2.3]/", false).is_err());
         assert!(TargetUrl::parse("http://[::ffff:192.0.0.1]/", false).is_err());
+    }
+
+    #[test]
+    fn rejects_non_canonical_ipv4_loopback_forms() {
+        // Decimal / octal / hex / short forms all resolve to 127.0.0.1 via
+        // libc `inet_aton` while staying `Host::Domain` in the `url` crate.
+        for host in [
+            "2130706433", // 127.0.0.1 as u32
+            "0x7f.0.0.1", // hex part
+            "0X7F.0.0.1", // hex uppercase
+            "0177.0.0.1", // octal part
+            "127.0.1",    // short: 127.0.0.1
+            "127.1",      // short: 127.0.0.1
+            "0x7f.0x0.0x0.0x1",
+            "2130706433.", // trailing dot tolerated by `url`
+        ] {
+            assert!(
+                TargetUrl::parse(&format!("http://{host}/"), false).is_err(),
+                "{host} must be rejected as loopback"
+            );
+        }
+        // Private ranges in alt forms too.
+        assert!(TargetUrl::parse("http://0xC0.0xA8.0x01.0x01/", false).is_err());
+        assert!(TargetUrl::parse("http://3232235777/", false).is_err()); // 192.168.1.1
+        // Public numeric forms stay allowed (no FP on e.g. 1.1.1.1 = 16843009).
+        assert!(TargetUrl::parse("http://16843009/", true).is_ok());
+        assert!(TargetUrl::parse("http://1.1.1.1/", false).is_ok());
+        // Real hostnames untouched.
+        assert!(TargetUrl::parse("http://example.com/", false).is_ok());
     }
 
     #[tokio::test]

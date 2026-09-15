@@ -183,7 +183,8 @@ pub fn chunk_for_dns(hex_data: &str, chunk: usize) -> Vec<String> {
 /// DBMS. Each payload embeds `fqdn = <token>.<domain>`.
 ///
 /// `dbms` is one of `mysql | postgres | mssql | oracle`; `None`/unknown
-/// yields a generic 3-probe set (MSSQL + Oracle + MySQL) covering the most
+/// (including `sqlite`, which has no network exfil primitive) yields a
+/// generic 3-probe set (MSSQL + Oracle + MySQL) covering the most
 /// common stacks.
 #[must_use]
 pub fn oob_payloads_for(dbms: Option<&str>, domain: &str, token: &str) -> Vec<OobPayload> {

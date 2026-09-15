@@ -57,10 +57,19 @@ impl BooleanDetector {
         // TRUE should be similar to baseline, FALSE should differ, or vice versa depending on injection.
         let j_true = jaccard(baseline_body, true_body);
         let j_false = jaccard(baseline_body, false_body);
-        // Heuristic: true branch keeps similarity high, false branch drops.
-        let is_vuln = (j_true - j_false).abs() > JACCARD_DIFF_THRESHOLD
+        // Anchored heuristic: a bare TRUE-vs-FALSE gap alone is not enough —
+        // on unstable pages (e.g. 0.2 vs 0.4, neither resembling the
+        // baseline) it fires false positives. Require at least one branch to
+        // still look like the baseline (`diff confidence < 0.4`), in either
+        // direction (normal: TRUE≈baseline; inverted login-style: FALSE≈baseline).
+        let gap = (j_true - j_false).abs();
+        let anchored = diff_true.confidence < SIMILAR_CONFIDENCE_MAX
+            || diff_false.confidence < SIMILAR_CONFIDENCE_MAX;
+        let is_vuln = (gap > JACCARD_DIFF_THRESHOLD && anchored)
             || (diff_true.confidence < SIMILAR_CONFIDENCE_MAX
-                && diff_false.confidence > DIFFERENT_CONFIDENCE_MIN);
+                && diff_false.confidence > DIFFERENT_CONFIDENCE_MIN)
+            || (diff_false.confidence < SIMILAR_CONFIDENCE_MAX
+                && diff_true.confidence > DIFFERENT_CONFIDENCE_MIN);
         let confidence = if is_vuln {
             (0.5 + (j_true - j_false).abs() * 0.5).clamp(0.0, 1.0)
         } else {

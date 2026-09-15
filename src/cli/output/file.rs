@@ -62,6 +62,19 @@ pub fn validate_output_path(path: &str, force: bool) -> anyhow::Result<PathBuf> 
             anyhow::anyhow!("cannot canonicalize parent '{}': {e}", parent.display())
         })?
     };
+    // Without `--force`, the canonical parent must stay under the canonical
+    // cwd: otherwise `subdir_link/report.json` (where `subdir_link -> /etc`)
+    // escapes the workspace despite the lexical `..`/absolute checks above.
+    if !force {
+        let canonical_cwd = std::fs::canonicalize(".")
+            .map_err(|e| anyhow::anyhow!("cannot canonicalize current dir: {e}"))?;
+        if !canonical_parent.starts_with(&canonical_cwd) {
+            anyhow::bail!(
+                "output parent '{}' escapes the current directory (symlink? use --force to override)",
+                canonical_parent.display()
+            );
+        }
+    }
     Ok(canonical_parent.join(file_name))
 }
 

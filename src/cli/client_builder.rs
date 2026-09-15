@@ -71,24 +71,29 @@ pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<Http
         match crate::http::proxy::ProxyConfig::parse(&proxy) {
             Ok(p) => builder = builder.proxy(p),
             Err(e) => {
-                return Err(InjektError::Http(format!("invalid proxy '{proxy}': {e}")));
+                // Never echo the raw proxy URL: it may carry `user:pass@`.
+                // `ProxyError::Invalid` is already credential-redacted; keep
+                // the message generic so nothing else leaks.
+                return Err(InjektError::Http(format!("invalid proxy: {e}")));
             }
         }
     }
 
     for header in &cli.headers {
         let Some((name, value)) = header.split_once(':') else {
-            return Err(InjektError::Http(format!(
-                "invalid --headers value '{header}', expected 'Name: value'"
-            )));
+            // Never echo the raw header: it may be `Authorization: <secret>`.
+            return Err(InjektError::Http(
+                "invalid --headers value (expected 'Name: value')".to_owned(),
+            ));
         };
         // Same-origin only: stored per-request, never as reqwest
         // `default_headers` (which would leak cross-host on redirect).
         builder = builder.user_header(
             HeaderName::from_bytes(name.trim().as_bytes())
                 .map_err(|e| InjektError::Http(format!("invalid header name '{name}': {e}")))?,
-            HeaderValue::from_str(value.trim())
-                .map_err(|e| InjektError::Http(format!("invalid header value '{value}': {e}")))?,
+            HeaderValue::from_str(value.trim()).map_err(|e| {
+                InjektError::Http(format!("invalid header value for '{name}': {e}"))
+            })?,
         );
     }
 

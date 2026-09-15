@@ -103,8 +103,8 @@ async fn postgres_concat_time_inline_requires_pipe_variant() {
         .await;
 
     let mut cfg = time_config();
-    // L1 only tries the 4 legacies (none contains `||`); L3 exhausts all 10
-    // payloads including the concat variant.
+    // L1 only tries the first 4 legacies (none contains `||`); L3 exhausts
+    // the full sweep including the concat variant.
     cfg.budget.level = 3;
     let engine = Engine::new(cfg, test_client(), CancellationToken::new());
     let target = format!("{}/?id=1", server.uri());
@@ -115,6 +115,46 @@ async fn postgres_concat_time_inline_requires_pipe_variant() {
             .iter()
             .any(|f| f.technique == injekt::session::state::TechniqueKind::Time),
         "inline `|| pg_sleep` backend must be detected, got {findings:?}"
+    );
+}
+
+/// Backend where the sleep family is filtered at the WAF (every
+/// `SLEEP`/`pg_sleep`/`WAITFOR`/`DBMS_PIPE`/`BENCHMARK` probe stays fast)
+/// but heavy-query payloads burn CPU: `generate_series` / `sysobjects` /
+/// `all_objects` sleep 3s. P0-5: L3 must still detect via the heavy variants.
+fn heavy_only_responder(req: &wiremock::Request) -> ResponseTemplate {
+    let url = req.url.to_string().to_ascii_lowercase();
+    let wants_heavy = url.contains("generate_series")
+        || url.contains("sysobjects")
+        || url.contains("all_objects");
+    if wants_heavy {
+        ResponseTemplate::new(200)
+            .set_delay(Duration::from_secs(3))
+            .set_body_string("welcome page id=1 normal content")
+    } else {
+        ResponseTemplate::new(200).set_body_string("welcome page id=1 normal content")
+    }
+}
+
+#[tokio::test]
+async fn heavy_query_time_detected_when_sleep_filtered() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(heavy_only_responder)
+        .mount(&server)
+        .await;
+
+    let mut cfg = time_config();
+    cfg.budget.level = 3;
+    let engine = Engine::new(cfg, test_client(), CancellationToken::new());
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.technique == injekt::session::state::TechniqueKind::Time),
+        "heavy-query backend must be detected via heavy variants, got {findings:?}"
     );
 }
 

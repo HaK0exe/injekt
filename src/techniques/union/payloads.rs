@@ -41,6 +41,7 @@ pub fn union_payloads_for(dbms: Option<&str>, columns: usize) -> Vec<UnionPayloa
         Some("postgres") => " --",
         Some("mssql") => " --",
         Some("oracle") => " --",
+        Some("sqlite") => " --",
         _ => " -- -",
     };
     // Second variant uses NULL as first column (bypassing type coercion issues)
@@ -82,6 +83,7 @@ pub fn union_payloads_for(dbms: Option<&str>, columns: usize) -> Vec<UnionPayloa
         Some("postgres") => "postgres",
         Some("mssql") => "mssql",
         Some("oracle") => "oracle",
+        Some("sqlite") => "sqlite",
         _ => "generic",
     };
     // (prefix, select-core): prefix is prepended verbatim; numeric uses a
@@ -139,4 +141,22 @@ pub fn order_by_payloads(max_cols: usize) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_label_and_comment() {
+        // P0-3: sqlite union probes carry the `sqlite` label (belief
+        // promotion) with `--` comment style and no `FROM dual`.
+        let v = union_payloads_for(Some("sqlite"), 3);
+        assert!(!v.is_empty());
+        for p in &v {
+            assert_eq!(p.dbms, "sqlite");
+            assert!(p.payload.ends_with(" --"), "{}", p.payload);
+            assert!(!p.payload.contains("FROM dual"), "{}", p.payload);
+        }
+    }
 }

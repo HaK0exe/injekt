@@ -184,16 +184,20 @@ pub async fn run_import(
 
 fn read_limited_import(path: &str) -> anyhow::Result<String> {
     const MAX_IMPORT_BYTES: u64 = 10 * 1024 * 1024;
-    let meta = std::fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("cannot stat import file '{path}': {e}"))?;
-    if meta.len() > MAX_IMPORT_BYTES {
-        anyhow::bail!(
-            "import file '{path}' too large ({} bytes > {MAX_IMPORT_BYTES} bytes)",
-            meta.len()
-        );
+    // Hard cap on the read itself (`take`), not a `metadata().len()`
+    // pre-check (TOCTOU: the file can grow between `stat` and `read`).
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("cannot read import file '{path}': {e}"))?;
+    let mut limited = file.take(MAX_IMPORT_BYTES.saturating_add(1));
+    let mut buf = String::new();
+    limited
+        .read_to_string(&mut buf)
+        .map_err(|e| anyhow::anyhow!("cannot read import file '{path}': {e}"))?;
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > MAX_IMPORT_BYTES {
+        anyhow::bail!("import file '{path}' too large (> {MAX_IMPORT_BYTES} bytes)");
     }
-    std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("cannot read import file '{path}': {e}"))
+    Ok(buf)
 }
 
 /// Original CLI entry point — prints to stdout/stderr.
@@ -354,7 +358,7 @@ async fn crawl(
         anyhow::bail!("--max-candidates must be greater than zero");
     }
     tracing::warn!(
-        target = %args.target,
+        target = %crate::session::scrubber::Scrubber::new(cli.no_redact).scrub(&args.target),
         "recon crawl and scan must only be used against systems you are authorized to test"
     );
     let config = CrawlConfig {

@@ -35,13 +35,29 @@ pub struct RawRequest {
 impl RawRequest {
     /// Parse from raw string (headers + optional body).
     ///
+    /// The header block and body are split on the first blank line
+    /// (`\r\n\r\n` preferred, `\n\n` fallback) and the body is preserved
+    /// verbatim: re-splitting it into lines and rejoining with `\n` would
+    /// corrupt `multipart/form-data` boundaries (`\r\n`-delimited) and any
+    /// other `\r\n`-sensitive payload.
+    ///
     /// # Errors
     /// Returns an error if the request line or method is missing/malformed.
     pub fn parse(input: &str) -> Result<Self, RawRequestError> {
-        let mut lines = input.lines();
+        // Verbatim body split first (before any line iteration).
+        let (head, body) = if let Some(idx) = input.find("\r\n\r\n") {
+            (&input[..idx], Some(&input[idx + 4..]))
+        } else if let Some(idx) = input.find("\n\n") {
+            (&input[..idx], Some(&input[idx + 2..]))
+        } else {
+            (input, None)
+        };
+        let mut lines = head.lines();
         let request_line = lines
             .next()
             .ok_or_else(|| RawRequestError::RequestLine("empty".to_owned()))?;
+        // The request-target never contains a literal space (it would be
+        // `%20`), so `split_whitespace` on the request line is safe.
         let parts: Vec<&str> = request_line.split_whitespace().collect();
         if parts.len() < 2 {
             return Err(RawRequestError::RequestLine(request_line.to_owned()));
@@ -51,15 +67,8 @@ impl RawRequest {
         let http_version = parts.get(2).unwrap_or(&"HTTP/1.1").to_string();
 
         let mut headers = HashMap::new();
-        let mut body_lines = Vec::new();
-        let mut in_body = false;
         for line in lines {
-            if in_body {
-                body_lines.push(line);
-                continue;
-            }
             if line.is_empty() {
-                in_body = true;
                 continue;
             }
             if let Some((k, v)) = line.split_once(':') {
@@ -70,11 +79,7 @@ impl RawRequest {
                 return Err(RawRequestError::Header(line.to_owned()));
             }
         }
-        let body = if body_lines.is_empty() {
-            None
-        } else {
-            Some(body_lines.join("\n"))
-        };
+        let body = body.filter(|b| !b.is_empty()).map(str::to_owned);
         Ok(Self {
             method,
             path,
@@ -99,6 +104,11 @@ impl RawRequest {
     /// Reconstruct target URL if Host header present.
     /// Supports absolute-form request-target (e.g., `GET http://host/path HTTP/1.1`)
     /// and preserves Host:port if present.
+    ///
+    /// When both are present, the absolute-form URI wins (it is the complete
+    /// target as sent to a proxy); the `Host` header is only used for
+    /// origin-form targets. Callers that need port-aware scheme selection
+    /// (e.g. `Host: x:80` → `http` first) handle it themselves.
     #[must_use]
     pub fn to_url(&self, scheme: &str) -> Option<String> {
         if self.path.starts_with("http://") || self.path.starts_with("https://") {

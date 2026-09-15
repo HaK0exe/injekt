@@ -26,21 +26,21 @@ pub const MAX_BULK_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// remains after filtering.
 pub fn load_targets(path: &str, allow_private: bool) -> anyhow::Result<Vec<String>> {
     use std::io::BufRead as _;
-    let meta =
-        std::fs::metadata(path).with_context(|| format!("cannot stat bulk file '{path}'"))?;
-    if meta.len() > MAX_BULK_FILE_BYTES {
-        anyhow::bail!(
-            "bulk file '{path}' too large ({} bytes > {MAX_BULK_FILE_BYTES} bytes)",
-            meta.len()
-        );
-    }
     let file =
         std::fs::File::open(path).with_context(|| format!("cannot read bulk file '{path}'"))?;
+    // Hard cap enforced during the read (not a `metadata().len()` pre-check:
+    // the file can grow between `stat` and `read`). Counts bytes as lines
+    // stream so a growing file bails instead of filling RAM.
     let reader = std::io::BufReader::new(file);
     let mut seen = HashSet::<String>::new();
     let mut targets = Vec::new();
+    let mut bytes_read: u64 = 0;
     for line_res in reader.lines() {
         let line = line_res.with_context(|| format!("cannot read bulk file '{path}'"))?;
+        bytes_read = bytes_read.saturating_add(line.len() as u64 + 1);
+        if bytes_read > MAX_BULK_FILE_BYTES + 1 {
+            anyhow::bail!("bulk file '{path}' too large (> {MAX_BULK_FILE_BYTES} bytes)");
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
             continue;
@@ -49,7 +49,8 @@ pub fn load_targets(path: &str, allow_private: bool) -> anyhow::Result<Vec<Strin
             continue;
         }
         if let Err(e) = TargetUrl::parse(trimmed, allow_private) {
-            tracing::warn!(line=%trimmed, error=%e, "skipping invalid bulk target");
+            let scrubbed = crate::session::scrubber::Scrubber::new(false).scrub(trimmed);
+            tracing::warn!(line=%scrubbed, error=%e, "skipping invalid bulk target");
             continue;
         }
         targets.push(trimmed.to_owned());
@@ -88,7 +89,8 @@ fn collect_valid_targets(content: &str, allow_private: bool) -> Vec<String> {
             continue;
         }
         if let Err(e) = TargetUrl::parse(trimmed, allow_private) {
-            tracing::warn!(line=%trimmed, error=%e, "skipping invalid bulk target");
+            let scrubbed = crate::session::scrubber::Scrubber::new(false).scrub(trimmed);
+            tracing::warn!(line=%scrubbed, error=%e, "skipping invalid bulk target");
             continue;
         }
         targets.push(trimmed.to_owned());

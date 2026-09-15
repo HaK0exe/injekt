@@ -453,17 +453,21 @@ pub struct Cli {
 
 // Manual `Debug` so `--cookies` / `--proxy` / `--headers` / `--oob-poll-url`
 // never appear in logs, panics or `tracing` records (OPSEC: secrets stay in
-// `SecretString` / scrubbed output only).
+// `SecretString` / scrubbed output only). `--target` / `--data` may carry
+// `?token=` / `password=` / `user:pass@` secrets and `oob_domain` identifies
+// operator infra — all three are scrubbed, not printed raw.
 impl core::fmt::Debug for Cli {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let redacted_opt = |v: &Option<String>| v.as_ref().map(|_| "[REDACTED]".to_owned());
         let redacted_headers: Vec<&str> = self.headers.iter().map(|_| "[REDACTED]").collect();
+        let scrub = crate::session::scrubber::Scrubber::new(false);
+        let scrubbed_opt = |v: &Option<String>| v.as_ref().map(|s| scrub.scrub(s));
         f.debug_struct("Cli")
             .field("command", &self.command)
             .field("profile", &self.profile)
             .field("config", &self.config)
-            .field("target", &self.target)
+            .field("target", &scrubbed_opt(&self.target))
             .field("bulk_file", &self.bulk_file)
             .field("method", &self.method)
             .field("headers", &redacted_headers)
@@ -475,7 +479,7 @@ impl core::fmt::Debug for Cli {
             .field("delay", &self.delay)
             .field("techniques", &self.techniques)
             .field("params", &self.params)
-            .field("data", &self.data)
+            .field("data", &scrubbed_opt(&self.data))
             .field("prefix", &self.prefix)
             .field("suffix", &self.suffix)
             .field("safe_chars", &self.safe_chars)
@@ -514,7 +518,7 @@ impl core::fmt::Debug for Cli {
             .field("explain", &self.explain)
             .field("seed", &self.seed)
             .field("ignore_codes", &self.ignore_codes)
-            .field("oob_domain", &self.oob_domain)
+            .field("oob_domain", &scrubbed_opt(&self.oob_domain))
             .field("oob_poll_url", &redacted_opt(&self.oob_poll_url))
             .field("oob_wait_secs", &self.oob_wait_secs)
             .field("tamper", &self.tamper)
@@ -527,7 +531,10 @@ impl core::fmt::Debug for Cli {
             .field("allow_knowledge", &self.allow_knowledge)
             .field("knowledge_path", &self.knowledge_path)
             .field("second_order", &self.second_order)
-            .field("second_order_revisit_url", &self.second_order_revisit_url)
+            .field(
+                "second_order_revisit_url",
+                &scrubbed_opt(&self.second_order_revisit_url),
+            )
             .field("second_order_max_stores", &self.second_order_max_stores)
             .field("raw_file", &self.raw_file)
             .field("raw_dir", &self.raw_dir)
@@ -738,29 +745,34 @@ impl Cli {
     }
 
     /// Effective concurrency. Precedence: CLI/env > config file > profile > 5.
+    /// Clamped to `>= 1`: `--threads 0` would make `buffer_unordered(0)`
+    /// stall forever (self-DoS).
     #[must_use]
     pub fn effective_threads(&self) -> usize {
         if let Some(v) = self.threads {
-            return v;
+            return v.max(1);
         }
         let file = self.file_snapshot();
         if let Some(v) = file.threads {
-            return v;
+            return v.max(1);
         }
-        self.active_profile().map_or(5, Profile::threads)
+        self.active_profile().map_or(5, Profile::threads).max(1)
     }
 
     /// Effective request timeout (seconds). Precedence: CLI/env > file > profile > 30.
+    /// Clamped to `>= 1`: `--timeout 0` would time out every request.
     #[must_use]
     pub fn effective_timeout(&self) -> u64 {
         if let Some(v) = self.timeout {
-            return v;
+            return v.max(1);
         }
         let file = self.file_snapshot();
         if let Some(v) = file.timeout {
-            return v;
+            return v.max(1);
         }
-        self.active_profile().map_or(30, Profile::timeout_secs)
+        self.active_profile()
+            .map_or(30, Profile::timeout_secs)
+            .max(1)
     }
 
     /// Effective retry count. Precedence: CLI/env > file > profile > 3.
@@ -1168,7 +1180,7 @@ impl Cli {
             .is_some_and(|p| p.to_ascii_lowercase().starts_with("socks5h://"))
     }
 
-    /// Normalized `--dbms` hint (`mysql|postgres|mssql|oracle`) or `None`
+    /// Normalized `--dbms` hint (`mysql|postgres|mssql|oracle|sqlite`) or `None`
     /// when absent/unknown (unknown warns, falls back to auto-fingerprint).
     #[must_use]
     pub fn normalized_dbms_hint(&self) -> Option<String> {
@@ -1180,6 +1192,7 @@ impl Cli {
             "postgres" | "postgresql" | "pg" | "pgsql" => "postgres",
             "mssql" | "sqlserver" | "sql-server" | "tsql" => "mssql",
             "oracle" | "ora" => "oracle",
+            "sqlite" => "sqlite",
             _ => {
                 tracing::warn!(dbms=%raw, "unknown --dbms, ignoring (auto-fingerprint)");
                 return None;
@@ -1438,6 +1451,23 @@ mod tests {
         assert_eq!(super::parse_request_budget("1000000"), Ok(1_000_000));
         assert!(super::parse_request_budget("1000001").is_err());
         assert!(super::parse_request_budget("nope").is_err());
+    }
+
+    #[test]
+    fn dbms_hint_normalizes_sqlite_and_aliases() {
+        // P0-3: `--dbms sqlite` must survive normalization (was: rejected as
+        // unknown, silently falling back to auto-fingerprint).
+        let mut cli = blank_cli();
+        cli.dbms = Some("sqlite".to_owned());
+        assert_eq!(cli.normalized_dbms_hint().as_deref(), Some("sqlite"));
+        cli.dbms = Some("  SQLITE ".to_owned());
+        assert_eq!(cli.normalized_dbms_hint().as_deref(), Some("sqlite"));
+        cli.dbms = Some("pg".to_owned());
+        assert_eq!(cli.normalized_dbms_hint().as_deref(), Some("postgres"));
+        cli.dbms = Some("nope".to_owned());
+        assert_eq!(cli.normalized_dbms_hint(), None);
+        let cli = blank_cli();
+        assert_eq!(cli.normalized_dbms_hint(), None);
     }
 
     #[test]

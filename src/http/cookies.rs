@@ -157,7 +157,16 @@ impl CookieJar {
         // Domain validation if url present
         if let (Some(d), Some(u)) = (&meta.domain, url) {
             let host = u.host_str().unwrap_or("").to_ascii_lowercase();
-            if !(host == d.as_str() || host.ends_with(&format!(".{d}"))) {
+            let domain = d
+                .strip_prefix('.')
+                .unwrap_or(d.as_str())
+                .to_ascii_lowercase();
+            // Reject public-suffix / dotless domains (`Domain=com` would
+            // otherwise match every `.com` host on redirect).
+            if !domain.contains('.') {
+                return;
+            }
+            if !(host == domain || host.ends_with(&format!(".{domain}"))) {
                 return;
             }
         }
