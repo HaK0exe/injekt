@@ -68,6 +68,26 @@ const GENERIC_BODY_MARKERS: &[(&str, bool, WafVendor)] = &[
     ("awselb", false, WafVendor::AwsAlb),
 ];
 
+/// Bot-mitigation (P0-4) body markers: `(needle, strong, vendor)`. Same
+/// weak/strong corroboration contract as [`GENERIC_BODY_MARKERS`].
+/// Weak needles are product words that also appear in benign content
+/// (`datadome` in a blog post, `kasada` as a surname); strong needles are
+/// challenge-artifact strings (captcha domains, sensor SDK names) that only
+/// a bot-mitigation page serves.
+const BOT_BODY_MARKERS: &[(&str, bool, WafVendor)] = &[
+    ("captcha-delivery.com", true, WafVendor::DataDome),
+    ("datadome", false, WafVendor::DataDome),
+    ("kpsdk", true, WafVendor::Kasada),
+    ("kasada", false, WafVendor::Kasada),
+    ("px-captcha", true, WafVendor::Human),
+    ("perimeterx", false, WafVendor::Human),
+    // Turnstile widget field: a legit site embedding the widget serves this
+    // on clean 200s too, so it stays weak (presence only without
+    // corroboration). The active-challenge case is covered by the
+    // `turnstile` + `cloudflare` rule below.
+    ("cf-turnstile-response", false, WafVendor::Turnstile),
+];
+
 /// WAF/CDN vendor behind the response, when identifiable.
 ///
 /// Infrastructure fingerprints are kept distinct from security products:
@@ -89,6 +109,10 @@ pub enum WafVendor {
     Sucuri,
     Fastly,
     Varnish,
+    DataDome,
+    Kasada,
+    Human,
+    Turnstile,
     Generic,
 }
 
@@ -105,6 +129,10 @@ impl core::fmt::Display for WafVendor {
             Self::Sucuri => write!(f, "sucuri"),
             Self::Fastly => write!(f, "fastly"),
             Self::Varnish => write!(f, "varnish"),
+            Self::DataDome => write!(f, "datadome"),
+            Self::Kasada => write!(f, "kasada"),
+            Self::Human => write!(f, "human"),
+            Self::Turnstile => write!(f, "turnstile"),
             Self::Generic => write!(f, "generic"),
         }
     }
@@ -244,6 +272,25 @@ pub fn detect_cloudflare_flat(
                     set_vendor(&mut vendor, WafVendor::F5);
                     corroborating_header_hit = true;
                 }
+                // P0-4 bot-mitigation cookies (security products: corroborate).
+                // DataDome sets `datadome=<device-check>` on every checked
+                // request; Kasada's sensor drops `__kps`/`kpsdk`; HUMAN
+                // (PerimeterX) drops `_px3` / `_pxvid`.
+                if value_lower.contains("datadome") {
+                    push_hit(&mut hits, "set-cookie:datadome");
+                    set_vendor(&mut vendor, WafVendor::DataDome);
+                    corroborating_header_hit = true;
+                }
+                if value_lower.contains("__kps") || value_lower.contains("kpsdk") {
+                    push_hit(&mut hits, "set-cookie:kasada");
+                    set_vendor(&mut vendor, WafVendor::Kasada);
+                    corroborating_header_hit = true;
+                }
+                if value_lower.contains("_px3") || value_lower.contains("_pxvid") {
+                    push_hit(&mut hits, "set-cookie:perimeterx");
+                    set_vendor(&mut vendor, WafVendor::Human);
+                    corroborating_header_hit = true;
+                }
             }
             "cf-mitigated" => {
                 has_mitigated = true;
@@ -296,6 +343,11 @@ pub fn detect_cloudflare_flat(
                 } else if name.starts_with("x-f5-") {
                     push_hit(&mut hits, name.as_str());
                     set_vendor(&mut vendor, WafVendor::F5);
+                    corroborating_header_hit = true;
+                } else if name.starts_with("x-px-") {
+                    // HUMAN (PerimeterX) risk headers (`x-px-block`, …).
+                    push_hit(&mut hits, name.as_str());
+                    set_vendor(&mut vendor, WafVendor::Human);
                     corroborating_header_hit = true;
                 } else if name == "server" {
                     if value_lower.contains("akamaighost") || value_lower.contains("akamai") {
@@ -390,8 +442,15 @@ pub fn detect_cloudflare_flat(
     if let Some(v) = generic_vendor {
         set_vendor(&mut vendor, v);
     }
-    let body_hits = weak_count + generic_weak;
-    if strong_hit || generic_strong {
+    let (bot_hits, bot_weak, bot_strong, bot_vendor) = bot_body_signals(&lower);
+    for hit in &bot_hits {
+        push_hit(&mut hits, hit);
+    }
+    if let Some(v) = bot_vendor {
+        set_vendor(&mut vendor, v);
+    }
+    let body_hits = weak_count + generic_weak + bot_weak;
+    if strong_hit || generic_strong || bot_strong {
         blocking = true;
     }
     if marker_cf {
@@ -403,6 +462,15 @@ pub fn detect_cloudflare_flat(
         push_hit(&mut hits, "body:captcha+cloudflare");
         blocking = true;
         set_vendor(&mut vendor, WafVendor::Cloudflare);
+    }
+    // Turnstile (P0-4): Cloudflare's interactive challenge. Same
+    // co-occurrence contract as `captcha` — the bare word alone also names
+    // the legit widget embedded on clean pages, so `cloudflare` must appear
+    // in the same body (challenge pages always brand it).
+    if lower.contains("turnstile") && lower.contains("cloudflare") {
+        push_hit(&mut hits, "body:turnstile+cloudflare");
+        blocking = true;
+        set_vendor(&mut vendor, WafVendor::Turnstile);
     }
     // Generic (non-Cloudflare) rate limiting: corroborating status + generic
     // wording, without any Cloudflare marker.
@@ -498,6 +566,88 @@ fn generic_body_signals(lower: &str) -> (Vec<String>, usize, bool, Option<WafVen
         }
     }
     (marker_hits, weak_count, strong_hit, vendor)
+}
+
+/// Scan a lowercased body prefix for bot-mitigation markers (P0-4).
+/// Same return contract as [`generic_body_signals`]: hit names, weak-hit
+/// count, strong flag, attributed vendor (`Generic` never wins over a
+/// specific vendor via [`set_vendor`]).
+fn bot_body_signals(lower: &str) -> (Vec<String>, usize, bool, Option<WafVendor>) {
+    let mut marker_hits = Vec::new();
+    let mut weak_count = 0usize;
+    let mut strong_hit = false;
+    let mut vendor: Option<WafVendor> = None;
+    for (needle, strong, owner) in BOT_BODY_MARKERS {
+        if lower.contains(needle) {
+            marker_hits.push(format!("body:{needle}"));
+            if *strong {
+                strong_hit = true;
+            } else {
+                weak_count += 1;
+            }
+            set_vendor(&mut vendor, *owner);
+        }
+    }
+    (marker_hits, weak_count, strong_hit, vendor)
+}
+
+/// Whether a status corroborates marker hits into a `blocking` verdict.
+/// Shared by [`detect_cloudflare_flat`] and the CT-mismatch merge so both
+/// paths agree on which statuses count (never sufficient alone).
+#[must_use]
+pub const fn is_coroborating_status(status: u16) -> bool {
+    matches!(status, 403 | 406 | 429 | 503 | 520 | 521 | 522 | 523 | 524)
+}
+
+/// Response `Content-Type` category for CT-mismatch detection. Returns
+/// `None` for missing/unparsable values (no verdict without a signal).
+fn ct_category(content_type: &str) -> Option<&'static str> {
+    let mime = content_type.split(';').next()?.trim().to_ascii_lowercase();
+    if mime.is_empty() || !mime.contains('/') {
+        return None;
+    }
+    if mime.contains("json") || mime.ends_with("+json") {
+        Some("json")
+    } else if mime.contains("xml") || mime.ends_with("+xml") {
+        Some("xml")
+    } else if mime.contains("html") {
+        Some("html")
+    } else if mime.starts_with("text/") {
+        Some("text")
+    } else {
+        // Binary/octet-stream/images/…: apps legitimately vary these, and
+        // bot challenges are HTML — never a mismatch signal.
+        None
+    }
+}
+
+/// Request/response Content-Type mismatch (P0-4): the caller sent an API
+/// payload (`expected_ct`, e.g. `application/json` from `--raw-file`) but
+/// the response is a different document kind (typically `text/html` — a
+/// challenge/deny page intercepted the call).
+///
+/// Only runs when the *expected* kind is `json`/`xml` (API targets, the
+/// P0-2 GraphQL/REST case): form/HTML targets legitimately receive varied
+/// types, so anything else yields `None`. Returns the hit name
+/// (`ct-mismatch:expected-json-got-html`) or `None` when kinds agree, the
+/// response kind is binary/missing, or the expectation is not an API kind.
+/// Never panics; header lookup is case-insensitive on already-lowercased
+/// names.
+#[must_use]
+pub fn ct_mismatch_hit(expected_ct: &str, headers: &[(String, String)]) -> Option<String> {
+    let expected = ct_category(expected_ct)?;
+    if expected != "json" && expected != "xml" {
+        return None;
+    }
+    let response_ct = headers
+        .iter()
+        .find(|(name, _)| name == "content-type")
+        .map(|(_, value)| value.as_str())?;
+    let response = ct_category(response_ct)?;
+    if response == expected {
+        return None;
+    }
+    Some(format!("ct-mismatch:expected-{expected}-got-{response}"))
 }
 
 #[cfg(test)]
@@ -707,6 +857,10 @@ mod tests {
         assert_eq!(WafVendor::Sucuri.to_string(), "sucuri");
         assert_eq!(WafVendor::Fastly.to_string(), "fastly");
         assert_eq!(WafVendor::Varnish.to_string(), "varnish");
+        assert_eq!(WafVendor::DataDome.to_string(), "datadome");
+        assert_eq!(WafVendor::Kasada.to_string(), "kasada");
+        assert_eq!(WafVendor::Human.to_string(), "human");
+        assert_eq!(WafVendor::Turnstile.to_string(), "turnstile");
         assert_eq!(WafVendor::Generic.to_string(), "generic");
     }
 
@@ -906,5 +1060,135 @@ mod tests {
             b"<html>origin timeout</html>",
         );
         assert!(cf.blocking, "{cf:?}");
+    }
+
+    #[test]
+    fn datadome_cookie_and_captcha_domain() {
+        // `datadome` cookie = product presence, never a block alone.
+        let presence = detect_cloudflare_flat(
+            200,
+            &headers(&[("set-cookie", "datadome=abc123; path=/; HttpOnly")]),
+            b"<html>ok</html>",
+        );
+        assert_eq!(presence.vendor, Some(WafVendor::DataDome), "{presence:?}");
+        assert!(!presence.blocking, "{presence:?}");
+        // DataDome captcha domain in body = active challenge, strong.
+        let blocked = detect_cloudflare_flat(
+            200,
+            &headers(&[]),
+            b"<html><script src='https://geo.captcha-delivery.com/captcha.js'></script></html>",
+        );
+        assert_eq!(blocked.vendor, Some(WafVendor::DataDome), "{blocked:?}");
+        assert!(blocked.blocking, "{blocked:?}");
+        // Bare product word alone is weak: presence, no block.
+        let word = detect_cloudflare_flat(200, &headers(&[]), b"we use datadome here");
+        assert_eq!(word.vendor, Some(WafVendor::DataDome), "{word:?}");
+        assert!(!word.blocking, "{word:?}");
+    }
+
+    #[test]
+    fn kasada_sensor_cookie_and_sdk() {
+        let presence = detect_cloudflare_flat(
+            200,
+            &headers(&[("set-cookie", "__kps=abc; path=/")]),
+            b"<html>ok</html>",
+        );
+        assert_eq!(presence.vendor, Some(WafVendor::Kasada), "{presence:?}");
+        assert!(!presence.blocking, "{presence:?}");
+        let blocked = detect_cloudflare_flat(
+            200,
+            &headers(&[]),
+            b"<html><script>kpsdk.init()</script></html>",
+        );
+        assert_eq!(blocked.vendor, Some(WafVendor::Kasada), "{blocked:?}");
+        assert!(blocked.blocking, "{blocked:?}");
+    }
+
+    #[test]
+    fn human_perimeterx_cookie_header_and_captcha() {
+        let cookie = detect_cloudflare_flat(
+            200,
+            &headers(&[("set-cookie", "_px3=abc; path=/")]),
+            b"<html>ok</html>",
+        );
+        assert_eq!(cookie.vendor, Some(WafVendor::Human), "{cookie:?}");
+        assert!(!cookie.blocking, "{cookie:?}");
+        let header = detect_cloudflare_flat(
+            403,
+            &headers(&[("x-px-block", "1")]),
+            b"<html>not found</html>",
+        );
+        assert_eq!(header.vendor, Some(WafVendor::Human), "{header:?}");
+        assert!(
+            header.blocking,
+            "security header corroborates status: {header:?}"
+        );
+        let captcha = detect_cloudflare_flat(
+            200,
+            &headers(&[]),
+            b"<html><div id='px-captcha'>verify</div></html>",
+        );
+        assert_eq!(captcha.vendor, Some(WafVendor::Human), "{captcha:?}");
+        assert!(captcha.blocking, "{captcha:?}");
+    }
+
+    #[test]
+    fn turnstile_needs_cloudflare_cooccurrence() {
+        // Bare `turnstile` word (legit widget embed) = weak presence only.
+        let widget = detect_cloudflare_flat(
+            200,
+            &headers(&[]),
+            b"<html><div class='cf-turnstile-response'></div></html>",
+        );
+        assert_eq!(widget.vendor, Some(WafVendor::Turnstile), "{widget:?}");
+        assert!(!widget.blocking, "widget embed must not block: {widget:?}");
+        // Turnstile + Cloudflare branding = active challenge.
+        let challenge = detect_cloudflare_flat(
+            200,
+            &headers(&[]),
+            b"<html>verifying you are human turnstile cloudflare<script src='https://challenges.cloudflare.com/turnstile/v0/api.js'></script></html>",
+        );
+        assert!(challenge.blocking, "{challenge:?}");
+    }
+
+    #[test]
+    fn ct_mismatch_flags_json_api_served_html() {
+        let html = headers(&[("content-type", "text/html; charset=utf-8")]);
+        let hit = ct_mismatch_hit("application/json", &html);
+        assert_eq!(
+            hit.as_deref(),
+            Some("ct-mismatch:expected-json-got-html"),
+            "{hit:?}"
+        );
+        // Agreement: no signal.
+        let json = headers(&[("content-type", "application/json")]);
+        assert_eq!(ct_mismatch_hit("application/json", &json), None);
+        // Vendor suffix / parameters ignored.
+        let json_ct = headers(&[("content-type", "application/problem+json; charset=utf-8")]);
+        assert_eq!(ct_mismatch_hit("application/json", &json_ct), None);
+        // Non-API expectations never flag (form targets vary legitimately).
+        assert_eq!(ct_mismatch_hit("text/html", &html), None);
+        assert_eq!(ct_mismatch_hit("", &html), None);
+        // Missing / binary response CT: no verdict.
+        assert_eq!(ct_mismatch_hit("application/json", &headers(&[])), None);
+        let bin = headers(&[("content-type", "application/octet-stream")]);
+        assert_eq!(ct_mismatch_hit("application/json", &bin), None);
+        // XML APIs covered too.
+        let xml_hit = ct_mismatch_hit("application/xml", &html);
+        assert_eq!(
+            xml_hit.as_deref(),
+            Some("ct-mismatch:expected-xml-got-html"),
+            "{xml_hit:?}"
+        );
+    }
+
+    #[test]
+    fn corroborating_status_helper_matches_table() {
+        for status in [403, 406, 429, 503, 520, 521, 522, 523, 524] {
+            assert!(is_coroborating_status(status), "{status}");
+        }
+        for status in [200, 201, 301, 400, 404, 500] {
+            assert!(!is_coroborating_status(status), "{status}");
+        }
     }
 }

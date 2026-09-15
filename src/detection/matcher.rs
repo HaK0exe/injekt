@@ -75,8 +75,12 @@ impl MatcherConfig {
 
     /// Veto gate for boolean-based (TRUE/FALSE) checks.
     ///
-    /// Returns `Some(false)` when either branch violates [`Self::matches`],
-    /// otherwise `None` (no verdict).
+    /// Differential semantics: `--string`/`--code`/`--not-string` describe the
+    /// valid page, and a boolean oracle *by design* makes one branch differ
+    /// (e.g. `--string welcome`: TRUE contains it, FALSE legitimately does
+    /// not). Veto only when *both* branches violate [`Self::matches`]
+    /// (neither looks like a valid page); when at least one branch satisfies
+    /// the matcher, abstain (`None`) and let the detector decide.
     #[must_use]
     pub fn gate_boolean(
         &self,
@@ -85,10 +89,9 @@ impl MatcherConfig {
         t_status: u16,
         f_status: u16,
     ) -> Option<bool> {
-        if self.matches(true_body, t_status) == Some(false) {
-            return Some(false);
-        }
-        if self.matches(false_body, f_status) == Some(false) {
+        let true_violates = self.matches(true_body, t_status) == Some(false);
+        let false_violates = self.matches(false_body, f_status) == Some(false);
+        if true_violates && false_violates {
             return Some(false);
         }
         None
@@ -270,8 +273,15 @@ mod tests {
     #[test]
     fn gate_boolean_veto_true_branch() {
         let cfg = active_string_config();
+        // Differential oracle: only the TRUE branch must satisfy `--string`;
+        // a FALSE branch that differs is the signal, not a veto.
+        assert!(
+            cfg.gate_boolean("goodbye", "welcome false", 200, 200)
+                .is_none()
+        );
+        // Veto only when BOTH branches violate the matcher.
         assert_eq!(
-            cfg.gate_boolean("goodbye", "welcome false", 200, 200),
+            cfg.gate_boolean("goodbye", "goodbye", 200, 200),
             Some(false)
         );
     }
@@ -279,8 +289,12 @@ mod tests {
     #[test]
     fn gate_boolean_veto_false_branch() {
         let cfg = active_string_config();
+        assert!(
+            cfg.gate_boolean("welcome true", "goodbye", 200, 200)
+                .is_none()
+        );
         assert_eq!(
-            cfg.gate_boolean("welcome true", "goodbye", 200, 200),
+            cfg.gate_boolean("goodbye", "goodbye", 200, 200),
             Some(false)
         );
     }
@@ -291,7 +305,10 @@ mod tests {
             code: Some(200),
             ..Default::default()
         };
-        assert_eq!(cfg.gate_boolean("a", "b", 200, 500), Some(false));
+        // Single-branch code differentials (TRUE 200 / FALSE 500) are the
+        // oracle signal — veto only when both miss.
+        assert!(cfg.gate_boolean("a", "b", 200, 500).is_none());
+        assert_eq!(cfg.gate_boolean("a", "b", 500, 500), Some(false));
         assert!(cfg.gate_boolean("a", "b", 200, 200).is_none());
     }
 

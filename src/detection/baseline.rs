@@ -4,7 +4,11 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 /// Statuses counted as WAF blocks for [`Baseline::is_waf_blocked`].
-const WAF_BLOCK_STATUSES: [u16; 2] = [403, 406];
+/// `403`/`406` are classic deny/challenge codes; `429` is throttling (the
+/// `is_waf_blocking` signal path corroborates it via headers/body markers).
+/// `5xx` deliberately excluded: origin errors on a down target must not
+/// trigger bypass tampers.
+const WAF_BLOCK_STATUSES: [u16; 3] = [403, 406, 429];
 /// Minimum block count across baseline samples before calling it a WAF.
 const MIN_WAF_BLOCKS: usize = 2;
 
@@ -167,6 +171,40 @@ impl Baseline {
             self.waf_blocking
         )
     }
+
+    /// Merge a request/response Content-Type mismatch signal (P0-4) into the
+    /// aggregate: the caller sent an API payload (`expected_ct`, e.g.
+    /// `application/json` from `--raw-file`) but a sample answered with a
+    /// different document kind (typically `text/html` — a challenge/deny
+    /// page intercepted the call).
+    ///
+    /// A mismatch alone is presence-level (`Generic`, `blocking=false` —
+    /// informational, never auto-tamper/downgrade by itself); it turns
+    /// `blocking` only together with a corroborating status on a mismatching
+    /// sample, mirroring the marker+status contract in
+    /// [`super::waf::detect_cloudflare_flat`]. No-op when `expected_ct` is
+    /// not an API kind or every sample agrees (see
+    /// [`super::waf::ct_mismatch_hit`]).
+    pub fn apply_ct_mismatch(&mut self, samples: &[Sample], expected_ct: &str) {
+        let mut blocking = false;
+        for sample in samples {
+            let Some(hit) = super::waf::ct_mismatch_hit(expected_ct, &sample.headers) else {
+                continue;
+            };
+            if !self.waf_hits.contains(&hit) {
+                self.waf_hits.push(hit);
+            }
+            if super::waf::is_coroborating_status(sample.status) {
+                blocking = true;
+            }
+        }
+        if self.waf_hits.iter().any(|h| h.starts_with("ct-mismatch:")) {
+            if self.waf_vendor.is_none() {
+                self.waf_vendor = Some("generic".to_owned());
+            }
+            self.waf_blocking = self.waf_blocking || blocking;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -257,5 +295,56 @@ mod tests {
         assert!(bl.is_waf_suspected());
         assert!(bl.is_waf_blocking());
         assert!(bl.waf_evidence_suffix().contains("blocking=true"));
+    }
+
+    #[test]
+    fn ct_mismatch_json_api_served_html_is_presence() {
+        let headers = [("content-type", "text/html; charset=utf-8")];
+        let samples = vec![
+            sample(200, b"<html>ok</html>", &headers),
+            sample(200, b"<html>ok</html>", &headers),
+        ];
+        let mut bl = Baseline::new(&samples);
+        assert!(!bl.is_waf_suspected());
+        bl.apply_ct_mismatch(&samples, "application/json");
+        assert!(bl.is_waf_suspected());
+        assert!(
+            !bl.is_waf_blocking(),
+            "mismatch alone must not block: {}",
+            bl.waf_evidence_suffix()
+        );
+        assert_eq!(bl.waf_vendor.as_deref(), Some("generic"));
+        assert!(
+            bl.waf_hits
+                .iter()
+                .any(|h| h == "ct-mismatch:expected-json-got-html"),
+            "{}",
+            bl.waf_evidence_suffix()
+        );
+    }
+
+    #[test]
+    fn ct_mismatch_with_coroborating_status_blocks() {
+        let headers = [("content-type", "text/html")];
+        let samples = vec![sample(403, b"<html>denied</html>", &headers)];
+        let mut bl = Baseline::new(&samples);
+        bl.apply_ct_mismatch(&samples, "application/json");
+        assert!(bl.is_waf_blocking(), "{}", bl.waf_evidence_suffix());
+    }
+
+    #[test]
+    fn ct_mismatch_noop_when_kinds_agree() {
+        let headers = [("content-type", "application/json")];
+        let samples = vec![sample(200, b"{\"a\":1}", &headers)];
+        let mut bl = Baseline::new(&samples);
+        bl.apply_ct_mismatch(&samples, "application/json");
+        assert!(!bl.is_waf_suspected());
+        assert_eq!(bl.waf_evidence_suffix(), "");
+        // Non-API expectations never flag.
+        let html = [("content-type", "text/html")];
+        let html_samples = vec![sample(200, b"<html>ok</html>", &html)];
+        let mut bl2 = Baseline::new(&html_samples);
+        bl2.apply_ct_mismatch(&html_samples, "text/html");
+        assert!(!bl2.is_waf_suspected());
     }
 }
