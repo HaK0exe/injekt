@@ -381,15 +381,19 @@ struct ExtractedDocument {
 fn extract_document(base: &Url, body: &str) -> ExtractedDocument {
     let document = Html::parse_document(body);
     let mut out = ExtractedDocument::default();
-    let anchor_selector = selector("a[href]");
-    for anchor in document.select(&anchor_selector) {
-        if let Some(url) = resolve_attr(base, &anchor, "href") {
-            add_link_candidates(&mut out, url, ParamType::Link);
+    if let Some(anchor_selector) = selector("a[href]") {
+        for anchor in document.select(&anchor_selector) {
+            if let Some(url) = resolve_attr(base, &anchor, "href") {
+                add_link_candidates(&mut out, url, ParamType::Link);
+            }
         }
     }
 
     let form_selector = selector("form");
     let field_selector = selector("input[name], select[name], textarea[name]");
+    let (Some(form_selector), Some(field_selector)) = (form_selector, field_selector) else {
+        return out;
+    };
     for form in document.select(&form_selector) {
         let action = form
             .value()
@@ -612,8 +616,12 @@ fn add_link_candidates(out: &mut ExtractedDocument, mut url: Url, param_type: Pa
     }
 }
 
-fn selector(value: &str) -> Selector {
-    Selector::parse(value).unwrap_or_else(|_| unreachable!("static selector is valid"))
+/// Parse a CSS selector, returning `None` instead of panicking when the
+/// static selector fails to compile (never happens in practice — all call
+/// sites use hardcoded selectors — but `unreachable!` would be a prod panic
+/// if `scraper` ever tightened its parser).
+fn selector(value: &str) -> Option<Selector> {
+    Selector::parse(value).ok()
 }
 
 /// JS endpoint pattern compiled once (was `Regex::new` per crawled page).
@@ -645,7 +653,9 @@ fn resolve_attr(base: &Url, element: &ElementRef<'_>, attr: &str) -> Option<Url>
 
 fn field_value(field: &ElementRef<'_>) -> String {
     if field.value().name() == "select" {
-        let option_selector = selector("option[selected], option");
+        let Some(option_selector) = selector("option[selected], option") else {
+            return String::new();
+        };
         return field
             .select(&option_selector)
             .next()
