@@ -125,6 +125,7 @@ impl InjektServer {
     /// Note: `raw_file` / `marker` / `method` / `import` / `replay` are
     /// intentionally not exposed via MCP (see docs/MCP.md); Burp raw bodies
     /// and marker modes stay CLI-only to keep the stdio surface minimal.
+    #[allow(clippy::too_many_lines)] // test fixture: exhaustive struct literal grows with each new flag
     fn base_cli() -> Cli {
         Cli {
             command: None,
@@ -177,6 +178,15 @@ impl InjektServer {
                 oob_domain: None,
                 oob_poll_url: None,
                 oob_wait_secs: None,
+                // `--ai-suggest` stays CLI-only (external LLM egress must be
+                // an explicit operator opt-in, never via the MCP surface).
+                ai_suggest: false,
+                ai_provider: None,
+                ai_endpoint: None,
+                ai_model: None,
+                ai_api_key: None,
+                ai_max_suggestions: 3,
+                ai_timeout: 30,
             },
             evasion: crate::cli::args::EvasionOpts {
                 prefix: None,

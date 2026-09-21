@@ -290,9 +290,7 @@ impl Cli {
         }
         let provider = self.effective_ai_provider();
         if provider.is_none() {
-            return Err(
-                "--ai-suggest requires --ai-provider <openai|anthropic>".to_owned(),
-            );
+            return Err("--ai-suggest requires --ai-provider <openai|anthropic>".to_owned());
         }
         let endpoint = self.detection.ai_endpoint.as_deref().unwrap_or("").trim();
         if endpoint.is_empty() {
@@ -674,6 +672,7 @@ mod tests {
     };
     use crate::cli::profile::Profile;
 
+    #[allow(clippy::too_many_lines)] // test fixture: exhaustive struct literal grows with each new flag
     fn blank_cli() -> Cli {
         Cli {
             command: None,
@@ -726,6 +725,13 @@ mod tests {
                 oob_domain: None,
                 oob_poll_url: None,
                 oob_wait_secs: None,
+                ai_suggest: false,
+                ai_provider: None,
+                ai_endpoint: None,
+                ai_model: None,
+                ai_api_key: None,
+                ai_max_suggestions: 3,
+                ai_timeout: 30,
             },
             evasion: EvasionOpts {
                 prefix: None,
@@ -1024,5 +1030,60 @@ mod tests {
                 .effective_max_duration(),
             Some(120)
         );
+    }
+
+    #[test]
+    fn ai_opts_off_by_default_byte_identical() {
+        // `--ai-suggest` OFF = 0 LLM call, validation always passes.
+        let cli = blank_cli();
+        assert!(!cli.detection.ai_suggest);
+        assert_eq!(cli.effective_ai_max_suggestions(), 3);
+        assert_eq!(cli.effective_ai_timeout(), 30);
+        assert_eq!(cli.effective_ai_provider(), None);
+        assert!(cli.validate_ai_opts().is_ok());
+    }
+
+    #[test]
+    fn ai_opts_require_provider_endpoint_model() {
+        let mut cli = blank_cli();
+        cli.detection.ai_suggest = true;
+        // Nothing set: provider missing first.
+        assert!(cli.validate_ai_opts().is_err());
+        cli.detection.ai_provider = Some("openai".to_owned());
+        assert!(cli.validate_ai_opts().is_err());
+        cli.detection.ai_endpoint = Some("http://localhost:11434/v1/chat/completions".to_owned());
+        assert!(cli.validate_ai_opts().is_err());
+        cli.detection.ai_model = Some("llama3.1:8b".to_owned());
+        assert!(cli.validate_ai_opts().is_ok());
+    }
+
+    #[test]
+    fn ai_opts_reject_bad_provider_and_endpoint() {
+        let mut cli = blank_cli();
+        cli.detection.ai_suggest = true;
+        cli.detection.ai_provider = Some("nope".to_owned());
+        cli.detection.ai_endpoint = Some("http://localhost:11434/v1".to_owned());
+        cli.detection.ai_model = Some("m".to_owned());
+        assert!(cli.validate_ai_opts().is_err());
+        assert_eq!(cli.effective_ai_provider(), None);
+        cli.detection.ai_provider = Some("Anthropic".to_owned());
+        assert_eq!(cli.effective_ai_provider().as_deref(), Some("anthropic"));
+        cli.detection.ai_endpoint = Some("ftp://example.com/x".to_owned());
+        assert!(cli.validate_ai_opts().is_err());
+        cli.detection.ai_endpoint = Some("https://api.anthropic.com/v1/messages".to_owned());
+        assert!(cli.validate_ai_opts().is_ok());
+    }
+
+    #[test]
+    fn ai_counts_clamp_defensively() {
+        let mut cli = blank_cli();
+        cli.detection.ai_max_suggestions = 0;
+        assert_eq!(cli.effective_ai_max_suggestions(), 1);
+        cli.detection.ai_max_suggestions = 9;
+        assert_eq!(cli.effective_ai_max_suggestions(), 5);
+        cli.detection.ai_max_suggestions = 3;
+        assert_eq!(cli.effective_ai_max_suggestions(), 3);
+        cli.detection.ai_timeout = 0;
+        assert_eq!(cli.effective_ai_timeout(), 1);
     }
 }
