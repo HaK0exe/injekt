@@ -154,6 +154,36 @@ injekt --target "https://example.com/?id=1" --output report.json
 cat report.json | jq .
 ```
 
+## Expérience terminal
+
+Le terminal sépare volontairement les flux : les logs (`INFO`, `WARNING`,
+`DEBUG`) vont sur **stderr** et le résultat humain va sur **stdout**. Cela
+permet de rediriger les findings sans mélanger les messages de progression.
+
+À la fin d'un scan mono-cible, injekt affiche un résumé compact :
+
+```text
+◆ Scan complete
+  Status: CLEAN | FINDINGS | INCONCLUSIVE | CANCELLED
+  Target: https://example.com/?id=1
+  Requests: 42
+  Duration: 12.4s
+```
+
+`CLEAN` signifie qu'un run complet n'a produit aucun finding confirmé ; ce
+n'est pas une garantie de sécurité absolue. `INCONCLUSIVE` signifie que le run
+s'est arrêté tôt ou que l'oracle était inutilisable (baseline instable / tout-5xx,
+`--request-budget` / `--max-duration`) — ne jamais le lire comme "non injectable". `--no-banner` désactive uniquement
+la bannière de démarrage. Les couleurs sont automatiquement désactivées avec
+`NO_COLOR`, `TERM=dumb`, `CLICOLOR=0` ou lorsque la sortie est redirigée.
+
+Pour une sortie destinée à une machine, utilisez `--output` avec `--format`
+(`json`, `sarif`, `junit` ou `md`) :
+
+```bash
+injekt --target "https://example.com/?id=1" --output report.sarif --format sarif
+```
+
 ---
 
 ## Référence CLI
@@ -259,7 +289,7 @@ proxy = "socks5h://127.0.0.1:9050"
 Voir [`docs/OPSEC.md`](docs/OPSEC.md) — résumé :
 
 - **Aucune écriture disque** sans `--export-encrypted` ; `SessionState` est `Arc<RwLock<…>>` et `ZeroizeOnDrop`.
-- **Scrubber** (`src/session/scrubber.rs`) : `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, JWT `eyJ…`, `AKIA[0-9A-Z]{16}`, PEM → `[REDACTED]` ou hash 8-hex.
+- **Scrubber** (`src/session/scrubber.rs`) : `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, JWT `eyJ…`, `AKIA[0-9A-Z]{16}`, PEM → `[REDACTED]` ou hash 16-hex.
 - **Identité** (`src/http/identity.rs`) : pool UA réaliste (Chrome 126 / Firefox 128 / Safari 17.5) avec `Sec-CH-UA` cohérent.
 - **Jitter** (`src/http/jitter.rs`) : `rand_distr::Normal` en **millisecondes**, jamais de cadence fixe (défaut 750±250ms, plancher 200ms — actif même sans `--jitter`).
 - **Rate limit** : token bucket, défaut **10 req/s** sauf `--rate-limit` explicite.

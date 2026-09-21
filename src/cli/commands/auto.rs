@@ -14,7 +14,8 @@
 
 use crate::{
     cli::args::{AutoArgs, Cli},
-    cli::output::file::write_output_file_async,
+    cli::engine_cfg::{EnumGate, build_engine_config},
+    cli::knowledge::learn_and_save,
     engine::orchestrator::{Engine, EngineConfig},
     reporting::{console, json::JsonReport, render::render_report},
     session::scrubber::Scrubber,
@@ -88,9 +89,9 @@ pub async fn run(cli: &Cli, args: &AutoArgs, cancel: CancellationToken) -> anyho
         anyhow::bail!("{e}");
     }
     let auto_target = args.target.clone().or_else(|| cli.effective_target());
-    let targets = crate::target::ingest::collect_targets(cli, auto_target.as_deref())?;
+    let targets = super::common::resolve_targets(cli, auto_target.as_deref())?;
 
-    if cli.dry_run {
+    if cli.output_opts.dry_run {
         dry_run(cli, args, &targets);
         return Ok(());
     }
@@ -110,7 +111,7 @@ fn is_bare_host(target: &str) -> bool {
 }
 
 fn dry_run(cli: &Cli, args: &AutoArgs, targets: &[String]) {
-    let scrubber = Scrubber::new(cli.no_redact);
+    let scrubber = Scrubber::new(cli.output_opts.no_redact);
     println!("dry-run: auto pipeline (no request sent)");
     println!("  resolution: {}", cli.resolution_summary());
     println!("  targets: {}", targets.len());
@@ -120,7 +121,7 @@ fn dry_run(cli: &Cli, args: &AutoArgs, targets: &[String]) {
     if targets.len() > 20 {
         println!("    … ({} more)", targets.len() - 20);
     }
-    let base = super::scan::engine_config(cli);
+    let base = build_engine_config(cli, EnumGate::Passthrough);
     let steps = escalation_plan(&base, !args.no_escalate);
     println!("  passes: {}", steps.len());
     for step in &steps {
@@ -150,7 +151,7 @@ async fn run_auto_direct(
     targets: &[String],
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
-    let scrubber = Scrubber::new(cli.no_redact);
+    let scrubber = Scrubber::new(cli.output_opts.no_redact);
     let mut all_findings = Vec::new();
     let mut all_extracted = Vec::new();
     let mut total_requests: u64 = 0;
@@ -191,27 +192,19 @@ async fn run_auto_direct(
 
     // C13 post-run opt-in : un seul delta agrégé sur tous les findings du run
     // (fusion + `fsync` + perms 0600). OFF = aucune IO.
-    if cli.knowledge_enabled() {
-        let base = super::scan::engine_config(cli);
-        let mut delta = crate::reasoning::knowledge::KnowledgeStore::empty();
-        crate::reasoning::knowledge::learn_from_run(
-            &mut delta,
+    {
+        let base = build_engine_config(cli, EnumGate::Passthrough);
+        learn_and_save(
             &all_findings,
             &base.techniques,
             base.dbms_hint.as_deref(),
             total_requests,
+            cli,
         );
-        if let Err(e) = crate::reasoning::knowledge::save_delta_if_enabled(
-            &delta,
-            true,
-            cli.knowledge_path.as_deref(),
-        ) {
-            tracing::warn!(error=%e, "knowledge save failed (run results kept in RAM)");
-        }
     }
 
-    if let Some(out) = cli.output.as_deref() {
-        let base = super::scan::engine_config(cli);
+    if let Some(out) = cli.output_opts.output.as_deref() {
+        let base = build_engine_config(cli, EnumGate::Passthrough);
         let meta = crate::reporting::json::ReportMeta::current(
             base.seed,
             cli.active_profile()
@@ -232,14 +225,14 @@ async fn run_auto_direct(
             total_requests,
             meta,
         );
-        write_json(
-            out,
-            &render_report(&report, cli.format, &scrubber),
-            cli.force,
+        super::common::write_report_async(
+            Some(out),
+            &render_report(&report, cli.output_opts.format, &scrubber),
+            cli.output_opts.force,
             &scrubber.scrub(out),
         )
         .await?;
-        tracing::info!(path = %scrubber.scrub(out), format = %cli.format.to_string(), "auto report written (0o600, no overwrite unless --force)");
+        tracing::info!(path = %scrubber.scrub(out), format = %cli.output_opts.format.to_string(), "auto report written (0o600, no overwrite unless --force)");
     }
     Ok(())
 }
@@ -250,7 +243,7 @@ async fn scan_with_escalation(
     target: &str,
     cancel: &CancellationToken,
 ) -> anyhow::Result<(Vec<crate::session::state::Finding>, Vec<String>, u64)> {
-    let mut base = super::scan::engine_config(cli);
+    let mut base = build_engine_config(cli, EnumGate::Passthrough);
     if args.auto_enumerate {
         base.enumeration.extract = true;
     }
@@ -260,9 +253,10 @@ async fn scan_with_escalation(
         if cancel.is_cancelled() {
             break;
         }
-        let scrubbed_target = crate::session::scrubber::Scrubber::new(cli.no_redact).scrub(target);
+        let scrubbed_target =
+            crate::session::scrubber::Scrubber::new(cli.output_opts.no_redact).scrub(target);
         tracing::info!(target = %scrubbed_target, step = step.label, level = step.config.budget.level, "auto pass");
-        let client = crate::cli::client_builder::build_client(cli, cli.allow_private)?;
+        let client = crate::cli::client_builder::build_client(cli, cli.http.allow_private)?;
         let engine = Engine::new(step.config.clone(), client, cancel.clone());
         match engine.run(target).await {
             Ok(_) => {
@@ -295,7 +289,7 @@ async fn run_auto_recon(
     targets: &[String],
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
-    let scrubber = Scrubber::new(cli.no_redact);
+    let scrubber = Scrubber::new(cli.output_opts.no_redact);
     let seed = targets.first().cloned().unwrap_or_default();
     let crawl_args = crate::cli::args::ReconCrawlArgs {
         target: seed.clone(),
@@ -318,12 +312,12 @@ async fn run_auto_recon(
         return run_auto_direct(cli, args, &targets[..1.min(targets.len())], cancel).await;
     }
 
-    let mut base = super::scan::engine_config(cli);
+    let mut base = build_engine_config(cli, EnumGate::Passthrough);
     if args.auto_enumerate {
         base.enumeration.extract = true;
     }
     let steps = escalation_plan(&base, !args.no_escalate);
-    let client = crate::cli::client_builder::build_client(cli, cli.allow_private)?;
+    let client = crate::cli::client_builder::build_client(cli, cli.http.allow_private)?;
     let mut best: Option<crate::recon::discovery::DiscoveryReport> = None;
     for step in &steps {
         if cancel.is_cancelled() {
@@ -360,27 +354,44 @@ async fn run_auto_recon(
     );
     console::print_findings(&report.findings, &scrubber);
     // C13 post-run opt-in : delta anonyme du run recon (fusion, `fsync`, 0600).
-    if cli.knowledge_enabled() {
-        let mut delta = crate::reasoning::knowledge::KnowledgeStore::empty();
-        crate::reasoning::knowledge::learn_from_run(
-            &mut delta,
-            &report.findings,
-            &base.techniques,
-            base.dbms_hint.as_deref(),
-            report.request_count,
+    learn_and_save(
+        &report.findings,
+        &base.techniques,
+        base.dbms_hint.as_deref(),
+        report.request_count,
+        cli,
+    );
+    if let Some(out) = cli.output_opts.output.as_deref() {
+        // Unifié sur `render_report` : respecte `--format` (json/sarif/junit/md),
+        // scrubbé et idempotent. `DiscoveryReport` brut → `JsonReport` enveloppe.
+        let meta = crate::reporting::json::ReportMeta::current(
+            base.seed,
+            cli.active_profile()
+                .map(|p| format!("{p:?}").to_ascii_lowercase()),
+            base.techniques.clone(),
+            base.budget.level,
+            base.evasion
+                .tampers
+                .iter()
+                .map(|t| t.name().to_owned())
+                .collect(),
         );
-        if let Err(e) = crate::reasoning::knowledge::save_delta_if_enabled(
-            &delta,
-            true,
-            cli.knowledge_path.as_deref(),
-        ) {
-            tracing::warn!(error=%e, "knowledge save failed (run results kept in RAM)");
-        }
-    }
-    if let Some(out) = cli.output.as_deref() {
-        let scrubbed_report = report.scrubbed(&scrubber);
-        let json = serde_json::to_string_pretty(&scrubbed_report)?;
-        write_json(out, &json, cli.force, &scrubber.scrub(out)).await?;
+        let json_report = JsonReport::new(
+            seed.clone(),
+            report.findings.clone(),
+            vec![],
+            vec![],
+            report.request_count,
+            meta,
+        );
+        let body = render_report(&json_report, cli.output_opts.format, &scrubber);
+        super::common::write_report_async(
+            Some(out),
+            &body,
+            cli.output_opts.force,
+            &scrubber.scrub(out),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -392,15 +403,6 @@ fn scrub_candidate(
     // would break testing. Scrubbing happens post-scan via
     // `DiscoveryReport::scrubbed` before print/write.
     c
-}
-
-async fn write_json(
-    path: &str,
-    json: &str,
-    force: bool,
-    scrubbed_for_log: &str,
-) -> anyhow::Result<()> {
-    write_output_file_async(path, json, force, scrubbed_for_log).await
 }
 
 #[cfg(test)]

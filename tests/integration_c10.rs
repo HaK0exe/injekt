@@ -397,7 +397,9 @@ async fn engine_mid_scan_cancel_is_graceful() {
         .await
         .expect("cancelled scan must settle promptly")
         .expect("engine run");
-    assert_eq!(state, injekt::engine::EngineState::Done);
+    // Interrupted runs are Cancelled (never Done/CLEAN): the target was not
+    // fully tested.
+    assert_eq!(state, injekt::engine::EngineState::Cancelled);
     assert!(
         start.elapsed() < Duration::from_secs(15),
         "graceful cancel must beat the class timeouts, took {:?}",

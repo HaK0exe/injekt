@@ -72,12 +72,15 @@ impl UnionDetector {
     #[must_use]
     pub fn evaluate_order_by(&self, body: &str) -> bool {
         let lower = body.to_ascii_lowercase();
+        // Generic words such as "invalid" and "sql" occur frequently in
+        // application validation pages.  Only accept structured database
+        // diagnostics that identify an ORDER BY position/column, or the
+        // Oracle-specific invalid-identifier code.
         (lower.contains("order by")
-            && (lower.contains("unknown column")
-                || lower.contains("invalid")
-                || lower.contains("sql")))
-            || lower.contains("ora-00904")
-            || lower.contains("the order by position")
+            && ((lower.contains("unknown column") && lower.contains("order clause"))
+                || lower.contains("order by position") && lower.contains("out of range")
+                || lower.contains("invalid identifier")))
+            || lower.contains("ora-00904") && lower.contains("invalid identifier")
     }
 }
 
@@ -109,6 +112,8 @@ mod tests {
         assert!(!d.evaluate_order_by("order by date desc — no error"));
         // "unknown column" without "order by" must not trigger (prevents FP on generic SQL errors)
         assert!(!d.evaluate_order_by("Unknown column 'foo' in field list"));
+        assert!(!d.evaluate_order_by("invalid SQL: order by date is not allowed"));
+        assert!(!d.evaluate_order_by("order by invalid parameter"));
     }
 
     #[test]

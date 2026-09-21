@@ -122,6 +122,24 @@ impl RawRequest {
         };
         Some(format!("{scheme}://{host}{path}"))
     }
+
+    /// Port-aware URL reconstruction shared by `--raw-file` and `--raw-dir`.
+    ///
+    /// `Host: x:80` is plain HTTP — trying `https://x:80` first would fail
+    /// closed on a valid target. Absolute-form targets carry their own scheme.
+    #[must_use]
+    pub fn to_url_with_port_hint(&self) -> Option<String> {
+        let is_absolute = self.path.starts_with("http://") || self.path.starts_with("https://");
+        if is_absolute {
+            return self.to_url("https");
+        }
+        let host_port_80 = self.headers.get("host").is_some_and(|h| h.ends_with(":80"));
+        if host_port_80 {
+            self.to_url("http").or_else(|| self.to_url("https"))
+        } else {
+            self.to_url("https").or_else(|| self.to_url("http"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +163,28 @@ mod tests {
         let raw = "POST /login HTTP/1.1\nHost: x\nContent-Type: application/x-www-form-urlencoded\n\nuser=admin&pass=1";
         let r = RawRequest::parse(raw).unwrap();
         assert_eq!(r.body.unwrap(), "user=admin&pass=1");
+    }
+
+    #[test]
+    fn port_hint_prefers_http_for_port_80() {
+        let raw = "GET /?id=1 HTTP/1.1\nHost: example.com:80\n\n";
+        let r = RawRequest::parse(raw).unwrap();
+        assert_eq!(
+            r.to_url_with_port_hint().as_deref(),
+            Some("http://example.com:80/?id=1")
+        );
+        let raw = "GET /?id=1 HTTP/1.1\nHost: example.com\n\n";
+        let r = RawRequest::parse(raw).unwrap();
+        assert_eq!(
+            r.to_url_with_port_hint().as_deref(),
+            Some("https://example.com/?id=1")
+        );
+        // Absolute-form wins regardless of Host.
+        let raw = "GET http://example.com/?id=1 HTTP/1.1\nHost: other.test:80\n\n";
+        let r = RawRequest::parse(raw).unwrap();
+        assert_eq!(
+            r.to_url_with_port_hint().as_deref(),
+            Some("http://example.com/?id=1")
+        );
     }
 }

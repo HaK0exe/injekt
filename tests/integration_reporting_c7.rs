@@ -316,7 +316,7 @@ fn report_format_defaults_to_json() {
     assert!(matches!(ReportFormat::default(), ReportFormat::Json));
     let cli = Cli::try_parse_from(["injekt", "scan", "--target", "https://example.com/?id=1"])
         .expect("cli parses");
-    assert!(matches!(cli.format, ReportFormat::Json));
+    assert!(matches!(cli.output_opts.format, ReportFormat::Json));
     for (flag, expected) in [
         ("sarif", ReportFormat::Sarif),
         ("junit", ReportFormat::Junit),
@@ -331,6 +331,9 @@ fn report_format_defaults_to_json() {
             "https://example.com/?id=1",
         ])
         .expect("cli parses with --format");
-        assert_eq!(cli.format, expected, "--format {flag} not honoured");
+        assert_eq!(
+            cli.output_opts.format, expected,
+            "--format {flag} not honoured"
+        );
     }
 }

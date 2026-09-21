@@ -29,6 +29,8 @@ pub mod error {
     pub enum InjektError {
         #[error("invalid target: {0}")]
         InvalidTarget(String),
+        #[error("no target provided. Use --target <URL> or `injekt scan --target <URL>`")]
+        NoTarget,
         #[error("http error: {0}")]
         Http(String),
         #[error("detection failed: {0}")]

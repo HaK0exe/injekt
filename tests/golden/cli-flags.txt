@@ -14,6 +14,7 @@ scan
 # flags (sorted --long, all levels)
 --allow-knowledge
 --allow-private
+--allow-secret-reuse
 --auto-enumerate
 --banner
 --bulk-file
@@ -58,6 +59,7 @@ scan
 --max-duration
 --max-pages
 --max-per-template
+--max-redirects
 --method
 --no-banner
 --no-escalate

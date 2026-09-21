@@ -130,85 +130,99 @@ impl InjektServer {
             command: None,
             profile: None,
             config: None,
-            target: None,
-            bulk_file: None,
-            method: None,
-            headers: Vec::new(),
-            cookies: None,
-            proxy: None,
-            threads: None,
-            timeout: None,
-            retries: None,
-            delay: None,
-            techniques: Vec::new(),
-            params: Vec::new(),
-            data: None,
-            prefix: None,
-            suffix: None,
-            safe_chars: None,
-            skip_urlencode: false,
-            string: None,
-            not_string: None,
-            code: None,
-            text_only: false,
-            fetch_using: None,
-            dbms: None,
-            extract: false,
-            dbs: false,
-            tables: false,
-            columns: false,
-            dump: false,
-            banner: false,
-            current_user: false,
-            current_db: false,
-            hostname: false,
-            db: None,
-            table: None,
-            column: None,
-            start: None,
-            stop: None,
-            count: false,
-            output: None,
-            format: crate::cli::args::ReportFormat::Json,
-            explain: None,
-            rate_limit: None,
-            jitter: None,
-            marker: None,
-            oob_domain: None,
-            oob_poll_url: None,
-            oob_wait_secs: None,
-            tamper: Vec::new(),
-            hpp: false,
-            chunked: false,
-            export_encrypted: None,
-            import: None,
-            no_redact: false,
-            allow_private: false,
+            target_opts: crate::cli::args::TargetOpts {
+                target: None,
+                bulk_file: None,
+                raw_file: None,
+                raw_dir: None,
+                stdin: false,
+                openapi_file: None,
+                sitemap_file: None,
+            },
+            http: crate::cli::args::HttpOpts {
+                method: None,
+                headers: Vec::new(),
+                cookies: None,
+                proxy: None,
+                timeout: None,
+                retries: None,
+                delay: None,
+                rate_limit: None,
+                jitter: None,
+                allow_private: false,
+                max_redirects: None,
+            },
+            detection: crate::cli::args::DetectionOpts {
+                threads: None,
+                level: Some(1),
+                techniques: Vec::new(),
+                tamper: Vec::new(),
+                params: Vec::new(),
+                data: None,
+                fetch_using: None,
+                dbms: None,
+                marker: None,
+                string: None,
+                not_string: None,
+                code: None,
+                text_only: false,
+                max_duration: None,
+                // Budgets OPT-IN (None = illimité, comportement historique) :
+                // exposés comme params MCP optionnels, câblés dans
+                // `build_scan_cli` / `build_recon_scan`.
+                request_budget: None,
+                confirm: false,
+                seed: None,
+                ignore_codes: Vec::new(),
+                oob_domain: None,
+                oob_poll_url: None,
+                oob_wait_secs: None,
+            },
+            evasion: crate::cli::args::EvasionOpts {
+                prefix: None,
+                suffix: None,
+                safe_chars: None,
+                skip_urlencode: false,
+                no_mutation: false,
+                second_order: false,
+                second_order_revisit_url: None,
+                second_order_max_stores: 8,
+                hpp: false,
+                chunked: false,
+            },
+            enumeration: crate::cli::args::EnumOpts {
+                extract: false,
+                dbs: false,
+                tables: false,
+                columns: false,
+                dump: false,
+                banner: false,
+                current_user: false,
+                current_db: false,
+                hostname: false,
+                db: None,
+                table: None,
+                column: None,
+                start: None,
+                stop: None,
+                count: false,
+            },
+            output_opts: crate::cli::args::OutputOpts {
+                output: None,
+                format: crate::cli::args::ReportFormat::Json,
+                dry_run: false,
+                no_redact: false,
+                explain: None,
+                export_encrypted: None,
+                import: None,
+                force: false,
+            },
+            allow_secret_reuse: false,
             // C13: MCP = RAM-only, knowledge jamais activé (surface stdio minimale).
             allow_knowledge: false,
             knowledge_path: None,
-            second_order: false,
-            second_order_revisit_url: None,
-            second_order_max_stores: 8,
-            raw_file: None,
-            raw_dir: None,
-            stdin: false,
-            openapi_file: None,
-            sitemap_file: None,
-            dry_run: false,
             verbose: false,
-            level: Some(1),
-            max_duration: None,
-            // Budgets OPT-IN (None = illimité, comportement historique) :
-            // exposés comme params MCP optionnels, câblés dans
-            // `build_scan_cli` / `build_recon_scan`.
-            request_budget: None,
-            confirm: false,
-            no_mutation: false,
-            seed: None,
-            ignore_codes: Vec::new(),
             no_banner: true,
-            force: false,
         }
     }
 
@@ -218,65 +232,66 @@ impl InjektServer {
             target: Some(params.target),
         }));
         if let Some(v) = params.threads {
-            cli.threads = Some(v);
+            cli.detection.threads = Some(v);
         }
         if let Some(v) = params.techniques {
-            cli.techniques = v;
+            cli.detection.techniques = v;
         }
         if let Some(v) = params.params {
-            cli.params = v;
+            cli.detection.params = v;
         }
-        cli.data = params.data;
-        cli.prefix = params.prefix;
-        cli.suffix = params.suffix;
-        cli.safe_chars = params.safe_chars;
-        cli.skip_urlencode = params.skip_urlencode.unwrap_or(false);
-        cli.string = params.string;
-        cli.not_string = params.not_string;
-        cli.code = params.code;
-        cli.text_only = params.text_only.unwrap_or(false);
-        cli.fetch_using = params.fetch_using;
+        cli.detection.data = params.data;
+        cli.evasion.prefix = params.prefix;
+        cli.evasion.suffix = params.suffix;
+        cli.evasion.safe_chars = params.safe_chars;
+        cli.evasion.skip_urlencode = params.skip_urlencode.unwrap_or(false);
+        cli.detection.string = params.string;
+        cli.detection.not_string = params.not_string;
+        cli.detection.code = params.code;
+        cli.detection.text_only = params.text_only.unwrap_or(false);
+        cli.detection.fetch_using = params.fetch_using;
         if let Some(v) = params.tamper {
-            cli.tamper = v;
+            cli.detection.tamper = v;
         }
-        cli.proxy = params.proxy;
-        cli.rate_limit = params.rate_limit;
-        cli.jitter = params.jitter;
-        cli.timeout = params.timeout;
-        cli.max_duration = params.max_duration;
-        cli.request_budget = params.request_budget;
-        cli.retries = params.retries;
-        cli.delay = params.delay;
+        cli.http.proxy = params.proxy;
+        cli.http.rate_limit = params.rate_limit;
+        cli.http.jitter = params.jitter;
+        cli.http.timeout = params.timeout;
+        cli.detection.max_duration = params.max_duration;
+        cli.detection.request_budget = params.request_budget;
+        cli.http.retries = params.retries;
+        cli.http.delay = params.delay;
         if let Some(v) = params.headers {
-            cli.headers = v;
+            cli.http.headers = v;
         }
-        cli.cookies = params.cookies;
-        cli.dbms = params.dbms;
-        cli.extract = params.extract.unwrap_or(false);
-        cli.dbs = params.dbs.unwrap_or(false);
-        cli.tables = params.tables.unwrap_or(false);
-        cli.columns = params.columns.unwrap_or(false);
-        cli.dump = params.dump.unwrap_or(false);
-        cli.banner = params.banner.unwrap_or(false);
-        cli.current_user = params.current_user.unwrap_or(false);
-        cli.current_db = params.current_db.unwrap_or(false);
-        cli.hostname = params.hostname.unwrap_or(false);
-        cli.db = params.db;
-        cli.table = params.table;
-        cli.column = params.column;
-        cli.start = params.start;
-        cli.stop = params.stop;
-        cli.count = params.count.unwrap_or(false);
-        cli.output = params.output;
-        cli.oob_domain = params.oob_domain;
-        cli.oob_poll_url = params.oob_poll_url;
+        cli.http.cookies = params.cookies;
+        cli.detection.dbms = params.dbms;
+        cli.enumeration.extract = params.extract.unwrap_or(false);
+        cli.enumeration.dbs = params.dbs.unwrap_or(false);
+        cli.enumeration.tables = params.tables.unwrap_or(false);
+        cli.enumeration.columns = params.columns.unwrap_or(false);
+        cli.enumeration.dump = params.dump.unwrap_or(false);
+        cli.enumeration.banner = params.banner.unwrap_or(false);
+        cli.enumeration.current_user = params.current_user.unwrap_or(false);
+        cli.enumeration.current_db = params.current_db.unwrap_or(false);
+        cli.enumeration.hostname = params.hostname.unwrap_or(false);
+        cli.enumeration.db = params.db;
+        cli.enumeration.table = params.table;
+        cli.enumeration.column = params.column;
+        cli.enumeration.start = params.start;
+        cli.enumeration.stop = params.stop;
+        cli.enumeration.count = params.count.unwrap_or(false);
+        cli.output_opts.output = params.output;
+        cli.detection.oob_domain = params.oob_domain;
+        cli.detection.oob_poll_url = params.oob_poll_url;
         if let Some(v) = params.oob_wait_secs {
-            cli.oob_wait_secs = Some(v);
+            cli.detection.oob_wait_secs = Some(v);
         }
-        cli.hpp = params.hpp.unwrap_or(false);
-        cli.chunked = params.chunked.unwrap_or(false);
-        cli.allow_private = params.allow_private.unwrap_or(false);
-        cli.no_redact = params.no_redact.unwrap_or(false);
+        cli.evasion.hpp = params.hpp.unwrap_or(false);
+        cli.evasion.chunked = params.chunked.unwrap_or(false);
+        cli.http.allow_private = params.allow_private.unwrap_or(false);
+        cli.http.max_redirects = params.max_redirects;
+        cli.output_opts.no_redact = params.no_redact.unwrap_or(false);
         cli
     }
 
@@ -289,14 +304,14 @@ impl InjektServer {
         cookies: Option<String>,
         allow_private: Option<bool>,
     ) {
-        cli.proxy = proxy;
-        cli.rate_limit = rate_limit;
-        cli.jitter = jitter;
+        cli.http.proxy = proxy;
+        cli.http.rate_limit = rate_limit;
+        cli.http.jitter = jitter;
         if let Some(v) = headers {
-            cli.headers = v;
+            cli.http.headers = v;
         }
-        cli.cookies = cookies;
-        cli.allow_private = allow_private.unwrap_or(false);
+        cli.http.cookies = cookies;
+        cli.http.allow_private = allow_private.unwrap_or(false);
     }
 
     fn build_recon_crawl(params: ReconCrawlParams) -> (Cli, ReconCrawlArgs) {
@@ -314,11 +329,12 @@ impl InjektServer {
             command: ReconCommands::Crawl(args.clone()),
         }));
         if let Some(v) = params.threads {
-            cli.threads = Some(v);
+            cli.detection.threads = Some(v);
         }
-        cli.timeout = params.timeout;
-        cli.retries = params.retries;
-        cli.delay = params.delay;
+        cli.http.timeout = params.timeout;
+        cli.http.retries = params.retries;
+        cli.http.delay = params.delay;
+        cli.http.max_redirects = params.max_redirects;
         Self::apply_common_network_opts(
             &mut cli,
             params.proxy,
@@ -349,57 +365,58 @@ impl InjektServer {
             command: ReconCommands::Scan(args.clone()),
         }));
         if let Some(v) = params.threads {
-            cli.threads = Some(v);
+            cli.detection.threads = Some(v);
         }
         if let Some(v) = params.techniques {
-            cli.techniques = v;
+            cli.detection.techniques = v;
         }
         if let Some(v) = params.params {
-            cli.params = v;
+            cli.detection.params = v;
         }
-        cli.data = params.data;
-        cli.prefix = params.prefix;
-        cli.suffix = params.suffix;
-        cli.safe_chars = params.safe_chars;
-        cli.skip_urlencode = params.skip_urlencode.unwrap_or(false);
-        cli.string = params.string;
-        cli.not_string = params.not_string;
-        cli.code = params.code;
-        cli.text_only = params.text_only.unwrap_or(false);
-        cli.fetch_using = params.fetch_using;
+        cli.detection.data = params.data;
+        cli.evasion.prefix = params.prefix;
+        cli.evasion.suffix = params.suffix;
+        cli.evasion.safe_chars = params.safe_chars;
+        cli.evasion.skip_urlencode = params.skip_urlencode.unwrap_or(false);
+        cli.detection.string = params.string;
+        cli.detection.not_string = params.not_string;
+        cli.detection.code = params.code;
+        cli.detection.text_only = params.text_only.unwrap_or(false);
+        cli.detection.fetch_using = params.fetch_using;
         if let Some(v) = params.tamper {
-            cli.tamper = v;
+            cli.detection.tamper = v;
         }
-        cli.dbms = params.dbms;
-        cli.extract = params.extract.unwrap_or(false);
-        cli.dbs = params.dbs.unwrap_or(false);
-        cli.tables = params.tables.unwrap_or(false);
-        cli.columns = params.columns.unwrap_or(false);
-        cli.dump = params.dump.unwrap_or(false);
-        cli.banner = params.banner.unwrap_or(false);
-        cli.current_user = params.current_user.unwrap_or(false);
-        cli.current_db = params.current_db.unwrap_or(false);
-        cli.hostname = params.hostname.unwrap_or(false);
-        cli.db = params.db;
-        cli.table = params.table;
-        cli.column = params.column;
-        cli.start = params.start;
-        cli.stop = params.stop;
-        cli.count = params.count.unwrap_or(false);
-        cli.output = params.output;
-        cli.oob_domain = params.oob_domain;
-        cli.oob_poll_url = params.oob_poll_url;
+        cli.detection.dbms = params.dbms;
+        cli.enumeration.extract = params.extract.unwrap_or(false);
+        cli.enumeration.dbs = params.dbs.unwrap_or(false);
+        cli.enumeration.tables = params.tables.unwrap_or(false);
+        cli.enumeration.columns = params.columns.unwrap_or(false);
+        cli.enumeration.dump = params.dump.unwrap_or(false);
+        cli.enumeration.banner = params.banner.unwrap_or(false);
+        cli.enumeration.current_user = params.current_user.unwrap_or(false);
+        cli.enumeration.current_db = params.current_db.unwrap_or(false);
+        cli.enumeration.hostname = params.hostname.unwrap_or(false);
+        cli.enumeration.db = params.db;
+        cli.enumeration.table = params.table;
+        cli.enumeration.column = params.column;
+        cli.enumeration.start = params.start;
+        cli.enumeration.stop = params.stop;
+        cli.enumeration.count = params.count.unwrap_or(false);
+        cli.output_opts.output = params.output;
+        cli.detection.oob_domain = params.oob_domain;
+        cli.detection.oob_poll_url = params.oob_poll_url;
         if let Some(v) = params.oob_wait_secs {
-            cli.oob_wait_secs = Some(v);
+            cli.detection.oob_wait_secs = Some(v);
         }
-        cli.hpp = params.hpp.unwrap_or(false);
-        cli.chunked = params.chunked.unwrap_or(false);
-        cli.no_redact = params.no_redact.unwrap_or(false);
-        cli.timeout = params.timeout;
-        cli.max_duration = params.max_duration;
-        cli.request_budget = params.request_budget;
-        cli.retries = params.retries;
-        cli.delay = params.delay;
+        cli.evasion.hpp = params.hpp.unwrap_or(false);
+        cli.evasion.chunked = params.chunked.unwrap_or(false);
+        cli.output_opts.no_redact = params.no_redact.unwrap_or(false);
+        cli.http.timeout = params.timeout;
+        cli.detection.max_duration = params.max_duration;
+        cli.detection.request_budget = params.request_budget;
+        cli.http.retries = params.retries;
+        cli.http.delay = params.delay;
+        cli.http.max_redirects = params.max_redirects;
         Self::apply_common_network_opts(
             &mut cli,
             params.proxy,
@@ -430,7 +447,7 @@ impl InjektServer {
             ));
         }
         let cli = Self::build_scan_cli(params);
-        Self::warn_no_redact(cli.no_redact);
+        Self::warn_no_redact(cli.output_opts.no_redact);
         // `run_scan` returns an already-scrubbed `JsonReport` (see
         // `cli::commands::scan`), so inline JSON never carries raw secrets.
         let result = scan::run_scan(&cli, self.cancel.clone())
@@ -440,7 +457,7 @@ impl InjektServer {
         let json = serde_json::to_value(&result.report)
             .map_err(|e| ErrorData::internal_error(format!("serialization failed: {e}"), None))?;
 
-        if let Some(out) = &cli.output {
+        if let Some(out) = &cli.output_opts.output {
             let path = Self::validate_output_path(out)?;
             let pretty = serde_json::to_string_pretty(&result.report).map_err(|e| {
                 ErrorData::internal_error(format!("serialization failed: {e}"), None)
@@ -483,7 +500,7 @@ impl InjektServer {
             ));
         }
         let (cli, args) = Self::build_recon_scan(params);
-        Self::warn_no_redact(cli.no_redact);
+        Self::warn_no_redact(cli.output_opts.no_redact);
         let result = recon::run_scan(&cli, self.cancel.clone(), &args)
             .await
             .map_err(|e| ErrorData::internal_error(format!("recon scan failed: {e}"), None))?;
@@ -491,7 +508,7 @@ impl InjektServer {
         let json = serde_json::to_value(&result)
             .map_err(|e| ErrorData::internal_error(format!("serialization failed: {e}"), None))?;
 
-        if let Some(out) = &cli.output {
+        if let Some(out) = &cli.output_opts.output {
             let path = Self::validate_output_path(out)?;
             let pretty = serde_json::to_string_pretty(&result).map_err(|e| {
                 ErrorData::internal_error(format!("serialization failed: {e}"), None)
@@ -527,27 +544,30 @@ impl InjektServer {
         // et n'appelle jamais `send` (plan lexical + contexte passif + scores).
         let target = params.target.clone();
         let mut cli = Self::base_cli();
-        cli.dry_run = true;
-        cli.techniques = params.techniques.unwrap_or_default();
-        cli.params = params.params.unwrap_or_default();
-        cli.data = params.data;
-        cli.dbms = params.dbms;
-        cli.seed = params.seed;
+        cli.output_opts.dry_run = true;
+        cli.detection.techniques = params.techniques.unwrap_or_default();
+        cli.detection.params = params.params.unwrap_or_default();
+        cli.detection.data = params.data;
+        cli.detection.dbms = params.dbms;
+        cli.detection.seed = params.seed;
         if let Some(level) = params.level {
-            cli.level = Some(level.clamp(1, 5));
+            cli.detection.level = Some(level.clamp(1, 5));
         }
         if let Some(threads) = params.threads {
-            cli.threads = Some(threads);
+            cli.detection.threads = Some(threads);
         }
-        cli.headers = params.headers.unwrap_or_default();
-        cli.cookies.clone_from(&params.cookies);
-        cli.allow_private = params.allow_private.unwrap_or(false);
-        cli.no_redact = params.no_redact.unwrap_or(false);
-        Self::warn_no_redact(cli.no_redact);
-        let cfg = scan::engine_config(&cli);
+        cli.http.headers = params.headers.unwrap_or_default();
+        cli.http.cookies.clone_from(&params.cookies);
+        cli.http.allow_private = params.allow_private.unwrap_or(false);
+        cli.output_opts.no_redact = params.no_redact.unwrap_or(false);
+        Self::warn_no_redact(cli.output_opts.no_redact);
+        let cfg = crate::cli::engine_cfg::build_engine_config(
+            &cli,
+            crate::cli::engine_cfg::EnumGate::Passthrough,
+        );
         let plan = crate::cli::plan::build_plan(&target, &cfg)
             .map_err(|e| ErrorData::invalid_params(e, None))?;
-        let scrubber = crate::session::scrubber::Scrubber::new(cli.no_redact);
+        let scrubber = crate::session::scrubber::Scrubber::new(cli.output_opts.no_redact);
         let scrubbed = plan.scrubbed(&scrubber);
         let mut json = serde_json::to_value(&scrubbed)
             .map_err(|e| ErrorData::internal_error(format!("serialization failed: {e}"), None))?;
@@ -682,7 +702,7 @@ pub struct ScanParams {
     /// Request timeout in seconds (default: 30)
     pub timeout: Option<u64>,
     /// Global detection time budget in seconds (OPT-IN, None = unlimited):
-    /// detection stops cooperatively once exceeded (clean Done, no error)
+    /// detection stops cooperatively once exceeded (Inconclusive without findings, no error)
     pub max_duration: Option<u64>,
     /// Global request budget (OPT-IN calibration, None = unlimited):
     /// detection stops cooperatively once total `request_count` reaches N
@@ -744,6 +764,8 @@ pub struct ScanParams {
     pub chunked: Option<bool>,
     /// Allow private/loopback targets (lab only, default: false)
     pub allow_private: Option<bool>,
+    /// Max redirects followed per request (default: 5, 0 = do not follow)
+    pub max_redirects: Option<u8>,
     /// Disable redaction in output (local debugging only)
     pub no_redact: Option<bool>,
 }
@@ -787,6 +809,8 @@ pub struct ReconCrawlParams {
     pub cookies: Option<String>,
     /// Allow private/loopback targets (lab only, default: false)
     pub allow_private: Option<bool>,
+    /// Max redirects followed per request (default: 5, 0 = do not follow)
+    pub max_redirects: Option<u8>,
 }
 
 /// Parameters for the `recon_scan` tool (crawl + test discovered parameters).
@@ -907,6 +931,8 @@ pub struct ReconScanParams {
     pub chunked: Option<bool>,
     /// Allow private/loopback targets (lab only, default: false)
     pub allow_private: Option<bool>,
+    /// Max redirects followed per request (default: 5, 0 = do not follow)
+    pub max_redirects: Option<u8>,
     /// Disable redaction in output (local debugging only)
     pub no_redact: Option<bool>,
 }

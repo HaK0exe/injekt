@@ -11,7 +11,7 @@ JSON-RPC channel and is never polluted.
 
 | Tool | Description |
 |------|-------------|
-| `scan` | Scan a target URL for SQL injection. Near-full CLI flag mapping (techniques, fetch-using, payload prefix/suffix/encoding opts, matchers, tampers, proxy, rate-limit, jitter (**ms**, `"750,250"`), headers, cookies, dbms, extract, dbs/tables/columns/dump, banner/current-user/current-db/hostname, db/table/column/start/stop/count, output, oob, hpp, chunked, allow-private, no-redact). See [CLI ↔ MCP parity](../DOCUMENTATION.md#mcp-vs-cli-parity-verified-against-srcmcptoolsrs) for the gaps. |
+| `scan` | Scan a target URL for SQL injection. Near-full CLI flag mapping (techniques, fetch-using, payload prefix/suffix/encoding opts, matchers, tampers, proxy, rate-limit, jitter (**ms**, `"750,250"`), headers, cookies, dbms, extract, dbs/tables/columns/dump, banner/current-user/current-db/hostname, db/table/column/start/stop/count, output, oob, hpp, chunked, allow-private, max-redirects, no-redact). See [CLI ↔ MCP parity](../DOCUMENTATION.md#mcp-vs-cli-parity-verified-against-srcmcptoolsrs) for the gaps. |
 | `recon_crawl` | Crawl a target, return discovered parameters (no testing). |
 | `recon_scan` | Crawl + test each discovered parameter. |
 | `info` | Capabilities, techniques, tampers, supported DBMS. |

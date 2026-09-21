@@ -154,6 +154,13 @@ impl CookieJar {
                 }
             }
         }
+        // RFC6265 §5.3: ignore a `Secure` cookie received over an insecure
+        // scheme (storing it would let a network attacker plant a cookie
+        // later sent over https). Send-time filtering already exists; this
+        // store-time guard closes the planting vector.
+        if meta.secure && url.is_some_and(|u| u.scheme() != "https") {
+            return;
+        }
         // Domain validation if url present
         if let (Some(d), Some(u)) = (&meta.domain, url) {
             let host = u.host_str().unwrap_or("").to_ascii_lowercase();
@@ -257,5 +264,19 @@ mod tests {
             jar.header_value_for_url(Some("https://victime.com/admin"))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn secure_cookie_from_http_is_not_stored() {
+        let mut jar = CookieJar::new();
+        jar.parse_set_cookie_with_url(
+            "sess=secret; Secure",
+            Some(&url::Url::parse("http://victime.com/admin").unwrap()),
+        );
+        assert!(
+            jar.header_value_for_url(Some("https://victime.com/admin"))
+                .is_none()
+        );
+        assert!(jar.get("sess").is_none());
     }
 }

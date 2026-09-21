@@ -25,12 +25,14 @@ fn baseline_page() -> ResponseTemplate {
 fn engine_with_oob(
     oob_domain: Option<String>,
     oob_poll_url: Option<String>,
+    ignore_codes: Vec<u16>,
 ) -> (Engine, CancellationToken) {
     let client = test_client();
     let mut cfg = EngineConfig::default();
     cfg.budget.threads = 1;
     cfg.techniques = vec!["oob".to_owned()];
     cfg.net.allow_private = true;
+    cfg.net.ignore_codes = ignore_codes;
     cfg.no_redact = true;
     cfg.enumeration.extract = false;
     cfg.oob.oob_domain = oob_domain;
@@ -49,15 +51,27 @@ async fn oob_confirmed_when_poll_reports_seen() {
         .mount(&target)
         .await;
 
-    // Collaborator shim: always confirms (simulates DB egress observed).
+    // Collaborator shim: confirms only the polled token (echoes it back
+    // with seen:true), like a token-attributing backend.
     let poll = MockServer::start().await;
     Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"seen":true}"#))
+        .respond_with(|req: &wiremock::Request| {
+            let token = req
+                .url
+                .query_pairs()
+                .find_map(|(k, v)| (k == "token").then(|| v.into_owned()))
+                .unwrap_or_default();
+            ResponseTemplate::new(200)
+                .set_body_string(format!(r#"{{"seen":true,"token":"{token}"}}"#))
+        })
         .mount(&poll)
         .await;
 
-    let (engine, _cancel) =
-        engine_with_oob(Some("collab.example.com".to_owned()), Some(poll.uri()));
+    let (engine, _cancel) = engine_with_oob(
+        Some("collab.example.com".to_owned()),
+        Some(poll.uri()),
+        vec![],
+    );
     let url = format!("{}/?id=1", target.uri());
     let state = engine.run(&url).await.expect("engine run");
     assert_eq!(state, injekt::engine::EngineState::Done);
@@ -81,6 +95,83 @@ async fn oob_confirmed_when_poll_reports_seen() {
 }
 
 #[tokio::test]
+async fn oob_no_finding_when_poll_reports_seen_without_token() {
+    // Bare `{"seen":true}` that never echoes the token (e.g. a stale
+    // callback for another token in a shared collaborator inbox) must NOT
+    // confirm — cross-token false-positive guard.
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(baseline_page())
+        .mount(&target)
+        .await;
+
+    let poll = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"seen":true}"#))
+        .mount(&poll)
+        .await;
+
+    let (engine, _cancel) = engine_with_oob(
+        Some("collab.example.com".to_owned()),
+        Some(poll.uri()),
+        vec![],
+    );
+    let url = format!("{}/?id=1", target.uri());
+    let _ = engine.run(&url).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.technique != injekt::session::state::TechniqueKind::Oob),
+        "bare seen:true without token must not confirm, got {findings:?}"
+    );
+}
+
+#[tokio::test]
+async fn oob_callback_overrides_ignored_last_status() {
+    // `--ignore-code 200` + token-verified callback: the external proof
+    // outranks the response veto (OOB executes async and returns a
+    // baseline-like page). Without the override this was a systematic
+    // false negative (veto on `last_status` after `callback_seen`).
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(baseline_page())
+        .mount(&target)
+        .await;
+
+    let poll = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(|req: &wiremock::Request| {
+            let token = req
+                .url
+                .query_pairs()
+                .find_map(|(k, v)| (k == "token").then(|| v.into_owned()))
+                .unwrap_or_default();
+            ResponseTemplate::new(200)
+                .set_body_string(format!(r#"{{"seen":true,"token":"{token}"}}"#))
+        })
+        .mount(&poll)
+        .await;
+
+    let (engine, _cancel) = engine_with_oob(
+        Some("collab.example.com".to_owned()),
+        Some(poll.uri()),
+        vec![200],
+    );
+    let url = format!("{}/?id=1", target.uri());
+    let state = engine.run(&url).await.expect("engine run");
+    assert_eq!(state, injekt::engine::EngineState::Done);
+
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.technique == injekt::session::state::TechniqueKind::Oob),
+        "token-verified callback must survive --ignore-code veto, got {findings:?}"
+    );
+}
+
+#[tokio::test]
 async fn oob_no_finding_when_no_callback() {
     let target = MockServer::start().await;
     Mock::given(method("GET"))
@@ -96,8 +187,11 @@ async fn oob_no_finding_when_no_callback() {
         .mount(&poll)
         .await;
 
-    let (engine, _cancel) =
-        engine_with_oob(Some("collab.example.com".to_owned()), Some(poll.uri()));
+    let (engine, _cancel) = engine_with_oob(
+        Some("collab.example.com".to_owned()),
+        Some(poll.uri()),
+        vec![],
+    );
     let url = format!("{}/?id=1", target.uri());
     let _ = engine.run(&url).await.expect("engine run");
     let findings = engine.state_handle().read().await.findings().to_vec();
@@ -117,7 +211,7 @@ async fn oob_skipped_without_domain() {
         .mount(&target)
         .await;
 
-    let (engine, _cancel) = engine_with_oob(None, None);
+    let (engine, _cancel) = engine_with_oob(None, None, vec![]);
     let url = format!("{}/?id=1", target.uri());
     let state = engine.run(&url).await.expect("engine run");
     assert_eq!(state, injekt::engine::EngineState::Done);
@@ -136,11 +230,98 @@ async fn oob_skipped_with_invalid_domain() {
         .mount(&target)
         .await;
 
-    let (engine, _cancel) = engine_with_oob(Some("http://not-a-domain/path".to_owned()), None);
+    let (engine, _cancel) =
+        engine_with_oob(Some("http://not-a-domain/path".to_owned()), None, vec![]);
     let url = format!("{}/?id=1", target.uri());
     let _ = engine.run(&url).await.expect("engine run");
     let findings = engine.state_handle().read().await.findings().to_vec();
     assert!(findings.is_empty(), "invalid oob domain must be skipped");
+}
+
+#[tokio::test]
+async fn oob_callback_attributes_triggering_variant() {
+    // OOB-2: per-payload tokens + send→wait→poll per variant with early-break.
+    // Stateful shim confirms only the 2nd distinct polled token: the finding
+    // must attribute THAT token (evidence contains 2nd, not 1st) and the
+    // engine must stop there (exactly 2 distincts polled).
+    use std::sync::{Arc, Mutex};
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(baseline_page())
+        .mount(&target)
+        .await;
+
+    let seen_order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_clone = seen_order.clone();
+    let poll = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(move |req: &wiremock::Request| {
+            let token = req
+                .url
+                .query_pairs()
+                .find_map(|(k, v)| (k == "token").then(|| v.into_owned()))
+                .unwrap_or_default();
+            if token.is_empty() {
+                return ResponseTemplate::new(200).set_body_string(r#"{"seen":false}"#.to_owned());
+            }
+            let distinct_len = {
+                let mut guard = seen_clone.lock().unwrap();
+                if !guard.contains(&token) {
+                    guard.push(token.clone());
+                }
+                guard.len()
+            };
+            if distinct_len == 2 {
+                let second = seen_clone
+                    .lock()
+                    .unwrap()
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_default();
+                if token == second {
+                    return ResponseTemplate::new(200)
+                        .set_body_string(format!(r#"{{"seen":true,"token":"{token}"}}"#));
+                }
+            }
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"seen":false,"interactions":[]}"#.to_owned())
+        })
+        .mount(&poll)
+        .await;
+
+    let (engine, _cancel) = engine_with_oob(
+        Some("collab.example.com".to_owned()),
+        Some(poll.uri()),
+        vec![],
+    );
+    let url = format!("{}/?id=1", target.uri());
+    let state = engine.run(&url).await.expect("engine run");
+    assert_eq!(state, injekt::engine::EngineState::Done);
+
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    let oob = findings
+        .iter()
+        .find(|f| f.technique == injekt::session::state::TechniqueKind::Oob)
+        .expect("oob finding present on 2nd-token callback");
+
+    let seen = seen_order.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        2,
+        "early-break must poll exactly 2 distinct tokens, got {seen:?}"
+    );
+    let first = &seen[0];
+    let second = &seen[1];
+    assert!(
+        oob.evidence.contains(second),
+        "evidence must attribute triggering (2nd) token {second}, got {}",
+        oob.evidence
+    );
+    assert!(
+        !oob.evidence.contains(&format!("token={first}")),
+        "evidence must not attribute 1st token {first}, got {}",
+        oob.evidence
+    );
 }
 
 #[tokio::test]
@@ -153,7 +334,7 @@ async fn oob_manual_mode_sends_probes_without_finding() {
         .mount(&target)
         .await;
 
-    let (engine, _cancel) = engine_with_oob(Some("collab.example.com".to_owned()), None);
+    let (engine, _cancel) = engine_with_oob(Some("collab.example.com".to_owned()), None, vec![]);
     let url = format!("{}/?id=1", target.uri());
     let _ = engine.run(&url).await.expect("engine run");
     let findings = engine.state_handle().read().await.findings().to_vec();

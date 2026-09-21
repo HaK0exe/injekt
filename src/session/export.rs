@@ -102,6 +102,23 @@ impl Zeroize for Snapshot {
 /// still decrypt — see `legacy_v1_snapshot_still_deserializes`).
 pub const EXPORT_BLOB_VERSION: u8 = 3;
 
+/// Minimum passphrase length enforced by the library (the CLI also enforces
+/// it interactively): a shorter passphrase derives a dictionary-breakable
+/// key and a false sense of security. Enforced on encrypt only — decrypt
+/// stays permissive so pre-guard blobs are never locked out (a wrong/short
+/// passphrase simply fails authentication there).
+pub const MIN_PASSPHRASE_LEN: usize = 12;
+
+/// KDF identifier written by [`EncryptedExport::encrypt_to_file`].
+/// `decrypt_from_file` accepts `None` (v1/v2 legacy) or exactly this value;
+/// anything else is rejected instead of being silently ignored (no quiet
+/// downgrade to weaker parameters).
+pub const EXPORT_KDF_ID: &str = "argon2id-m65536-t3-p1-v19";
+
+/// Salt length (bytes) written on encrypt; shorter salts are rejected on
+/// decrypt (a short/empty salt collapses Argon2id strength).
+pub const EXPORT_SALT_LEN: usize = 16;
+
 /// Encrypted export (OPT-IN only). Snapshot XChaCha20-Poly1305, key derived Argon2id.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -111,13 +128,20 @@ impl EncryptedExport {
     /// Encrypt session state to file. Key derived via Argon2id explicit params (2026 OWASP).
     ///
     /// # Errors
-    /// Returns an error if key derivation, encryption, serialization, or the file
-    /// write fails (including when `path` already exists).
+    /// Returns an error if the passphrase is shorter than
+    /// [`MIN_PASSPHRASE_LEN`], or if key derivation, encryption,
+    /// serialization, or the file write fails (including when `path` already
+    /// exists).
     pub fn encrypt_to_file(
         state: &SessionState,
         passphrase: &SecretString,
         path: &str,
     ) -> Result<(), ExportError> {
+        if passphrase.expose_secret().len() < MIN_PASSPHRASE_LEN {
+            return Err(ExportError::Crypto(format!(
+                "passphrase too short (min {MIN_PASSPHRASE_LEN} chars)"
+            )));
+        }
         let mut snapshot = Snapshot {
             findings: state.findings().to_vec(),
             extracted: state.extracted_exposed(),
@@ -155,7 +179,7 @@ impl EncryptedExport {
             nonce_b64: BASE64.encode(nonce_bytes),
             ciphertext_b64: BASE64.encode(ciphertext),
             v: EXPORT_BLOB_VERSION,
-            kdf: Some("argon2id-m65536-t3-p1-v19".to_owned()),
+            kdf: Some(EXPORT_KDF_ID.to_owned()),
         };
         let out = serde_json::to_vec_pretty(&blob)
             .map_err(|e| ExportError::Serialization(e.to_string()))?;
@@ -176,13 +200,19 @@ impl EncryptedExport {
 
     /// Decrypt file to JSON bytes (caller reconstructs `SessionState`).
     ///
+    /// The plaintext is returned in a [`Zeroizing`] wrapper so the cleartext
+    /// snapshot is wiped on drop instead of lingering in RAM (heap dumps,
+    /// core files). Callers needing a slice can rely on deref coercion to
+    /// `&[u8]`; never call `.to_vec()` out of the wrapper.
+    ///
     /// # Errors
-    /// Returns an error if the file can't be read, its blob version is unsupported,
-    /// or decryption fails (wrong passphrase or corrupted data).
+    /// Returns an error if the file can't be read, its blob version or KDF
+    /// identifier is unsupported, the salt/nonce/ciphertext envelope is
+    /// malformed, or decryption fails (wrong passphrase or corrupted data).
     pub fn decrypt_from_file(
         passphrase: &SecretString,
         path: &str,
-    ) -> Result<Vec<u8>, ExportError> {
+    ) -> Result<Zeroizing<Vec<u8>>, ExportError> {
         let data = std::fs::read(path).map_err(|e| ExportError::Io(e.to_string()))?;
         let blob: EncryptedBlob =
             serde_json::from_slice(&data).map_err(|e| ExportError::Serialization(e.to_string()))?;
@@ -191,9 +221,15 @@ impl EncryptedExport {
                 "unsupported blob version".to_owned(),
             ));
         }
+        if blob.kdf.as_deref().is_some_and(|kdf| kdf != EXPORT_KDF_ID) {
+            return Err(ExportError::Crypto("unsupported KDF".to_owned()));
+        }
         let salt = BASE64
             .decode(&blob.salt_b64)
             .map_err(|e| ExportError::Serialization(e.to_string()))?;
+        if salt.len() < EXPORT_SALT_LEN {
+            return Err(ExportError::Crypto("invalid salt length".to_owned()));
+        }
         let nonce_bytes = BASE64
             .decode(&blob.nonce_b64)
             .map_err(|e| ExportError::Serialization(e.to_string()))?;
@@ -203,6 +239,9 @@ impl EncryptedExport {
         let ciphertext = BASE64
             .decode(&blob.ciphertext_b64)
             .map_err(|e| ExportError::Serialization(e.to_string()))?;
+        if ciphertext.is_empty() {
+            return Err(ExportError::Crypto("empty ciphertext".to_owned()));
+        }
 
         let key = Zeroizing::new(Self::derive_key_argon2id(passphrase, &salt)?);
         let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
@@ -213,7 +252,7 @@ impl EncryptedExport {
                 .decrypt(nonce, ciphertext.as_ref())
                 .map_err(|e| ExportError::Crypto(e.to_string()))?,
         );
-        Ok(plaintext.to_vec())
+        Ok(plaintext)
     }
 
     fn derive_key_argon2id(
@@ -424,6 +463,42 @@ mod tests {
         let path = temp_path();
         EncryptedExport::encrypt_to_file(&state, &passphrase, &path).unwrap();
         assert!(EncryptedExport::decrypt_from_file(&wrong, &path).is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn short_passphrase_rejected_in_lib() {
+        let state = test_state();
+        for short in ["", "1234567", "short-pw"] {
+            let err =
+                EncryptedExport::encrypt_to_file(&state, &SecretString::from(short), &temp_path())
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("passphrase too short"),
+                "unexpected error for {short:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_salt_and_unknown_kdf_rejected() {
+        let state = test_state();
+        let passphrase = SecretString::from("passphrase123456");
+        let path = temp_path();
+        EncryptedExport::encrypt_to_file(&state, &passphrase, &path).unwrap();
+        let data = fs::read(&path).unwrap();
+        let mut blob: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        // Empty salt collapses Argon2id strength: refuse instead of deriving.
+        blob["salt_b64"] = serde_json::Value::from(String::new());
+        fs::write(&path, serde_json::to_vec(&blob).unwrap()).unwrap();
+        let err = EncryptedExport::decrypt_from_file(&passphrase, &path).unwrap_err();
+        assert!(err.to_string().contains("salt"), "unexpected error: {err}");
+        // Unknown KDF: refuse instead of silently ignoring the field.
+        let mut blob: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        blob["kdf"] = serde_json::Value::from("scrypt-xyz");
+        fs::write(&path, serde_json::to_vec(&blob).unwrap()).unwrap();
+        let err = EncryptedExport::decrypt_from_file(&passphrase, &path).unwrap_err();
+        assert!(err.to_string().contains("KDF"), "unexpected error: {err}");
         let _ = fs::remove_file(&path);
     }
 }

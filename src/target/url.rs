@@ -23,6 +23,9 @@ pub enum UrlError {
 impl TargetUrl {
     /// Parse strictly, normalize, reject private IPs unless `allow_private`.
     ///
+    /// Bare hosts without a scheme (`example.com`, `example.com:8080/a?id=1`)
+    /// default to `https://` (same rule as the recon crawler).
+    ///
     /// ```rust
     /// use injekt::target::url::TargetUrl;
     /// let t = TargetUrl::parse("http://example.com/?id=1", false).unwrap();
@@ -35,7 +38,20 @@ impl TargetUrl {
     /// `allow_private` is `false`.
     #[track_caller]
     pub fn parse(input: &str, allow_private: bool) -> Result<Self, UrlError> {
-        let url = Url::parse(input).map_err(|e| UrlError::Invalid(e.to_string()))?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err(UrlError::Invalid("empty url".to_owned()));
+        }
+        // Bare hosts (`example.com`, `example.com:8080/path?id=1`) are
+        // documented as valid targets (auto/recon accept them): default to
+        // `https://` like the recon crawler does. Full URLs keep their scheme
+        // so `ftp://` is still rejected as `Scheme`, not silently rewritten.
+        let with_scheme = if trimmed.contains("://") {
+            trimmed.to_owned()
+        } else {
+            format!("https://{trimmed}")
+        };
+        let url = Url::parse(&with_scheme).map_err(|e| UrlError::Invalid(e.to_string()))?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err(UrlError::Scheme(url.scheme().to_owned()));
         }
@@ -338,6 +354,19 @@ mod tests {
     fn parse_valid() {
         let u = TargetUrl::parse("https://example.com/search?q=hello&id=1", true).unwrap();
         assert_eq!(u.query_params().len(), 2);
+    }
+
+    #[test]
+    fn bare_host_defaults_to_https() {
+        // `auto --target example.com` must not fail with
+        // "relative URL without a base".
+        let u = TargetUrl::parse("example.com", true).unwrap();
+        assert_eq!(u.as_str(), "https://example.com/");
+        let u = TargetUrl::parse("example.com:8080/a?id=1", true).unwrap();
+        assert!(u.as_str().starts_with("https://example.com:8080/"));
+        // Private bare hosts still rejected without the lab flag.
+        assert!(TargetUrl::parse("127.0.0.1", false).is_err());
+        assert!(TargetUrl::parse("127.0.0.1", true).is_ok());
     }
 
     #[test]

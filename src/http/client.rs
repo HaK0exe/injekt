@@ -425,6 +425,23 @@ impl RequestSpec {
     }
 }
 
+/// Pure send timing for a class-aware request (P0-VAGUE-1).
+///
+/// `resp` is the final response (after redirects/retries, same as
+/// [`HttpClient::send_with_retry_for_class`]). `elapsed_send` is the wall
+/// time of **only** the last successful `timeout(class_timeout, req.send())`
+/// — never a sum, never jitter / rate-limiter / sleeps / backoff /
+/// `Retry-After`. `attempts` counts every `req.send()` tentative across
+/// retries and redirect hops; `retried` is `attempts > 1`.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct TimedResponse {
+    pub resp: reqwest::Response,
+    pub elapsed_send: Duration,
+    pub attempts: u32,
+    pub retried: bool,
+}
+
 impl HttpClient {
     #[must_use]
     pub fn builder() -> ClientBuilder<NeedTimeout> {
@@ -539,6 +556,32 @@ impl HttpClient {
         class: RequestClass,
         cancel: &CancellationToken,
     ) -> Result<reqwest::Response, ClientError> {
+        Ok(self
+            .send_with_retry_timed_for_class(spec, class, cancel)
+            .await?
+            .resp)
+    }
+
+    /// Class-aware timed send (P0-VAGUE-1): same behaviour as
+    /// [`Self::send_with_retry_for_class`], plus the pure send timing.
+    ///
+    /// `elapsed_send` is the wall time of **only** the last successful
+    /// `timeout(class_timeout, req.send())` — never a sum, never jitter /
+    /// rate-limiter / sleeps / backoff / `Retry-After`. `attempts` counts
+    /// every `req.send()` tentative across retries and redirect hops;
+    /// `retried` is `attempts > 1`.
+    ///
+    /// # Errors
+    /// Returns an error if the request is cancelled, times out, targets a
+    /// private host without `allow_private`, exceeds the redirect limit, or
+    /// fails after retries.
+    #[allow(clippy::too_many_lines)] // P0-VAGUE-1: instrumented copy of the retry path, keep identical.
+    pub async fn send_with_retry_timed_for_class(
+        &self,
+        spec: RequestSpec,
+        class: RequestClass,
+        cancel: &CancellationToken,
+    ) -> Result<TimedResponse, ClientError> {
         // Isolated time pool: at most `TIME_POOL_SLOTS` slow probes in
         // flight. Non-time classes skip this entirely (no starvation).
         let _time_permit = if matches!(class, RequestClass::Time) {
@@ -590,17 +633,33 @@ impl HttpClient {
         // Operator headers go to the origin; cross-host hops drop them.
         let mut include_user = true;
         let mut hops = 0_usize;
+        // Pure-send instrumentation: total `req.send()` tentatives across
+        // hops/retries, and the last successful send's wall time only.
+        let mut attempts = 0_u32;
+        let mut elapsed_send: Duration;
         loop {
-            let resp = self
-                .send_single_with_retry(&current, class, include_user, cancel)
+            let (resp, hop_elapsed, hop_attempts) = self
+                .send_single_with_retry_timed(&current, class, include_user, cancel)
                 .await?;
+            attempts = attempts.saturating_add(hop_attempts);
+            elapsed_send = hop_elapsed;
             let status = resp.status();
             if !is_redirect_status(status) {
-                return Ok(resp);
+                return Ok(TimedResponse {
+                    resp,
+                    elapsed_send,
+                    attempts,
+                    retried: attempts > 1,
+                });
             }
             let Some(max) = self.redirect_policy.max_hops() else {
                 // `RedirectPolicy::None`: return 3xx as-is, do not follow.
-                return Ok(resp);
+                return Ok(TimedResponse {
+                    resp,
+                    elapsed_send,
+                    attempts,
+                    retried: attempts > 1,
+                });
             };
             if hops >= max {
                 return Err(ClientError::TooManyRedirects);
@@ -611,7 +670,12 @@ impl HttpClient {
                 .and_then(|v| v.to_str().ok())
                 .map(ToOwned::to_owned);
             let Some(location) = location else {
-                return Ok(resp);
+                return Ok(TimedResponse {
+                    resp,
+                    elapsed_send,
+                    attempts,
+                    retried: attempts > 1,
+                });
             };
             // Resolve relative `Location` against the current URL; validate
             // the next hop BEFORE any connection (fail-closed).
@@ -647,22 +711,36 @@ impl HttpClient {
     /// cannot exceed the configured RPS ceiling. The per-class timeout
     /// (`boolean` 10s, `time` 15s, `oob`/default base) bounds both the send
     /// and the retry sleeps are cancellable.
-    async fn send_single_with_retry(
+    /// Single-hop timed send with retry (no redirect following).
+    /// Every retry re-acquires the rate limiter so 429/5xx/timeout storms
+    /// cannot exceed the configured RPS ceiling. The per-class timeout
+    /// (`boolean` 10s, `time` 15s, `oob`/default base) bounds the send and
+    /// the retry sleeps are cancellable. Returns the response plus the wall
+    /// time of only the last successful `timeout(class_timeout, req.send())`
+    /// and the count of `req.send()` tentatives for this hop.
+    #[allow(clippy::too_many_lines)] // P0-VAGUE-1: instrumented copy of the retry path, keep identical.
+    async fn send_single_with_retry_timed(
         &self,
         spec: &RequestSpec,
         class: RequestClass,
         include_user: bool,
         cancel: &CancellationToken,
-    ) -> Result<reqwest::Response, ClientError> {
+    ) -> Result<(reqwest::Response, Duration, u32), ClientError> {
         let class_timeout = self.timeouts.for_class(class);
         let mut attempt = 0usize;
+        let mut attempts = 0_u32;
+        let mut elapsed_send: Duration;
         loop {
             if cancel.is_cancelled() {
                 return Err(ClientError::Cancelled);
             }
             let req = self.build_request(spec, include_user).await;
 
-            // per-request timeout covers send() only; jitter/rate-limit already done
+            // per-request timeout covers send() only; jitter/rate-limit already done.
+            // `send_start` bounds only the `timeout(class_timeout, req.send())`
+            // below: jitter / rate-limiter / backoff / `Retry-After` sleeps stay
+            // outside, and only the last successful send's duration is kept.
+            let send_start = std::time::Instant::now();
             let send_fut = req.send();
             let resp_res: Result<reqwest::Response, ClientError> = tokio::select! {
                 () = cancel.cancelled() => return Err(ClientError::Cancelled),
@@ -675,6 +753,8 @@ impl HttpClient {
 
             match resp_res {
                 Ok(resp) => {
+                    attempts = attempts.saturating_add(1);
+                    elapsed_send = send_start.elapsed();
                     // Store cookies with URL scope per RFC6265
                     let url_for_cookies = spec.url.clone();
                     for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
@@ -728,9 +808,10 @@ impl HttpClient {
                         }
                         continue;
                     }
-                    return Ok(resp);
+                    return Ok((resp, elapsed_send, attempts));
                 }
                 Err(e) => {
+                    attempts = attempts.saturating_add(1);
                     let retryable = match &e {
                         ClientError::Timeout(_) => true,
                         // Idempotence-gated stale-pool EOF (PR20): `GET`/`HEAD`

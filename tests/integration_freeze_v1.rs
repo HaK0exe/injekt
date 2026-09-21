@@ -164,7 +164,7 @@ fn report_format_variants_frozen() {
     assert!(matches!(ReportFormat::default(), ReportFormat::Json));
     let cli = Cli::try_parse_from(["injekt", "scan", "--target", "https://example.com/?id=1"])
         .expect("cli parses");
-    assert!(matches!(cli.format, ReportFormat::Json));
+    assert!(matches!(cli.output_opts.format, ReportFormat::Json));
 }
 
 // ---------------------------------------------------------------------------

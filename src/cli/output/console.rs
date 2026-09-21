@@ -108,6 +108,10 @@ fn logo_lines() -> impl Iterator<Item = &'static str> {
 /// Plain (no color) when [`colors_enabled`] is `false` (`NO_COLOR`,
 /// `TERM=dumb`, pipe/CI).
 pub fn banner() {
+    // Ligne à vide d'aération : sépare la ligne de commande tapée du logo
+    // (et le tagline du résultat qui suit, via le `eprintln!()` final).
+    // Tout l'espacement vit ici, jamais dans `ascii_art.txt`.
+    eprintln!();
     if !colors_enabled() {
         for line in logo_lines() {
             eprintln!("{}", line.trim_end());

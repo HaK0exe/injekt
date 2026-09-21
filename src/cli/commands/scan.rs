@@ -1,15 +1,17 @@
 #![deny(unsafe_code)]
 
 use crate::{
-    cli::args::Cli,
+    cli::args::{Cli, ScanArgs},
     cli::client_builder::build_client,
-    cli::output::file::write_output_file_async,
+    cli::engine_cfg::{EnumGate, build_engine_config},
+    cli::knowledge::learn_and_save,
     engine::orchestrator::{Engine, EngineConfig},
     reporting::{console, json::JsonReport, render::render_report},
     session::scrubber::Scrubber,
 };
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
@@ -22,107 +24,6 @@ pub struct ScanResult {
     pub target: String,
     pub config: EngineConfig,
     pub state_handle: Arc<tokio::sync::RwLock<crate::session::state::SessionState>>,
-}
-
-/// Build engine config from CLI detection/enumeration options.
-/// Resolution honours `--profile` / config file / `INJEKT_*` via `Cli::effective_*`:
-/// explicit flags always win, presets only fill gaps (non-breaking).
-pub(crate) fn engine_config(cli: &Cli) -> EngineConfig {
-    let tampers = if cli.tamper.is_empty() {
-        Vec::new()
-    } else {
-        crate::techniques::tamper::parse_tamper_list(Some(&cli.tamper.join(",")))
-    };
-    // C13 : lecture au boot uniquement sur opt-in explicite. OFF (`None`) =
-    // aucune IO, boost 1.0 neutre, chemin byte-identique au sans-knowledge.
-    let knowledge = crate::reasoning::knowledge::load_if_enabled(
-        cli.knowledge_enabled(),
-        cli.knowledge_path.as_deref(),
-    );
-    if let Some(ks) = knowledge.as_ref() {
-        tracing::debug!(
-            entries = ks.len(),
-            enabled = true,
-            "knowledge loaded (opt-in)"
-        );
-    }
-    EngineConfig {
-        budget: crate::engine::orchestrator::BudgetConfig {
-            threads: cli.effective_threads(),
-            level: cli.effective_level(),
-            request_budget: cli.effective_request_budget(),
-            max_duration_secs: cli.effective_max_duration(),
-        },
-        evasion: crate::engine::orchestrator::EvasionConfig {
-            payload_opts: cli.payload_opts(),
-            tampers,
-            hpp: cli.hpp,
-            chunked: cli.chunked,
-        },
-        net: crate::engine::orchestrator::NetConfig {
-            allow_private: cli.allow_private,
-            remote_dns: cli.uses_remote_dns(),
-            ignore_codes: cli.ignore_codes.clone(),
-            method_override: cli.method.clone(),
-        },
-        oob: crate::engine::orchestrator::OobConfig {
-            oob_domain: cli.oob_domain.clone(),
-            oob_poll_url: cli.oob_poll_url.clone(),
-            oob_wait_secs: cli.effective_oob_wait_secs(),
-        },
-        enumeration: crate::engine::orchestrator::EnumConfig {
-            extract: cli.extract,
-            dbs: cli.dbs,
-            tables: cli.tables,
-            columns: cli.columns,
-            dump: cli.dump,
-            banner: cli.banner,
-            current_user: cli.current_user,
-            current_db: cli.current_db,
-            hostname: cli.hostname,
-            db: cli.db.clone(),
-            table: cli.table.clone(),
-            column: cli.column.clone(),
-            start: cli.start,
-            stop: cli.stop,
-            count: cli.count,
-        },
-        techniques: if !cli.techniques.is_empty() {
-            cli.techniques.clone()
-        } else if cli
-            .fetch_using
-            .as_deref()
-            .is_some_and(|v| v == "boolean" || v == "time")
-        {
-            // --fetch-using narrows the default technique set (explicit --techniques wins,
-            // otherwise explicit --fetch-using wins over config file / profile defaults).
-            match cli.fetch_using.as_deref() {
-                Some("boolean") => vec!["boolean".to_owned()],
-                Some("time") => vec!["time".to_owned()],
-                _ => cli.effective_techniques(),
-            }
-        } else {
-            cli.effective_techniques()
-        },
-        test_params: cli.params.clone(),
-        post_data: cli.data.clone(),
-        matcher: cli.matcher_config(),
-        confirm: cli.confirm,
-        no_mutation: cli.no_mutation,
-        seed: cli.effective_seed(),
-        explain: cli.explain.clone(),
-        no_redact: cli.no_redact,
-        dbms_hint: cli.normalized_dbms_hint(),
-        marker: cli.marker.clone(),
-        raw_request: cli.merged_raw_request(),
-        knowledge,
-        second_order: crate::engine::orchestrator::SecondOrderConfig {
-            enabled: cli.second_order,
-            revisit_url: cli.second_order_revisit_url.clone(),
-            max_stores: cli.effective_second_order_max_stores(),
-            ..crate::engine::orchestrator::SecondOrderConfig::default()
-        },
-    }
 }
 
 /// Run a scan and return structured results without printing to stdout.
@@ -138,10 +39,10 @@ pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult
     // `--import` is not a scan-resume flag: session resume lives in
     // `replay --file` (decrypt + summary) and `recon import --file`.
     // Fail fast instead of silently ignoring it.
-    if let Some(path) = cli.import.as_deref() {
+    if let Some(path) = cli.output_opts.import.as_deref() {
         return Err(crate::error::InjektError::Other(
             format!(
-                "--import '{path}' is not supported for scan; use `replay --file <export.enc>` to inspect an encrypted export or `recon import --file <crawl.json> --test` for candidates"
+                "--import '{path}' is not supported for scan; use `replay --file <export.enc>` to inspect an encrypted export or `recon import --file <crawl.json> --test` for candidates (see `replay --help`)"
             )
             .into(),
         )
@@ -152,8 +53,8 @@ pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult
         .effective_target()
         .ok_or_else(|| crate::error::InjektError::Other("target required".into()))?;
 
-    let client = build_client(cli, cli.allow_private)?;
-    let cfg = engine_config(cli);
+    let client = build_client(cli, cli.http.allow_private)?;
+    let cfg = build_engine_config(cli, EnumGate::Passthrough);
 
     let engine = Engine::new(cfg.clone(), client, cancel.clone());
     let state = engine.run(&target).await?;
@@ -188,29 +89,13 @@ pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult
     // écriture (`fsync`, perms 0600). OFF = aucune IO. Le delta ne contient
     // que `(technique, dbms, generic, succès?, req)` — jamais de cible,
     // param, seed, evidence ou secret.
-    if cli.knowledge_enabled() {
-        let mut delta = crate::reasoning::knowledge::KnowledgeStore::empty();
-        crate::reasoning::knowledge::learn_from_run(
-            &mut delta,
-            &report.findings,
-            &cfg.techniques,
-            cfg.dbms_hint.as_deref(),
-            count,
-        );
-        match crate::reasoning::knowledge::save_delta_if_enabled(
-            &delta,
-            true,
-            cli.knowledge_path.as_deref(),
-        ) {
-            Ok(true) => tracing::info!(
-                path = %scrubber.scrub(&cli.effective_knowledge_path().display().to_string()),
-                entries = delta.len(),
-                "knowledge updated (opt-in, aggregates only)"
-            ),
-            Ok(false) => {}
-            Err(e) => warn!(error=%e, "knowledge save failed (run results kept in RAM)"),
-        }
-    }
+    learn_and_save(
+        &report.findings,
+        &cfg.techniques,
+        cfg.dbms_hint.as_deref(),
+        count,
+        cli,
+    );
 
     Ok(ScanResult {
         report,
@@ -224,38 +109,33 @@ pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult
 /// Bulk CLI entry point (`-m/--bulk-file` + `--stdin` / `--openapi-file` /
 /// `--sitemap-file` / `--raw-dir`): sequential multi-target scan.
 async fn run_bulk_cli(cli: &Cli, cancel: CancellationToken) -> Result<()> {
-    if cli.bulk_file.is_some() && cli.effective_target().is_some() {
+    if cli.target_opts.bulk_file.is_some() && cli.effective_target().is_some() {
         return Err(crate::error::InjektError::Other(
             "--bulk-file conflicts with --target/--raw-file (one mode at a time)".into(),
         )
         .into());
     }
-    if cli.export_encrypted.is_some() {
+    if cli.output_opts.export_encrypted.is_some() {
         return Err(crate::error::InjektError::Other(
             "--export-encrypted is not supported with --bulk-file (use --output for the aggregated report)".into(),
         )
         .into());
     }
-    if cli.cookies.is_some() {
-        warn!("--cookies combined with --bulk-file replays the same cookies on every target");
-    }
-    if cli.headers.iter().any(|h| {
-        h.split_once(':')
-            .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("authorization"))
-    }) {
-        warn!("Authorization header combined with --bulk-file is replayed on every target");
-    }
-    let targets = crate::target::ingest::collect_targets(cli, None)?;
+    let targets = super::common::resolve_targets(cli, None)?;
+    // Fail closed instead of spraying operator sessions across origins:
+    // multi-origin bulk + auth secrets requires --allow-secret-reuse.
+    // (Single-origin replay stays same-origin and is legitimate.)
+    super::common::guard_bulk(cli, &targets)?;
     // Fail fast on broken network config; per-target rebuilds stay fresh
     // (CookieJar/RateLimiter isolation).
-    build_client(cli, cli.allow_private)?;
-    let cfg = engine_config(cli);
+    build_client(cli, cli.http.allow_private)?;
+    let cfg = build_engine_config(cli, EnumGate::Passthrough);
     let scrubber = Scrubber::new(cfg.no_redact);
     info!(count = targets.len(), "bulk scan start");
     let report = super::bulk::run_bulk(
         targets,
         &cfg,
-        || build_client(cli, cli.allow_private),
+        || build_client(cli, cli.http.allow_private),
         &cancel,
         &scrubber,
     )
@@ -266,30 +146,22 @@ async fn run_bulk_cli(cli: &Cli, cancel: CancellationToken) -> Result<()> {
     }
     report.print_summary(&scrubber);
     // C13 bulk (opt-in) : un seul delta agrégé sur tous les findings du run.
-    if cli.knowledge_enabled() {
+    {
         let findings: Vec<crate::session::state::Finding> = report
             .per_target
             .iter()
             .flat_map(|r| r.findings.clone())
             .collect();
-        let mut delta = crate::reasoning::knowledge::KnowledgeStore::empty();
-        crate::reasoning::knowledge::learn_from_run(
-            &mut delta,
+        learn_and_save(
             &findings,
             &cfg.techniques,
             cfg.dbms_hint.as_deref(),
             report.request_count_total,
+            cli,
         );
-        if let Err(e) = crate::reasoning::knowledge::save_delta_if_enabled(
-            &delta,
-            true,
-            cli.knowledge_path.as_deref(),
-        ) {
-            warn!(error=%e, "knowledge save failed (run results kept in RAM)");
-        }
     }
-    if let Some(out) = &cli.output {
-        let body = if matches!(cli.format, crate::cli::args::ReportFormat::Json) {
+    if let Some(out) = &cli.output_opts.output {
+        let body = if matches!(cli.output_opts.format, crate::cli::args::ReportFormat::Json) {
             serde_json::to_string_pretty(&report.to_json(&scrubber))?
         } else {
             // SARIF/JUnit/Markdown aggregate every per-target finding into
@@ -310,22 +182,18 @@ async fn run_bulk_cli(cli: &Cli, cancel: CancellationToken) -> Result<()> {
                 report.request_count_total,
                 crate::reporting::json::ReportMeta::default(),
             );
-            render_report(&aggregated, cli.format, &scrubber)
+            render_report(&aggregated, cli.output_opts.format, &scrubber)
         };
-        write_output_file_async(out, &body, cli.force, &scrubber.scrub(out)).await?;
-        info!(path=%scrubber.scrub(out), format=%cli.format.to_string(), "bulk report written (0o600, no overwrite unless --force)");
+        super::common::write_report_async(
+            Some(out),
+            &body,
+            cli.output_opts.force,
+            &scrubber.scrub(out),
+        )
+        .await?;
+        info!(path=%scrubber.scrub(out), format=%cli.output_opts.format.to_string(), "bulk report written (0o600, no overwrite unless --force)");
     }
     Ok(())
-}
-
-/// `true` when any multi-target ingestion source is set.
-#[must_use]
-pub fn has_ingestion_sources(cli: &Cli) -> bool {
-    cli.bulk_file.is_some()
-        || cli.stdin
-        || cli.openapi_file.is_some()
-        || cli.sitemap_file.is_some()
-        || cli.raw_dir.is_some()
 }
 
 /// Print the offline execution plan without sending any request (C11).
@@ -334,9 +202,9 @@ pub fn has_ingestion_sources(cli: &Cli) -> bool {
 fn dry_run(cli: &Cli) {
     println!("dry-run: scan plan (no request sent)");
     println!("  resolution: {}", cli.resolution_summary());
-    let cfg = engine_config(cli);
-    // `collect_targets` is lexical-only (parse + dedup, no DNS/HTTP).
-    let targets = match crate::target::ingest::collect_targets(cli, None) {
+    let cfg = build_engine_config(cli, EnumGate::Passthrough);
+    // `resolve_targets` is lexical-only (parse + dedup, no DNS/HTTP).
+    let targets = match super::common::resolve_targets(cli, None) {
         Ok(t) => t,
         Err(e) => {
             // Fall back to the single effective target so `--target` typos
@@ -355,7 +223,7 @@ fn dry_run(cli: &Cli) {
     }
     println!("  targets: {}", targets.len());
     for target in targets.iter().take(20) {
-        let scrubber = Scrubber::new(cli.no_redact);
+        let scrubber = Scrubber::new(cli.output_opts.no_redact);
         match crate::cli::plan::build_plan(target, &cfg) {
             Ok(plan) => {
                 print!(
@@ -378,7 +246,7 @@ fn dry_run(cli: &Cli) {
     // C13 : priors knowledge affichés en dry-run (0 requête, OPSEC-safe,
     // scrubbé : agrégats seuls, aucun identifiant).
     {
-        let scrubber = Scrubber::new(cli.no_redact);
+        let scrubber = Scrubber::new(cli.output_opts.no_redact);
         if cli.knowledge_enabled() {
             let path = cli.effective_knowledge_path();
             let loaded = cfg
@@ -412,32 +280,52 @@ fn dry_run(cli: &Cli) {
 /// # Errors
 /// Returns an error if the scan (or bulk scan) fails, or the output report
 /// can't be written to disk.
-pub async fn run(cli: Cli, cancel: CancellationToken) -> Result<()> {
-    if cli.dry_run {
-        dry_run(&cli);
+#[allow(clippy::too_many_lines)] // export-encrypted prompt keeps this long; split in the engine_config-factorization PR.
+pub async fn run(cli: &Cli, args: &ScanArgs, cancel: CancellationToken) -> Result<()> {
+    // `args` is the explicit `scan --target` (or the synthetic bare-mode
+    // `ScanArgs` from `fallback_bare_or_auto`): `effective_target()` already
+    // merges it via `Cli::command`, so this only pins the uniform `&Cli`
+    // calling convention. Deprecation warn lives in `dispatch` (explicit
+    // subcommand only — bare mode must not warn).
+    let _ = args.target.as_deref();
+    if cli.output_opts.dry_run {
+        dry_run(cli);
         return Ok(());
     }
-    if has_ingestion_sources(&cli) {
-        return run_bulk_cli(&cli, cancel).await;
+    if super::common::is_bulk(cli) {
+        return run_bulk_cli(cli, cancel).await;
     }
-    let result = run_scan(&cli, cancel).await?;
+    let started = Instant::now();
+    let result = run_scan(cli, cancel.clone()).await?;
+    let state = if cancel.is_cancelled() {
+        "Cancelled".to_owned()
+    } else {
+        format!("{:?}", result.engine_state)
+    };
 
     let scrubber = Scrubber::new(result.config.no_redact);
-    // Canonical human summary is the orchestrator `scan done` line (findings
-    // per technique, req, 403/429, `--explain` hint). Keep this at `debug!`
-    // so TTY output shows exactly one summary, not two.
+    // Keep the structured tracing event on stderr for debug/CI diagnostics;
+    // the compact human-facing summary below is the single stdout summary.
     debug!(
         target=%scrubber.scrub(&result.target),
         state=?result.engine_state,
         "scan finished"
     );
 
+    console::print_run_summary(
+        &result.target,
+        &state,
+        result.report.request_count,
+        started.elapsed(),
+        result.report.findings.len(),
+        &scrubber,
+    );
     console::print_findings(&result.report.findings, &scrubber);
     console::print_extracted(&result.report.extracted);
 
     // `--explain <param>`: one-line reasoning verdict to stdout (in addition
     // to the orchestrator `info!` log above). Reads findings + RAM-only trace.
-    if let Some(wanted) = cli.explain.as_deref() {
+    if let Some(wanted) = cli.output_opts.explain.as_deref() {
         let st = result.state_handle.read().await;
         match st.explain(wanted) {
             Some(line) => println!("explain {wanted}: {line}"),
@@ -445,15 +333,21 @@ pub async fn run(cli: Cli, cancel: CancellationToken) -> Result<()> {
         }
     }
 
-    if let Some(out) = &cli.output {
-        let body = render_report(&result.report, cli.format, &scrubber);
+    if let Some(out) = &cli.output_opts.output {
+        let body = render_report(&result.report, cli.output_opts.format, &scrubber);
         // Secure write: 0o600, create_new (no overwrite unless --force),
         // relative-only + canonicalized parent (see `output::file`).
-        write_output_file_async(out, &body, cli.force, &scrubber.scrub(out)).await?;
-        info!(path=%scrubber.scrub(out), format=%cli.format.to_string(), "report written (0o600, no overwrite unless --force)");
+        super::common::write_report_async(
+            Some(out),
+            &body,
+            cli.output_opts.force,
+            &scrubber.scrub(out),
+        )
+        .await?;
+        info!(path=%scrubber.scrub(out), format=%cli.output_opts.format.to_string(), "report written (0o600, no overwrite unless --force)");
     }
 
-    if let Some(path) = &cli.export_encrypted {
+    if let Some(path) = &cli.output_opts.export_encrypted {
         let scrubbed_path = Scrubber::new(result.config.no_redact).scrub(path);
         warn!(path=%scrubbed_path, "export chiffré demandé — artefact sensible");
         // Secure passphrase prompt (rpassword) with fallback to env for CI

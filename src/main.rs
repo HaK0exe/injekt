@@ -7,38 +7,49 @@
 use clap::Parser as _;
 use injekt::cli::{
     args::{Cli, Commands},
-    commands,
+    commands::dispatch,
 };
+use std::process::ExitCode;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let usage = e.chain().any(|c| {
+                matches!(
+                    c.downcast_ref::<injekt::error::InjektError>(),
+                    Some(injekt::error::InjektError::NoTarget)
+                )
+            });
+            eprintln!("Error: {e:#}");
+            if usage {
+                ExitCode::from(2)
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
 
-    // MCP mode branches off before any stdout tracing is installed:
-    // on stdio transport, stdout is the JSON-RPC channel.
+async fn run() -> anyhow::Result<()> {
+    let cli = Cli::parse();
     if matches!(cli.command, Some(Commands::Mcp(_))) {
         return injekt::mcp::server::run_mcp().await;
     }
-
     let filter = if cli.verbose { "debug" } else { "info" };
     fmt()
         .event_format(injekt::cli::output::console::SqlmapStyle)
-        // Logs → stderr only so stdout stays pipeable (reports, MCP
-        // JSON-RPC on stdio). ANSI is gated inside `SqlmapStyle` via
-        // `colors_enabled()` (NO_COLOR/TERM=dumb/TTY); no `with_ansi`
-        // here — that setter only exists for the default formatter.
         .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
         )
         .init();
-
     if !cli.no_banner {
         injekt::cli::output::console::banner();
     }
-
     let cancel = CancellationToken::new();
     let c = cancel.clone();
     tokio::spawn(async move {
@@ -47,55 +58,5 @@ async fn main() -> anyhow::Result<()> {
             c.cancel();
         }
     });
-
-    match &cli.command {
-        Some(Commands::Scan(_)) => {
-            commands::scan::run(cli, cancel).await?;
-        }
-        Some(Commands::Auto(args)) => {
-            commands::auto::run(&cli, args, cancel).await?;
-        }
-        Some(Commands::Init(args)) => {
-            let force = cli.force;
-            commands::scaffold::run_init(args, force)?;
-        }
-        Some(Commands::Completions(args)) => {
-            commands::scaffold::run_completions(&cli, args)?;
-        }
-        Some(Commands::Man(_)) => {
-            commands::scaffold::run_man();
-        }
-        Some(Commands::Recon(_)) => {
-            commands::recon::run(cli, cancel).await?;
-        }
-        Some(Commands::Replay(_)) => {
-            commands::replay::run(cli)?;
-        }
-        Some(Commands::Info(_)) => {
-            commands::info::run();
-        }
-        // `Mcp` is handled before tracing init above (stdout must stay pure
-        // JSON-RPC); no second branch here.
-        Some(_) => {
-            eprintln!("Unknown command");
-            std::process::exit(2);
-        }
-        None => {
-            if cli.bulk_file.is_some()
-                || cli.effective_target().is_some()
-                || cli.stdin
-                || cli.openapi_file.is_some()
-                || cli.sitemap_file.is_some()
-                || cli.raw_dir.is_some()
-                || cli.dry_run
-            {
-                commands::scan::run(cli, cancel).await?;
-            } else {
-                eprintln!("No target provided. Use --target <URL> or `injekt scan --target <URL>`");
-                std::process::exit(2);
-            }
-        }
-    }
-
-    Ok(())
+    dispatch(cli, cancel).await
 }

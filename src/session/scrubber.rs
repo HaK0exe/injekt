@@ -145,6 +145,12 @@ fn scrub_url_userinfo(input: &str) -> String {
     re.replace_all(input, "$1[REDACTED]@").into_owned()
 }
 
+/// Shared sensitive-key alternation for query/JSON/form secret scrubbing.
+/// ONE list for all three renderers so a key covered in one place cannot
+/// leak through another (`?authorization=…`, `"cookie":123`,
+/// `private-key=…` were previously missed in query/form/RAW respectively).
+const SENSITIVE_KEY_ALTERNATION: &str = "sessionid|phpsessid|jsessionid|aspsessionid|asp_net_sessionid|sid|sessid|session|token|access_token|accesstoken|auth_token|authtoken|api_key|api-key|api_secret|api-secret|apisecret|apikey|api_token|api-token|apitoken|x-api-key|x-api-token|x-api-secret|x-auth-token|secret|client_secret|clientsecret|client_id|password|passwd|pwd|auth|authorization|session_token|sessiontoken|refresh_token|refreshtoken|id_token|idtoken|csrf|csrf_token|csrf-token|private_key|privatekey|private-key|cookie|set-cookie|aws_secret|aws_session_token";
+
 /// Sensitive query-parameter values (`?token=…&sessionid=…`).
 /// The key is preserved for triage, the value is redacted. `id`, `q`, `page`
 /// and other non-sensitive params are untouched.
@@ -153,9 +159,9 @@ fn scrub_query_secrets(input: &str) -> String {
     let re = RE.get_or_init(|| {
         #[allow(clippy::expect_used)]
         {
-            Regex::new(
-                r#"(?i)([?&;](?:sessionid|phpsessid|jsessionid|aspsessionid|asp_net_sessionid|sid|sessid|session|token|access_token|accesstoken|auth_token|authtoken|api_key|api-key|api_secret|api-secret|apisecret|apikey|api_token|api-token|apitoken|x-api-key|x-api-token|x-api-secret|secret|client_secret|clientsecret|password|passwd|pwd|auth|session_token|sessiontoken|refresh_token|refreshtoken|id_token|idtoken|csrf|csrf_token|csrf-token|private_key|privatekey)=)[^&\s"'<>]+"#,
-            )
+            Regex::new(&format!(
+                r#"(?i)([?&;](?:{SENSITIVE_KEY_ALTERNATION})=)[^&\s"'<>]+"#,
+            ))
             .expect("query secrets regex")
         }
     });
@@ -171,18 +177,18 @@ fn scrub_json_secrets(input: &str) -> String {
     let str_re = STR_RE.get_or_init(|| {
         #[allow(clippy::expect_used)]
         {
-            Regex::new(
-                r#"(?i)("(?:password|passwd|pwd|secret|client_secret|clientsecret|api_key|api-key|api_secret|api-secret|apisecret|apikey|api_token|api-token|apitoken|access_token|accesstoken|auth_token|authtoken|session_token|sessiontoken|refresh_token|refreshtoken|id_token|idtoken|token|sessionid|session|cookie|authorization|set-cookie|x-api-key|x-api-token|x-api-secret|x-auth-token|csrf|csrf_token|csrf-token|private_key|privatekey|private-key|aws_secret|aws_session_token)"\s*:\s*")[^"]*(")"#,
-            )
+            Regex::new(&format!(
+                r#"(?i)("(?:{SENSITIVE_KEY_ALTERNATION})"\s*:\s*")[^"]*(")"#,
+            ))
             .expect("json str secrets regex")
         }
     });
     let raw_re = RAW_RE.get_or_init(|| {
         #[allow(clippy::expect_used)]
         {
-            Regex::new(
-                r#"(?i)("(?:password|passwd|pwd|secret|client_secret|clientsecret|api_key|api-key|api_secret|api-secret|apisecret|apikey|api_token|api-token|apitoken|access_token|accesstoken|auth_token|authtoken|session_token|sessiontoken|refresh_token|refreshtoken|id_token|idtoken|token|sessionid|session|csrf|csrf_token|csrf-token)"\s*:\s*)(-?\d+(?:\.\d+)?|true|false|null)"#,
-            )
+            Regex::new(&format!(
+                r#"(?i)("(?:{SENSITIVE_KEY_ALTERNATION})"\s*:\s*)(-?\d+(?:\.\d+)?|true|false|null)"#,
+            ))
             .expect("json raw secrets regex")
         }
     });
@@ -197,9 +203,9 @@ fn scrub_form_secrets(input: &str) -> String {
     let re = RE.get_or_init(|| {
         #[allow(clippy::expect_used)]
         {
-            Regex::new(
-                r#"(?i)\b(password|passwd|pwd|secret|client_secret|clientsecret|api_key|api-key|api_secret|api-secret|apisecret|apikey|api_token|api-token|apitoken|x-api-key|x-api-token|x-api-secret|access_token|accesstoken|auth_token|authtoken|session_token|sessiontoken|refresh_token|refreshtoken|id_token|idtoken|token|sessionid|phpsessid|jsessionid|sid|sessid|session|auth|csrf|csrf_token|csrf-token|private_key|privatekey|private-key)\s*=\s*[^&\s,;"'<>]+"#,
-            )
+            Regex::new(&format!(
+                r#"(?i)\b({SENSITIVE_KEY_ALTERNATION})\s*=\s*[^&\s,;"'<>]+"#,
+            ))
             .expect("form secrets regex")
         }
     });
@@ -526,6 +532,47 @@ mod tests {
         // Host preserved for userinfo redact.
         let out = sc.scrub("proxy socks://user:p4ss@127.0.0.1:1080");
         assert!(out.contains("127.0.0.1"), "{out}");
+    }
+
+    #[test]
+    fn scrubs_unified_sensitive_keys_across_renderers() {
+        // Previously-missed keys per renderer (audit): `authorization` and
+        // `private-key` in query, `cookie`/`authorization` numerics in JSON,
+        // `authorization`/`client_id`/`aws_*` in form bodies.
+        let sc = Scrubber::new(false);
+        for secret in [
+            "https://h/?authorization=secret123",
+            "https://h/?private-key=abc456",
+            "https://h/?client_id=cid789&aws_secret=sek012",
+            "https://h/?cookie=sess999&set-cookie=sc888",
+            r#"{"cookie": 12345, "user": "admin"}"#,
+            r#"{"authorization": "tok111", "ok": true}"#,
+            r#"{"aws_secret": "sek222", "n": 1}"#,
+            "data authorization=tok333&client_id=cid444",
+            "data private-key=abc555&user=admin",
+        ] {
+            let out = sc.scrub(secret);
+            for leaked in [
+                "secret123",
+                "abc456",
+                "cid789",
+                "sek012",
+                "12345",
+                "sess999",
+                "sc888",
+                "tok111",
+                "sek222",
+                "tok333",
+                "cid444",
+                "abc555",
+            ] {
+                assert!(!out.contains(leaked), "{secret} leaked {leaked}: {out}");
+            }
+        }
+        // Benign keys/values still survive in every renderer.
+        assert!(sc.scrub("https://h/?id=1&q=x").contains("id=1"));
+        assert!(sc.scrub(r#"{"user": "admin"}"#).contains("admin"));
+        assert!(sc.scrub("data user=admin&page=2").contains("user=admin"));
     }
 
     #[test]

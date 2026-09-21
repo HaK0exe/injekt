@@ -41,16 +41,16 @@ injekt --no-banner info   # stdout propre (banner sur stderr)
 
 Sortie attendue (v0.3.0) :
 ```
-Techniques      boolean, time, error, union, stacked, oob, json
+Techniques      boolean, time, error, union, stacked, oob, json, nosql
 Tampers         space2comment, space2plus, space2tab, space2newline, space2randomblank, ...
 Profiles        quick, balanced, stealth, aggressive
 OOB             opt-in via --oob-domain <collaborator> [--oob-poll-url <url> with {token}]
 Request tampers --hpp, --chunked
-DBMS            mysql, postgres, mssql, oracle
+DBMS            mysql, postgres, mssql, oracle, sqlite
 Docs            docs/OPSEC.md
 ```
 
-> Si `info` ne liste pas 8 techniques / 24 tampers / 4 DBMS → binaire périmé.
+> Si `info` ne liste pas 8 techniques / 24 tampers / 5 DBMS → binaire périmé.
 
 ## 1.3 Profils (`--profile`)
 
@@ -106,7 +106,10 @@ INJEKT_PROFILE=stealth INJEKT_THREADS=2 INJEKT_PROXY=socks5h://127.0.0.1:9050 in
 ```
 
 Variables supportées : `INJEKT_PROFILE|CONFIG|TARGET|THREADS|TIMEOUT|RETRIES|DELAY|`
-`RATE_LIMIT|JITTER|TECHNIQUES|LEVEL|PROXY|DBMS|TAMPER|OOB_DOMAIN|OOB_POLL_URL|OOB_WAIT_SECS|PASSPHRASE`.
+`RATE_LIMIT|JITTER|TECHNIQUES|LEVEL|SEED|PROXY|DBMS|TAMPER|OOB_DOMAIN|OOB_POLL_URL|OOB_WAIT_SECS|`
+`MAX_DURATION|REQUEST_BUDGET|MAX_REDIRECTS|SECOND_ORDER|SECOND_ORDER_REVISIT_URL|`
+`SECOND_ORDER_MAX_STORES|ALLOW_KNOWLEDGE|KNOWLEDGE_PATH|FORMAT|EXPLAIN|PASSPHRASE`.
+(`INJEKT_PASSPHRASE` est lue via l'environnement au moment du chiffrement, pas via clap.)
 `RUST_LOG` override le niveau `tracing` (`info` défaut, `-v` → `debug`).
 Fichier auto-découvert : `./injekt.toml` puis `~/.config/injekt/config.toml`.
 Un `--config` explicite manquant/illisible = **exit 1** ; auto-découvert = warning seul.
@@ -126,6 +129,43 @@ Checklist pre-engagement :
 - [ ] Nombre de cibles correct (bulk/openapi/sitemap/raw-dir : surprises fréquentes).
 - [ ] Proxy affiché si réseau hostile (jamais de scan nu sur cible WAFisée sans raison).
 - [ ] `--allow-private` **absent** sauf lab.
+
+## 1.5bis Budgets, confirmation et opt-ins avancés
+
+Tous globaux, tous OPT-IN (comportement historique inchangé quand absents) :
+
+```bash
+# Budgets (jamais posés par --profile ni par injekt.toml, uniquement flag ou env) :
+injekt --target "https://example.com/?id=1" --max-duration 120      # 0..86400 s, détection seule
+injekt --target "https://example.com/?id=1" --request-budget 500    # 0..1000000, arrêt global coopératif
+INJEKT_MAX_DURATION=120 INJEKT_REQUEST_BUDGET=500 injekt --target "https://example.com/?id=1"
+
+# Confirmation stricte C6 : 2e passe en payloads frais (OOB exclu, ~2x requêtes),
+# ne crée jamais de finding — ne fait qu'invalider ceux qui échouent au re-test :
+injekt --target "https://example.com/?id=1" --confirm
+
+# Kill-switch mutation (mutation ON par défaut, scopée aux findings confirmés via --confirm,
+# ≤4 variantes / ≤8 requêtes par finding, échec silencieux) :
+injekt --target "https://example.com/?id=1" --confirm --no-mutation
+
+# Second-order Option B (lab uniquement, même-origine : schéma/host/port identiques) :
+# OFF par défaut = 0 requête extra ; ON = marqueur bénin stocké puis revisit (max 2 GET) :
+injekt --target "https://example.com/?id=1" --second-order --second-order-revisit-url /admin
+INJEKT_SECOND_ORDER=1 INJEKT_SECOND_ORDER_REVISIT_URL=/admin injekt --target "https://example.com/?id=1"
+# --second-order-max-stores : 1..32, défaut 8 (INJEKT_SECOND_ORDER_MAX_STORES).
+
+# Knowledge engine C13 (OFF par défaut = 0 IO, byte-identique) :
+# ON = lecture ~/.cache/injekt/knowledge.json (ou --knowledge-path), agrégats anonymes
+# (technique, DBMS, contexte) uniquement, boost borné, écriture post-run fusionnée (0600) :
+injekt --target "https://example.com/?id=1" --allow-knowledge
+injekt --target "https://example.com/?id=1" --allow-knowledge --knowledge-path ./knowledge.json
+
+# Rapports et inspection :
+injekt --target "https://example.com/?id=1" --output report.sarif --format sarif   # json|sarif|junit|md (INJEKT_FORMAT, défaut json)
+injekt --target "https://example.com/?id=1" --output report.md --format md
+injekt init --preset balanced --path ./injekt.toml --force   # --force global : écrase / chemins absolus
+injekt --target "https://example.com/?id=1" --explain id@query   # verdict offline, 0 requête (INJEKT_EXPLAIN)
+```
 
 ## 1.6 Utilitaires : `completions`, `man`
 

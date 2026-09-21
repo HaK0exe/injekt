@@ -78,8 +78,9 @@ injekt --target "https://example.com/?id=1" --tamper doubleurlencode,space2comme
 injekt --target "https://example.com/?id=1" --hpp --techniques boolean
 # Chunked : body en Transfer-Encoding: chunked streamé (Body only, bypass Content-Length) :
 injekt --target "https://example.com/search" --method POST --data "q=test" --chunked --techniques boolean
-# Recon avec les deux :
+# Recon avec les deux (`recon scan` = alias → préférer `auto --with-recon`) :
 injekt recon scan --target "example.com" --hpp --chunked --auto-enumerate --dbs
+injekt auto --target "example.com" --with-recon --hpp --chunked --auto-enumerate --dbs
 ```
 
 L3 de `auto` active `--hpp` automatiquement (voir chap. 7).
@@ -107,9 +108,55 @@ L1 + boolean,error (référence)
  → + --hpp
  → --level 3 + equaltolike,numericobfuscate,linecomment + --text-only
  → --chunked (si POST Body)
- → OOB (si blind total, chap. 3.6)
+  → OOB (si blind total, chap. 3.7)
  → STOP : documenter l'échec (négatif WAF-hardené ≠ pas d'injection, mais fin de scope rentable)
 ```
 
 Tracer chaque palier au rapport (tampers/level/request_count) — un contournement
 non tracé est un finding non reproductible.
+
+## 4.6 Escalade `auto` (référence exacte `escalation_plan()`)
+
+`injekt auto` (sauf `--no-escalate` = L1 seul) enchaîne 3 passes et **s'arrête à la
+première avec findings** (cible saine = 1 passe, cible WAF-ish = 2-3 chances) :
+
+| Passe | Label | Level | Tampers | Matchers/request |
+|---|---|---|---|---|
+| L1 | `L1-baseline` | tel que configuré | tels que configurés | — |
+| L2 | `L2-tamper` | `max(level, 2)` | `space2comment,randomcase,versionedfuzz` **si tampers vides** (explicites gardés tels quels) ; `--confirm` coupé sur cette passe | — |
+| L3 | `L3-evasion` | `max(level, 3)` | `space2comment,randomcase,charencode,equaltolike,numericobfuscate,linecomment` **si < 6** (explicites gardés tels quels) ; garde `--confirm` tel que configuré | `text-only=true`, `hpp=true` |
+
+- `base64encode` **jamais auto** (ni L2 ni L3) : il casse les différentiels boolean
+  TRUE/FALSE — opt-in explicite uniquement.
+- Vérifier le plan sans envoyer une requête : `--dry-run` affiche les 3 passes
+  (level/tampers/text-only/hpp par palier).
+- Correspondance manuelle : la recette 4.5 suit le même ordre (tampers cibles →
+  level → hpp → text-only), `auto` l'exécute seul.
+
+## 4.7 Garde-fous : `--no-mutation`, second-order (lab-only)
+
+```bash
+# Couper la mini-mutation C5-tardive (escape hatch, 0 autre effet) :
+injekt --target "https://example.com/?id=1" --confirm --no-mutation
+```
+
+- `--no-mutation` : coupe la mini-mutation qui tourne **après** re-validation `--confirm`
+  (findings confirmés seuls, ≤4 variantes / ≤8 requêtes par finding, seedée, tracée
+  `mutation:<famille>`, échec silencieux = finding conservé). Jamais de mutation en
+  first-pass détection, sur non-confirmés, ni sous WAF bloquant.
+
+```bash
+# Second-order actif borné (LAB UNIQUEMENT, même-origine) :
+injekt --target "http://lab.local/submit" --allow-private \
+  --second-order --second-order-revisit-url /admin --techniques union
+```
+
+- Stocke un marqueur bénin jetable (`u+8hex`, payload `'<marker>'` style union —
+  jamais de RCE, jamais de stacked exec) sur ≤ `--second-order-max-stores` params
+  Body/Query/Header (défaut 8, `1..=32` ; `Cookie` exclu, `User-Agent`/`X-Forwarded-For`/
+  `Referer` couverts comme Body/Query), puis revisite l'URL **même-origine stricte**
+  (schéma/host/port, sinon erreur — `--second-order-revisit-url` requis, ex. `/admin`).
+- Exige **2/2 hits** sur max 2 GET séquentiels (statut 200 + non-ignoré + reflet du
+  marqueur) → finding `union` à 0.85 (FP 0.15), trace = hashes seuls, jamais de
+  marqueur en clair dans les logs.
+- **OFF par défaut = 0 requête extra**, chemin byte-identique.

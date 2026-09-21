@@ -4,9 +4,9 @@
 //! - `None` (default) = unlimited, historical behaviour byte-identical:
 //!   two `None` runs on the same clean mock cost exactly the same.
 //! - `Some(small)` on a clean mock = cooperative stop: clean
-//!   [`EngineState::Done`] (never an error), 0 findings, total capped at
-//!   `budget + one in-flight technique` (threads = 1 via `test_defaults`,
-//!   so no concurrency overshoot beyond a single technique).
+//!   [`EngineState::Inconclusive`] (never an error, never CLEAN), 0 findings,
+//!   total capped at `budget + one in-flight technique` (threads = 1 via
+//!   `test_defaults`, so no concurrency overshoot beyond a single technique).
 //!
 //! The `BudgetConfig::request_budget` field is set directly here; the CLI
 //! `--request-budget N` flag flows into it via `engine_config`
@@ -42,7 +42,7 @@ async fn run_clean_mock(budget: Option<usize>) -> (EngineState, u64, usize) {
     let mut cfg = EngineConfig::test_defaults();
     cfg.budget.request_budget = budget;
     let engine = Engine::new(cfg, test_client(), CancellationToken::new());
-    let state = engine.run(&target).await.expect("run returns Done");
+    let state = engine.run(&target).await.expect("run returns state");
     let handle = engine.state_handle();
     let snap = handle.read().await;
     (state, snap.request_count(), snap.findings().len())
@@ -77,8 +77,8 @@ async fn request_budget_small_stops_cleanly_with_zero_findings() {
     println!("budgeted({cap}) clean run cost: {r_budget} req");
     assert_eq!(
         state,
-        EngineState::Done,
-        "budget exhaustion must end clean (Done, never an error)"
+        EngineState::Inconclusive,
+        "budget exhaustion without findings must end inconclusive (never CLEAN/Done, never an error)"
     );
     assert_eq!(findings, 0, "clean mock must yield 0 findings");
     assert!(

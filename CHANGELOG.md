@@ -34,6 +34,11 @@ Roadmap `docs/ROADMAP-v1.0.md` §v1.0-rc : rien de nouveau — geler, durcir, pr
 
 ### Changed
 
+- Terminal UX : les scans mono-cible affichent désormais un résumé final
+  compact (`CLEAN`/`FINDINGS`/`CANCELLED`, cible, requêtes, durée) ; les logs
+  restent sur `stderr` et les résultats humains sur `stdout`. Les couleurs
+  suivent `NO_COLOR`, `TERM=dumb`, `CLICOLOR=0` et la détection TTY.
+
 - `src/session/scrubber.rs` (audit v1.0-rc) : couverture étendue —
   headers auth élargis (`X-Access/Session/Csrf-Token`, `X-Api-Secret`,
   `Proxy-Authenticate`, `WWW-Authenticate`, …), userinfo URL
