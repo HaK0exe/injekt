@@ -387,13 +387,29 @@ impl core::fmt::Debug for HttpClient {
 }
 
 /// Request specification for generic HTTP calls (2026 best practice).
-#[derive(Debug, Clone)]
+///
+/// `Debug` is manual: `url` is scrubbed (query secrets, userinfo), headers
+/// never render (cookies/auth), body shows its length only.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct RequestSpec {
     pub method: Method,
     pub url: String,
     pub headers: HeaderMap,
     pub body: Option<bytes::Bytes>,
+}
+
+impl core::fmt::Debug for RequestSpec {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let scrubber = crate::session::scrubber::Scrubber::new(false);
+        f.debug_struct("RequestSpec")
+            .field("method", &self.method)
+            .field("url", &scrubber.scrub(&self.url))
+            .field("headers", &"[REDACTED]")
+            .field("header_count", &self.headers.len())
+            .field("body_len", &self.body.as_ref().map(bytes::Bytes::len))
+            .finish_non_exhaustive()
+    }
 }
 
 impl RequestSpec {
@@ -433,13 +449,28 @@ impl RequestSpec {
 /// — never a sum, never jitter / rate-limiter / sleeps / backoff /
 /// `Retry-After`. `attempts` counts every `req.send()` tentative across
 /// retries and redirect hops; `retried` is `attempts > 1`.
-#[derive(Debug)]
+///
+/// `Debug` is manual: reqwest's `Response` debug renders URL + headers, so
+/// only the scrubbed URL, status and timings are shown.
 #[non_exhaustive]
 pub struct TimedResponse {
     pub resp: reqwest::Response,
     pub elapsed_send: Duration,
     pub attempts: u32,
     pub retried: bool,
+}
+
+impl core::fmt::Debug for TimedResponse {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let scrubber = crate::session::scrubber::Scrubber::new(false);
+        f.debug_struct("TimedResponse")
+            .field("url", &scrubber.scrub(self.resp.url().as_str()))
+            .field("status", &self.resp.status())
+            .field("elapsed_send", &self.elapsed_send)
+            .field("attempts", &self.attempts)
+            .field("retried", &self.retried)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HttpClient {
@@ -1130,4 +1161,26 @@ fn is_same_host(a: &str, b: &str) -> bool {
     ua.host_str() == ub.host_str()
         && ua.port_or_known_default() == ub.port_or_known_default()
         && ua.scheme() == ub.scheme()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_spec_debug_redacts_url_and_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            http::HeaderValue::from_static("session=secret123"),
+        );
+        let spec = RequestSpec::get("https://example.com/?token=secret123".to_owned())
+            .with_headers(headers)
+            .with_body(b"password=secret123".to_vec());
+        let rendered = format!("{spec:?}");
+        assert!(!rendered.contains("secret123"), "{rendered}");
+        assert!(rendered.contains("example.com"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(rendered.contains("body_len"), "{rendered}");
+    }
 }
