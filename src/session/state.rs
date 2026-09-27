@@ -155,7 +155,11 @@ impl WafInfo {
 }
 
 /// A single confirmed finding — kept in RAM only.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is manual + scrubbed (see below): `target`/`parameter`/`evidence`
+/// may carry `?token=` secrets or userinfo, so a derived `Debug` would leak
+/// them into any `tracing::debug!("{finding:?}")`.
+#[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Finding {
     pub target: String,
@@ -190,6 +194,29 @@ pub struct Finding {
 
 fn default_false_positive_prob() -> f64 {
     1.0
+}
+
+// Manual `Debug`: `target`/`parameter`/`evidence` are scrubbed (query secrets,
+// userinfo, tokens) and evidence is truncated — `Debug` is for triage, full
+// evidence lives in reports. Never `derive(Debug)` here.
+impl core::fmt::Debug for Finding {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let scrubber = super::scrubber::Scrubber::new(false);
+        let evidence: String = scrubber.scrub(&self.evidence).chars().take(256).collect();
+        f.debug_struct("Finding")
+            .field("target", &scrubber.scrub(&self.target))
+            .field("parameter", &scrubber.scrub(&self.parameter))
+            .field("technique", &self.technique)
+            .field("confidence", &self.confidence)
+            .field("false_positive_prob", &self.false_positive_prob)
+            .field("severity", &self.severity)
+            .field("dbms", &self.dbms)
+            .field("evidence", &evidence)
+            .field("evidence_hashes", &self.evidence_detail.hashes.len())
+            .field("waf", &self.waf)
+            .field("timestamp", &self.timestamp)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Finding {
@@ -790,5 +817,37 @@ impl Clone for SessionState {
             ai_attempted: self.ai_attempted.clone(),
             seed: self.seed,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secret_finding() -> Finding {
+        Finding::new(
+            "https://example.com/search?token=secret123&id=1",
+            "id",
+            TechniqueKind::Boolean,
+            0.9,
+            "boolean TRUE/FALSE split, session=secret123",
+        )
+    }
+
+    #[test]
+    fn finding_debug_redacts_secrets_but_keeps_host() {
+        let finding = secret_finding();
+        let rendered = format!("{finding:?}");
+        assert!(!rendered.contains("secret123"), "{rendered}");
+        assert!(rendered.contains("example.com"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    }
+
+    #[test]
+    fn finding_debug_truncates_evidence() {
+        let mut finding = secret_finding();
+        finding.evidence = "x".repeat(10_000);
+        let rendered = format!("{finding:?}");
+        assert!(rendered.len() < 10_000, "{rendered}");
     }
 }
