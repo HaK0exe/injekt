@@ -429,7 +429,10 @@ impl Zeroize for StoredProbe {
 /// s.increment_requests();
 /// assert_eq!(s.request_count(), 1);
 /// ```
-#[derive(Debug, Default)]
+///
+/// `Debug` is manual: `findings` render via the scrubbed [`Finding`] impl,
+/// `extracted` (dump DB material) only ever shows a count — never values.
+#[derive(Default)]
 pub struct SessionState {
     #[allow(dead_code)]
     findings: Vec<Finding>,
@@ -523,6 +526,22 @@ impl Drop for SessionState {
 }
 
 impl ZeroizeOnDrop for SessionState {}
+
+// Manual `Debug`: findings use the scrubbed `Finding` impl; `extracted`
+// (dumped DB rows) and `stored` markers only show counts — a `{:?}` dump of
+// RAM must never carry secret material into logs.
+impl core::fmt::Debug for SessionState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SessionState")
+            .field("findings", &self.findings)
+            .field("extracted_count", &self.extracted.len())
+            .field("stored_count", &self.stored.len())
+            .field("request_count", &self.request_count)
+            .field("detectability", &self.detectability)
+            .field("seed", &self.seed)
+            .finish_non_exhaustive()
+    }
+}
 
 impl SessionState {
     #[must_use]
@@ -849,5 +868,18 @@ mod tests {
         finding.evidence = "x".repeat(10_000);
         let rendered = format!("{finding:?}");
         assert!(rendered.len() < 10_000, "{rendered}");
+    }
+
+    #[test]
+    fn session_debug_hides_extracted_values() {
+        use secrecy::SecretString;
+        let mut state = SessionState::new();
+        state
+            .extracted
+            .push(SecretString::from("admin:secret123".to_owned()));
+        state.increment_requests();
+        let rendered = format!("{state:?}");
+        assert!(!rendered.contains("secret123"), "{rendered}");
+        assert!(rendered.contains("extracted_count"), "{rendered}");
     }
 }
