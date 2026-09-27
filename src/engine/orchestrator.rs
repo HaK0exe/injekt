@@ -500,6 +500,14 @@ pub struct EngineConfig {
     /// snapshot lu au boot (`--allow-knowledge`), boost `1+alpha` borné
     /// `[0.5,1.5]` puis clamp scheduler `[0.5,2.0]` (jamais de veto).
     pub knowledge: Option<KnowledgeStore>,
+    /// `--ai-suggest` second-pass (opt-in post-échec/WAF). `enabled == false`
+    /// (défaut) = 0 appel LLM, chemin byte-identical. Config RAM-only, clé
+    /// API `SecretString` redacted en `Debug`.
+    pub ai: crate::ai::AiSuggestConfig,
+    /// Génération à la volée par grammaire (`--generative`, `--max-generated`).
+    /// `mode == Off` (défaut) = listes historiques, chemin byte-identical.
+    /// Config RAM-only, aucun secret.
+    pub generative: crate::generation::GenerativeConfig,
 }
 
 impl EngineConfig {
@@ -573,6 +581,8 @@ impl Default for EngineConfig {
             marker: None,
             raw_request: None,
             knowledge: None,
+            ai: crate::ai::AiSuggestConfig::default(),
+            generative: crate::generation::GenerativeConfig::default(),
         }
     }
 }
@@ -845,6 +855,8 @@ impl Engine {
                 &effective_tampers,
                 effective_opts,
                 &context_result.context,
+                &context_result.dbms_belief,
+                detection_started,
             )
             .await;
         }
@@ -1207,17 +1219,34 @@ impl Engine {
             return self.collect_baseline_uncached(target, raw_request).await;
         };
         let key = crate::recon::BaselineCache::cache_key(target, raw_request);
-        let key_lock = cache.lock_for_key(&key).await;
-        let _per_key = key_lock.lock().await;
+        // Singleflight cancellable: `lock_for_key` + per-key mutex sans `select!`
+        // bloquaient Ctrl+C jusqu'à la fin du premier collecteur (~90s en recon scan).
+        let key_lock = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => {
+                return Err(crate::error::InjektError::Cancelled);
+            }
+            lock = cache.lock_for_key(&key) => lock,
+        };
+        let _per_key = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => {
+                return Err(crate::error::InjektError::Cancelled);
+            }
+            guard = key_lock.lock() => guard,
+        };
+        // Blocked in either sense (status-count or marker-signal): never serve
+        // from cache, otherwise a transient 403/406/429 poisons later candidates.
+        // Must mirror `effective_tampers` below (`is_waf_blocked() || is_waf_blocking()`).
         if let Some((cached_baseline, cached_tampers, cached_opts)) = cache.get(&key).await
-            && !cached_baseline.is_waf_blocking()
+            && !(cached_baseline.is_waf_blocked() || cached_baseline.is_waf_blocking())
         {
             return Ok(Some((cached_baseline, cached_tampers, cached_opts)));
         }
         // Blocking entry (or miss): bypass and re-collect below.
         let collected = self.collect_baseline_uncached(target, raw_request).await?;
         if let Some((fresh_baseline, fresh_tampers, fresh_opts)) = collected.as_ref()
-            && !fresh_baseline.is_waf_blocking()
+            && !(fresh_baseline.is_waf_blocked() || fresh_baseline.is_waf_blocking())
         {
             cache
                 .insert(
@@ -1302,14 +1331,19 @@ impl Engine {
                                     })
                                 })
                                 .collect();
-                            match self.client.read_body_with_timeout(r).await {
-                                Ok(body) => BaselineOutcome::Sample(baseline::Sample {
+                            match tokio::select! {
+                                biased;
+                                () = self.cancel.cancelled() => None,
+                                res = self.client.read_body_with_timeout(r) => Some(res),
+                            } {
+                                Some(Ok(body)) => BaselineOutcome::Sample(baseline::Sample {
                                     status,
                                     body,
                                     duration: elapsed,
                                     headers: raw_headers,
                                 }),
-                                Err(_) => BaselineOutcome::BodyReadFailed,
+                                Some(Err(_)) => BaselineOutcome::BodyReadFailed,
+                                None => BaselineOutcome::Cancelled,
                             }
                         }
                         Err(e) => BaselineOutcome::TransportFailed(format!(
@@ -1662,6 +1696,8 @@ impl Engine {
         effective_tampers: &[Tamper],
         effective_opts: ProbeOpts,
         context: &InjectionContext,
+        dbms_belief: &DbmsBelief,
+        detection_started: std::time::Instant,
     ) {
         let snapshot = self.state.read().await.findings().to_vec();
         let candidates: Vec<(usize, Finding)> = snapshot
@@ -1767,6 +1803,40 @@ impl Engine {
                 st.findings_mut().retain(|x| {
                     !(x.parameter == finding.parameter && x.technique == finding.technique)
                 });
+                drop(st);
+                // `--ai-suggest` post-confirm (opt-in) : le finding droppé
+                // rouvre une seconde chance bornée avec des formes inédites
+                // (trigger `confirm_dropped`). Gate interne : 0 requête quand
+                // OFF/déjà-tenté/sous verrou ; échec silencieux.
+                if self.config.ai.enabled && !self.cancel.is_cancelled() {
+                    let ai_deadline = BudgetConfig::detection_deadline(
+                        detection_started,
+                        self.config.budget.max_duration_secs,
+                    );
+                    run_ai_suggest_for_param(
+                        &self.client,
+                        &self.state,
+                        &self.cancel,
+                        &self.config,
+                        target,
+                        target_str,
+                        &param,
+                        baseline,
+                        marker_set,
+                        raw_request.as_ref().as_ref(),
+                        effective_tampers,
+                        effective_opts,
+                        &self.config.evasion.payload_opts,
+                        &self.config.matcher,
+                        &self.config.net.ignore_codes,
+                        derived,
+                        context,
+                        dbms_belief,
+                        ai_deadline,
+                        true,
+                    )
+                    .await;
+                }
             }
         }
         info!("--confirm second-pass done");
@@ -2634,6 +2704,37 @@ async fn run_detection_for_param(
         .await;
         scheduler.record_outcome(&param_key, hyp.is_confirmed(), hyp.cost_spent.max(1));
     }
+    // `--ai-suggest` second-pass (opt-in post-échec/WAF) : gate synchrone
+    // interne (0 requête quand OFF/incomplet/déjà-tenté/sans trigger/sous
+    // verrou). Borné à `max_suggestions` paires × 2 requêtes, échec
+    // silencieux sans finding inventé.
+    if config.ai.enabled && !cancel.is_cancelled() {
+        let ai_deadline =
+            BudgetConfig::detection_deadline(shared.started, config.budget.max_duration_secs);
+        run_ai_suggest_for_param(
+            client,
+            state,
+            cancel,
+            config,
+            &shared.target,
+            &shared.target_str,
+            param,
+            &shared.baseline,
+            &shared.marker_set,
+            raw_request.as_ref().as_ref(),
+            &shared.tampers,
+            ProbeOpts::new(config.evasion.hpp, config.evasion.chunked),
+            &config.evasion.payload_opts,
+            &config.matcher,
+            &config.net.ignore_codes,
+            config.seed,
+            &shared.context,
+            &live_shared.dbms_belief,
+            ai_deadline,
+            false,
+        )
+        .await;
+    }
     // Visibilité du plafond OPT-IN : le scheduler per-param est seedé avec la
     // même valeur (`budget_total`), donc son épuisement confirme l'arrêt sur
     // budget (le `warn!` global ci-dessus a déjà annoncé le stop). `None` =
@@ -2787,6 +2888,8 @@ async fn dispatch_probe_first_half(
                 &shared.context,
                 &shared.dbms_belief,
                 deadline,
+                config.generative.mode,
+                config.generative.max_generated,
             )
             .await;
         }
@@ -4550,19 +4653,40 @@ async fn fetch_for_payload_with_class(
     let start = Instant::now();
     let resp = client.send_with_retry_for_class(spec, class, cancel).await;
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-    state.write().await.increment_requests();
+    {
+        let mut st = state.write().await;
+        st.increment_requests();
+        // WAF footprint par param (live) : `403`/`406`/`429` sur une sonde =
+        // blocage probable. Mémorisé pour le trigger `--ai-suggest`
+        // (post-échec) ; distinct des compteurs `detectability` absorbés en
+        // fin de run depuis le client HTTP.
+        if let Ok(r) = resp.as_ref()
+            && matches!(r.status().as_u16(), 403 | 406 | 429)
+        {
+            st.note_waf_hit(&param.key());
+        }
+    }
     match resp {
         Ok(r) => {
             let status = r.status().as_u16();
+            // Bounded + cancellable body read: Ctrl+C pendant un body drip
+            // sort immédiatement au lieu de bloquer jusqu'au timeout de classe.
             // Bounded body read: a transport error (`Timeout`, reset) returns
             // status 0 so callers skip scoring instead of treating `""` as a
             // dissimilar body (similarity ~0 / confidence 0.75 false positive).
-            match client.read_body_string_for_class(r, class).await {
-                Ok(body) => (body, elapsed, status),
-                Err(e) => {
+            let body_res = tokio::select! {
+                biased;
+                () = cancel.cancelled() => None,
+                res = client.read_body_string_for_class(r, class) => Some(res),
+            };
+            match body_res {
+                Some(Ok(body)) => (body, elapsed, status),
+                Some(Err(e)) => {
                     warn!(error=%e, "probe body read failed, skipping score");
                     (String::new(), elapsed, 0)
                 }
+                // Cancelled mid-read: status 0 = skipped, never scored.
+                None => (String::new(), elapsed, 0),
             }
         }
         Err(e) => {
@@ -4604,6 +4728,364 @@ async fn fetch_body_and_time_spec(
     }
 }
 
+/// `--ai-suggest` second-pass (opt-in post-échec / WAF-block uniquement).
+///
+/// Un seul passage par paramètre et par run (verrou `ai_attempted` partagé
+/// entre le hook détection et le hook post-confirm), seulement si le run est
+/// reparti bredouille face à un signal actionnable : WAF bloquant
+/// (`is_waf_blocked() || is_waf_blocking()`), filtre applicatif (`400`
+/// streak mémorisé par [`SessionState::note_app_filter_hit`]), empreinte WAF
+/// live, ou `--confirm` droppé (`confirm_dropped`, hook post-confirm).
+///
+/// Bornes : 0 appel LLM quand OFF/incomplet/déjà-tenté/annulé/budget/deadline
+/// (fail silencieux), au plus `max_suggestions` paires validées × 2 requêtes
+/// (défaut 3 paires = 6 requêtes/param). Chaque paire passe par le validator
+/// local avant envoi ; l'évaluation reprend `BooleanDetector` + veto matcher
+/// (single-trial, `trials=1/1` en évidence — le confirm 3-trials reste une
+/// option V2). Échec silencieux : aucun finding inventé, finding originel
+/// jamais modifié (aucun n'existe sur ce param par construction du gate).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_ai_suggest_for_param(
+    client: &HttpClient,
+    state: &Arc<RwLock<SessionState>>,
+    cancel: &CancellationToken,
+    config: &EngineConfig,
+    target: &TargetUrl,
+    target_str: &str,
+    param: &TargetParameter,
+    baseline: &baseline::Baseline,
+    marker_set: &MarkerSet,
+    raw: Option<&RawRequest>,
+    tampers: &[Tamper],
+    opts: ProbeOpts,
+    popts: &PayloadOpts,
+    matcher: &crate::detection::matcher::MatcherConfig,
+    ignore_codes: &[u16],
+    seed: Option<u64>,
+    context: &InjectionContext,
+    dbms_belief: &DbmsBelief,
+    deadline: Option<std::time::Instant>,
+    confirm_dropped: bool,
+) {
+    use crate::ai::{
+        AiSuggestConfig, ai_hard_stop, ai_plan_label, ai_trigger, should_attempt_ai_suggest,
+    };
+    let ai: &AiSuggestConfig = &config.ai;
+    if !ai.enabled {
+        return;
+    }
+    let param_key = param.key();
+    // Gate synchrone (0 requête) : findings vides sur ce param + trigger +
+    // verrous (budget/deadline/cancel/origine down/boolean désactivé).
+    let findings_empty = !state
+        .read()
+        .await
+        .findings()
+        .iter()
+        .any(|f| f.parameter == param_key);
+    let waf_signal = baseline.is_waf_blocked() || baseline.is_waf_blocking();
+    let filter_hit = state.read().await.app_filter_hit(&param_key);
+    // Empreinte WAF live en phase détection : un WAF qui ne bloque que les
+    // payloads (baseline 200 propre) ne laisse aucun signal baseline, mais
+    // chaque sonde bloquée est mémorisée par param dans
+    // `fetch_for_payload_with_class` (les compteurs `detectability` ne sont
+    // absorbés qu'en fin de run — trop tard pour ce hook).
+    let live_waf_hit = state.read().await.waf_hit(&param_key);
+    let trigger = ai_trigger(waf_signal, filter_hit, confirm_dropped) || live_waf_hit;
+    let budget_spent = BudgetConfig::is_over_request_budget(
+        state.read().await.request_count(),
+        config.budget.request_budget,
+    );
+    let hard_stop = ai_hard_stop(
+        baseline_all_error(&baseline.status_codes),
+        budget_spent,
+        BudgetConfig::is_past_deadline(deadline),
+        cancel.is_cancelled(),
+        !is_technique_enabled(&config.techniques, TechniqueKind::Boolean),
+    );
+    if !should_attempt_ai_suggest(ai.enabled, findings_empty, trigger, hard_stop) {
+        return;
+    }
+    if !ai.is_complete() {
+        debug!(param = param_key, "ai-suggest skipped: incomplete config");
+        return;
+    }
+    // Verrou un-passage-par-param : le hook détection et le hook
+    // post-confirm partagent ce verrou (un fetch échoué ne retente pas —
+    // borné avant persistant, documenté).
+    if state.read().await.has_ai_attempted(&param_key) {
+        return;
+    }
+    state.write().await.note_ai_attempted(&param_key);
+    info!(
+        param = param_key,
+        provider = ai.provider.map(crate::ai::AiProviderKind::name),
+        waf_signal,
+        filter_hit,
+        "ai-suggest second-pass start (bounded, silent on failure)"
+    );
+    // Signaux abstraits uniquement (0 secret) + squelettes des paires L1
+    // historiques pour interdire au LLM de les répéter à l'identique.
+    let failed_shapes: Vec<String> =
+        crate::techniques::boolean::payloads::boolean_payloads_for(dbms_payload_label(dbms_belief))
+            .iter()
+            .take(2)
+            .map(|p| {
+                crate::ai::prompt::skeletonize(&format!("{} / {}", p.true_payload, p.false_payload))
+            })
+            .collect();
+    let signals = crate::ai::prompt::AiSignals::collect(
+        context,
+        dbms_belief,
+        baseline.waf_vendor.as_deref(),
+        &baseline.waf_hits,
+        baseline.is_waf_blocking(),
+        &failed_shapes,
+        &context.comment.to_string(),
+    );
+    let system = crate::ai::prompt::system_prompt();
+    let user = crate::ai::prompt::build_user_prompt(&signals, ai.max_suggestions);
+    let Some(provider) = ai.provider else {
+        return;
+    };
+    let suggested = match crate::ai::provider::fetch_suggestions(ai, system, &user, cancel).await {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            debug!(param = param_key, error = %e, "ai-suggest fetch failed, skipping silently");
+            return;
+        }
+    };
+    // Cohérence WAF-bypass (ex. auto space2comment) sans casser le
+    // différentiel TRUE/FALSE : tampers effectifs filtrés boolean-safe, comme
+    // `confirm_error_with_boolean`. RNG seedé : même seed → mêmes variantes.
+    let mut rng = crate::seeded_rng::make_rng(seed);
+    let safe_trans: Vec<Tamper> = tampers
+        .iter()
+        .filter(|t| t.is_boolean_safe())
+        .cloned()
+        .collect();
+    let tamper_label = if safe_trans.is_empty() {
+        "none".to_owned()
+    } else {
+        safe_trans
+            .iter()
+            .map(super::super::techniques::tamper::Tamper::name)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let detector = BooleanDetector::new();
+    let baseline_body = matcher.pre_process(&baseline.representative_body_str());
+    let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut validated: u8 = 0;
+    for (idx, pair) in suggested.iter().enumerate() {
+        if cancel.is_cancelled() || check_deadline(deadline, &param_key, "ai-suggest") {
+            break;
+        }
+        if validated >= ai.max_suggestions {
+            break;
+        }
+        if BudgetConfig::is_over_request_budget(
+            state.read().await.request_count(),
+            config.budget.request_budget,
+        ) {
+            debug!(param = param_key, "ai-suggest stopping on request-budget");
+            break;
+        }
+        let Ok(valid) =
+            crate::ai::validator::validate_ai_pair(&pair.true_branch, &pair.false_branch, &tried)
+        else {
+            debug!(
+                param = param_key,
+                index = idx,
+                "ai-suggest pair rejected by validator"
+            );
+            continue;
+        };
+        tried.insert(valid.true_payload.clone());
+        tried.insert(valid.false_payload.clone());
+        validated = validated.saturating_add(1);
+        let true_payload =
+            build_final_payload_with_rng(&valid.true_payload, &safe_trans, popts, &mut rng);
+        let false_payload =
+            build_final_payload_with_rng(&valid.false_payload, &safe_trans, popts, &mut rng);
+        let plan = ai_plan_label(provider, validated.saturating_sub(1));
+        let (true_raw, true_ms, true_status) = fetch_for_payload_with_class(
+            client,
+            state,
+            cancel,
+            target,
+            target_str,
+            param,
+            &true_payload,
+            marker_set,
+            raw,
+            opts,
+            popts,
+            RequestClass::Boolean,
+        )
+        .await;
+        let true_body = matcher.pre_process(&true_raw);
+        let (false_raw, false_ms, false_status) = fetch_for_payload_with_class(
+            client,
+            state,
+            cancel,
+            target,
+            target_str,
+            param,
+            &false_payload,
+            marker_set,
+            raw,
+            opts,
+            popts,
+            RequestClass::Boolean,
+        )
+        .await;
+        let false_body = matcher.pre_process(&false_raw);
+        // Transport/ignore/filtre : jamais scoré, jamais de finding (même
+        // rigueur que `test_boolean_bounded`, en single-trial ici).
+        if true_status == 0 || false_status == 0 {
+            push_ai_trace(
+                state,
+                &param_key,
+                &plan,
+                seed,
+                0.2,
+                2.0,
+                &valid.true_payload,
+                &valid.false_payload,
+            )
+            .await;
+            continue;
+        }
+        if is_ignored(true_status, ignore_codes) || is_ignored(false_status, ignore_codes) {
+            push_ai_trace(
+                state,
+                &param_key,
+                &plan,
+                seed,
+                0.2,
+                2.0,
+                &valid.true_payload,
+                &valid.false_payload,
+            )
+            .await;
+            continue;
+        }
+        if is_app_filter_block(true_status, false_status) {
+            push_ai_trace(
+                state,
+                &param_key,
+                &plan,
+                seed,
+                0.2,
+                2.0,
+                &valid.true_payload,
+                &valid.false_payload,
+            )
+            .await;
+            continue;
+        }
+        let res = detector.evaluate(
+            &baseline_body,
+            &true_body,
+            &false_body,
+            baseline.mean_ms,
+            true_ms,
+            false_ms,
+        );
+        if !res.is_vulnerable
+            || matcher.gate_boolean(&true_body, &false_body, true_status, false_status)
+                == Some(false)
+        {
+            push_ai_trace(
+                state,
+                &param_key,
+                &plan,
+                seed,
+                res.confidence.min(0.2),
+                2.0,
+                &valid.true_payload,
+                &valid.false_payload,
+            )
+            .await;
+            continue;
+        }
+        let fp = (1.0 - res.confidence).clamp(0.0, 1.0);
+        let evidence = format!(
+            "boolean true_sim={:.2} false_sim={:.2} trials=1/1 fp={fp:.2} tamper={tamper_label} {plan}{}",
+            res.true_similarity,
+            res.false_similarity,
+            matcher.evidence_suffix(),
+        );
+        let finding = Finding::new(
+            target.as_str(),
+            param_key.clone(),
+            TechniqueKind::Boolean,
+            res.confidence,
+            evidence,
+        )
+        .with_false_positive_prob(fp)
+        .with_waf(baseline.waf_vendor.clone(), baseline.is_waf_blocking());
+        let mut finding = finding;
+        finding.dbms = None;
+        state.write().await.push_finding(finding);
+        push_ai_trace(
+            state,
+            &param_key,
+            &plan,
+            seed,
+            res.confidence,
+            2.0,
+            &valid.true_payload,
+            &valid.false_payload,
+        )
+        .await;
+        info!(
+            param = param_key,
+            plan,
+            confidence = res.confidence,
+            "ai-suggest confirmed finding"
+        );
+        break;
+    }
+}
+
+/// Trace hashes-only d'une paire IA sondée (jamais de payload en clair).
+#[allow(clippy::too_many_arguments)]
+async fn push_ai_trace(
+    state: &Arc<RwLock<SessionState>>,
+    param_key: &str,
+    plan: &str,
+    seed: Option<u64>,
+    posterior: f64,
+    cost: f64,
+    true_payload: &str,
+    false_payload: &str,
+) {
+    let mut st = state.write().await;
+    let seq = st.next_trace_seq();
+    let req_hash = crate::reasoning::trace::hash_str_hex(&format!(
+        "{param_key}:ai:{plan}:{}",
+        seed.map_or("none".to_owned(), |s| s.to_string())
+    ));
+    let resp_hash = crate::reasoning::trace::hash_str_hex(&format!(
+        "{param_key}:ai:{plan}:t={}f={}",
+        crate::session::scrubber::Scrubber::hash_truncated(true_payload),
+        crate::session::scrubber::Scrubber::hash_truncated(false_payload),
+    ));
+    st.push_trace(crate::reasoning::ProbeRecord::new(
+        seq,
+        param_key.to_owned(),
+        TechniqueKind::Boolean.to_string(),
+        plan.to_owned(),
+        seed,
+        req_hash,
+        resp_hash,
+        posterior.clamp(0.0, 1.0),
+        cost,
+    ));
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::similar_names)]
 #[allow(clippy::too_many_lines)]
@@ -4627,6 +5109,8 @@ async fn test_boolean_bounded(
     context: &InjectionContext,
     dbms_belief: &DbmsBelief,
     deadline: Option<std::time::Instant>,
+    generative_mode: crate::generation::GenerativeMode,
+    max_generated: u8,
 ) {
     let (top_dbms, top_prob) = dbms_belief.top_candidate();
     debug!(param = param.key(), context = context.summary(), %top_dbms, top_prob, "boolean: context-aware detection");
@@ -4638,6 +5122,51 @@ async fn test_boolean_bounded(
     // quote context leads so L1 (`take(2)`) probes the right family first.
     let mut payloads = boolean_payloads_for(dbms_payload_label(dbms_belief));
     order_boolean_by_context(&mut payloads, context);
+    // Génération opt-in (`--generative`) : paires historiques d'abord (ordre
+    // et budgets inchangés), puis synthétisées jusqu'à `max_generated`.
+    // `Off` = byte-identical (0 générée). Les générées sont dédupliquées
+    // contre l'historique (zéro requête redondante) et portent leur label
+    // `gen:<fence>+<logic>+<pred>` en évidence.
+    let (hist_take, generated): (usize, Vec<crate::generation::GeneratedCandidate>) =
+        match generative_mode {
+            crate::generation::GenerativeMode::Off => {
+                (payload_budget(level, 2, payloads.len()), Vec::new())
+            }
+            crate::generation::GenerativeMode::Conservative
+            | crate::generation::GenerativeMode::Aggressive => {
+                let comment = crate::generation::comment_for(top_dbms, &context.comment);
+                let historical_true: std::collections::HashSet<String> =
+                    payloads.iter().map(|p| p.true_payload.clone()).collect();
+                let pool = crate::generation::enumerate_candidates(
+                    context,
+                    top_dbms,
+                    comment,
+                    generative_mode,
+                    crate::generation::MAX_GENERATED,
+                    seed,
+                );
+                let mut gen_pool = crate::generation::dedupe_against(pool, &historical_true);
+                gen_pool.truncate(usize::from(max_generated));
+                (
+                    if generative_mode == crate::generation::GenerativeMode::Aggressive {
+                        payloads.len()
+                    } else {
+                        payload_budget(level, 2, payloads.len())
+                    },
+                    gen_pool,
+                )
+            }
+        };
+    let mut combined: Vec<(
+        crate::techniques::boolean::payloads::BooleanPayload,
+        Option<String>,
+    )> = Vec::with_capacity(hist_take.saturating_add(generated.len()));
+    for p in payloads.iter().take(hist_take) {
+        combined.push((p.clone(), None));
+    }
+    for g in generated {
+        combined.push((g.payload, Some(g.label)));
+    }
     let detector = BooleanDetector::new();
     let baseline_body = matcher.pre_process(&baseline.representative_body_str());
     // Boolean TRUE/FALSE pairs require coherent transforms: opaque tampers
@@ -4650,10 +5179,7 @@ async fn test_boolean_bounded(
     // Bypass payloads (`/**/`) return `200` and reset the streak, so evasion
     // still detects; N1/N2 (`200`) never trip it.
     let mut filter_streak: usize = 0;
-    'payload: for p in payloads
-        .iter()
-        .take(payload_budget(level, 2, payloads.len()))
-    {
+    'payload: for (p, gen_label) in &combined {
         if cancel.is_cancelled() {
             break;
         }
@@ -4794,6 +5320,9 @@ async fn test_boolean_bounded(
                     streak = filter_streak,
                     "app signature filter (repeated 400) — pruning boolean early"
                 );
+                // `--ai-suggest` trigger (post-échec) : mémorise le prune par
+                // param pour le second-pass, sans requête supplémentaire.
+                state.write().await.note_app_filter_hit(&param.key());
                 break 'payload;
             }
             let (conf, inverted) = crate::detection::confirmation::confirm_either(&trials);
@@ -4810,7 +5339,7 @@ async fn test_boolean_bounded(
                 // must not rewrite the confirmed differential).
                 let (agg_true, agg_false) = crate::detection::confirmation::aggregate_sims(&trials);
                 let evidence = format!(
-                    "boolean true_sim={:.2} false_sim={:.2} trials={}/3 fp={:.2} tamper={}{}{}{}{}",
+                    "boolean true_sim={:.2} false_sim={:.2} trials={}/3 fp={:.2} tamper={}{}{}{}{}{}",
                     agg_true,
                     agg_false,
                     conf.trials,
@@ -4819,7 +5348,10 @@ async fn test_boolean_bounded(
                     opts.evidence_suffix(),
                     popts.evidence_suffix(),
                     matcher.evidence_suffix(),
-                    if inverted { " inverted" } else { "" }
+                    if inverted { " inverted" } else { "" },
+                    gen_label
+                        .as_deref()
+                        .map_or(String::new(), |l| format!(" gen={l}")),
                 );
                 let mut finding = Finding::new(
                     target.as_str(),

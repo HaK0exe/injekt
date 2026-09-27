@@ -12,6 +12,13 @@ recon scan
 replay
 scan
 # flags (sorted --long, all levels)
+--ai-api-key
+--ai-endpoint
+--ai-max-suggestions
+--ai-model
+--ai-provider
+--ai-suggest
+--ai-timeout
 --allow-knowledge
 --allow-private
 --allow-secret-reuse
@@ -44,6 +51,7 @@ scan
 --file
 --force
 --format
+--generative
 --headers
 --hostname
 --hpp
@@ -57,6 +65,7 @@ scan
 --marker
 --max-candidates
 --max-duration
+--max-generated
 --max-pages
 --max-per-template
 --max-redirects

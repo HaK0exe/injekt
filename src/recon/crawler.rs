@@ -274,7 +274,16 @@ impl Crawler {
                 );
             }
             if depth < self.config.depth {
+                // Bounded queue: `queued` counts distinct URLs ever seen. Without a
+                // push-side cap, `?page=1..∞` traps queue tens of thousands of
+                // `Url` before `visited.len() >= max_pages` breaks the pop loop.
+                // Cap pending+visited to a small multiple of `max_pages`.
+                let queue_cap = self.config.max_pages.saturating_mul(4).max(64);
                 for link in extracted.links {
+                    if queued.len() >= queue_cap {
+                        dropped_over_cap += 1;
+                        break;
+                    }
                     if is_in_scope(&root, &link, self.config.include_subdomains)
                         && TargetUrl::parse(link.as_str(), self.config.allow_private).is_ok()
                         && robots.allows(link.path())

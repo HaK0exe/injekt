@@ -130,6 +130,15 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--oob-domain <DOMAIN>` | Collaborator base domain (enables OOB probes, **OPT-IN**) | — |
 | `--oob-poll-url <URL>` | Poll URL with `{token}` placeholder (auto-confirm callbacks) | — |
 | `--oob-wait-secs <N>` | Seconds to wait for async DB-side OOB query before polling | `5` |
+| `--ai-suggest` | AI suggestion second-pass (**OPT-IN**, post-échec uniquement): after a finding-less run blocked by WAF (`403/406/429`), app-filter (`400` streak), live WAF footprint, or `--confirm` drop, ask an external LLM for up to `--ai-max-suggestions` boolean TRUE/FALSE pairs, validate them locally, then re-probe (bounded, silent on failure; one LLM call max per parameter per run). OFF = 0 LLM call. Sends abstract signals only (context summary, DBMS belief, WAF vendor, payload skeletons) — never cookies/headers/target body/extracted data | `false` |
+| `--ai-provider <openai\|anthropic>` | LLM wire format: `openai` (Chat Completions) or `anthropic` (Messages). Required with `--ai-suggest` | — |
+| `--ai-endpoint <URL>` | LLM endpoint (`http(s)://`; prefer a local gateway, e.g. Ollama). Required with `--ai-suggest` | — |
+| `--ai-model <NAME>` | LLM model name. Required with `--ai-suggest` | — |
+| `--ai-api-key <STR>` | LLM API key (env `INJEKT_AI_API_KEY` preferred, never in config files; fully redacted in logs). Optional — local gateways often need none | — |
+| `--ai-max-suggestions <1-5>` | Max LLM-suggested TRUE/FALSE pairs re-probed per parameter (1 pair = 2 requests) | `3` |
+| `--ai-timeout <SECS>` | HTTP timeout for LLM provider calls | `30` |
+| `--generative <MODE>` | Payload generation mode (deterministic grammar, seeded): `off` = historical lists only (default, byte-identical), `conservative` = historical first then core-predicate pairs up to `--max-generated`, `aggressive` = whole historical list plus all predicates. Core includes spaceless shapes (`'OR(1)=(1)-- -`, no ` OR ` keyword — bypasses naive signature WAFs) and whitespace alternatives (tab/newline separators, `%09`/`%0A`) plus `EqInt`/`EqStr`/`Like`/`In`/`Between` × fences/logics; aggressive adds `Rlike`/`CaseWhen`/`Div`/`Xor`/`ChrFunc` (dialect-aware). Generated pairs are deduped against history (zero redundant requests) and flow through the unchanged tamper/evaluation/budget pipeline; findings cite `gen:<fence>+<logic>+<pred>[+tab\|+nl]` in evidence | `off` |
+| `--max-generated <0-32>` | Max generated pairs per parameter and technique (`0` disables generation even when `--generative` is set; 32 covers the max cyclic gap between spaceless shapes for any seed rotation) | `4` |
 | `--dbms <KIND>` | Force DBMS: `mysql`, `postgres`, `mssql`, `oracle` | auto-fingerprint |
 | `--extract` | Enable data extraction (opt-in, uses `SecretString`) | `false` |
 | `--output <PATH>` | Write report to file in `--format` serialization (0o600 on Unix, relative path, never overwrites an existing file) | stdout |

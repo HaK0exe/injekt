@@ -213,6 +213,12 @@ impl EncryptedExport {
         passphrase: &SecretString,
         path: &str,
     ) -> Result<Zeroizing<Vec<u8>>, ExportError> {
+        // Cap pre-read: un blob malveillant sans limite = OOM avant decrypt.
+        const MAX_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+        let meta = std::fs::metadata(path).map_err(|e| ExportError::Io(e.to_string()))?;
+        if meta.len() > MAX_BLOB_BYTES {
+            return Err(ExportError::Serialization("blob too large".to_owned()));
+        }
         let data = std::fs::read(path).map_err(|e| ExportError::Io(e.to_string()))?;
         let blob: EncryptedBlob =
             serde_json::from_slice(&data).map_err(|e| ExportError::Serialization(e.to_string()))?;

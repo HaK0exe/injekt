@@ -417,6 +417,22 @@ pub struct SessionState {
     /// Reasoning trace (C6): hashes only, RAM-only, zeroized on drop.
     /// Never holds clear payload/body/cookie/token.
     trace: crate::reasoning::ReasoningTrace,
+    /// Param keys (`id@query`) whose boolean probe hit the app signature
+    /// filter (`400` streak ≥ `FILTER_STREAK_LIMIT`, A1-style). Drives the
+    /// `--ai-suggest` trigger (post-échec uniquement). RAM-only, cleared on
+    /// `wipe`/drop like the rest of the session.
+    app_filter_hits: Vec<String>,
+    /// Param keys (`id@query`) dont au moins une sonde a reçu `403`/`406`/`429`
+    /// en phase détection (WAF/challenge/rate-limit live). Distinct de
+    /// `app_filter_hits` (`400` applicatif) et des compteurs `detectability`
+    /// absorbés en fin de run : mémorisé pour le trigger `--ai-suggest`.
+    /// RAM-only, cleared on `wipe`/drop.
+    waf_hits: Vec<String>,
+    /// Param keys déjà couvertes par un passage `--ai-suggest` ce run
+    /// (détection ou post-confirm). Un seul appel LLM par param : borne les
+    /// coûts même en cas de triggers multiples. RAM-only, cleared on
+    /// `wipe`/drop.
+    ai_attempted: Vec<String>,
     /// Effective run seed (`--seed`), recorded for `--explain` / replay.
     /// `None` = historical OS-random behaviour.
     seed: Option<u64>,
@@ -457,6 +473,18 @@ impl Zeroize for SessionState {
         self.detectability = Detectability::default();
         self.started_at = None;
         self.trace.zeroize();
+        for hit in &mut self.app_filter_hits {
+            hit.zeroize();
+        }
+        self.app_filter_hits.clear();
+        for hit in &mut self.waf_hits {
+            hit.zeroize();
+        }
+        self.waf_hits.clear();
+        for hit in &mut self.ai_attempted {
+            hit.zeroize();
+        }
+        self.ai_attempted.clear();
         self.seed = None;
     }
 }
@@ -480,6 +508,9 @@ impl SessionState {
             detectability: Detectability::default(),
             started_at: Some(Utc::now()),
             trace: crate::reasoning::ReasoningTrace::new(),
+            app_filter_hits: Vec::new(),
+            waf_hits: Vec::new(),
+            ai_attempted: Vec::new(),
             seed: None,
         }
     }
@@ -631,6 +662,49 @@ impl SessionState {
         self.detectability
     }
 
+    /// Record that `param_key` (`id@query`) hit the app signature filter
+    /// (boolean `400` streak pruned early). Bounded: one entry per param
+    /// (deduped), set only from the boolean probe. Drives `--ai-suggest`.
+    pub fn note_app_filter_hit(&mut self, param_key: &str) {
+        if !self.app_filter_hits.iter().any(|k| k == param_key) {
+            self.app_filter_hits.push(param_key.to_owned());
+        }
+    }
+
+    /// `true` when `param_key` was pruned by the app signature filter.
+    #[must_use]
+    pub fn app_filter_hit(&self, param_key: &str) -> bool {
+        self.app_filter_hits.iter().any(|k| k == param_key)
+    }
+
+    /// Record a live WAF/challenge/rate-limit hit (`403`/`406`/`429`) on a
+    /// probe for `param_key`. Bounded: one entry per param (deduped).
+    pub fn note_waf_hit(&mut self, param_key: &str) {
+        if !self.waf_hits.iter().any(|k| k == param_key) {
+            self.waf_hits.push(param_key.to_owned());
+        }
+    }
+
+    /// `true` when `param_key` saw a live WAF hit during detection.
+    #[must_use]
+    pub fn waf_hit(&self, param_key: &str) -> bool {
+        self.waf_hits.iter().any(|k| k == param_key)
+    }
+
+    /// Record an `--ai-suggest` pass for `param_key` (one LLM call max per
+    /// param per run, detection + post-confirm sharing this lock).
+    pub fn note_ai_attempted(&mut self, param_key: &str) {
+        if !self.ai_attempted.iter().any(|k| k == param_key) {
+            self.ai_attempted.push(param_key.to_owned());
+        }
+    }
+
+    /// `true` when `param_key` already got its AI pass.
+    #[must_use]
+    pub fn has_ai_attempted(&self, param_key: &str) -> bool {
+        self.ai_attempted.iter().any(|k| k == param_key)
+    }
+
     #[must_use]
     pub fn started_at(&self) -> Option<DateTime<Utc>> {
         self.started_at
@@ -670,6 +744,18 @@ impl SessionState {
         self.request_count = 0;
         self.detectability = Detectability::default();
         self.trace.zeroize();
+        for hit in &mut self.app_filter_hits {
+            hit.zeroize();
+        }
+        self.app_filter_hits.clear();
+        for hit in &mut self.waf_hits {
+            hit.zeroize();
+        }
+        self.waf_hits.clear();
+        for hit in &mut self.ai_attempted {
+            hit.zeroize();
+        }
+        self.ai_attempted.clear();
         self.seed = None;
     }
 }
@@ -699,6 +785,9 @@ impl Clone for SessionState {
             detectability: self.detectability,
             started_at: self.started_at,
             trace: self.trace.clone(),
+            app_filter_hits: self.app_filter_hits.clone(),
+            waf_hits: self.waf_hits.clone(),
+            ai_attempted: self.ai_attempted.clone(),
             seed: self.seed,
         }
     }

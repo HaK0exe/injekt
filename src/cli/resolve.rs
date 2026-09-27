@@ -308,6 +308,29 @@ impl Cli {
         Ok(())
     }
 
+    /// Normalized generation mode (`--generative`). `None`/unknown →
+    /// `Off` (fail-closed, byte-identical default).
+    #[must_use]
+    pub fn effective_generative_mode(&self) -> crate::generation::GenerativeMode {
+        self.detection
+            .generative
+            .as_deref()
+            .and_then(crate::generation::GenerativeMode::from_name)
+            .unwrap_or(crate::generation::GenerativeMode::Off)
+    }
+
+    /// Effective generated-pairs cap `0..=MAX_GENERATED` (clap garantit déjà la range ;
+    /// clamp défensif pour les constructions manuelles). Défaut 4.
+    #[must_use]
+    pub const fn effective_max_generated(&self) -> u8 {
+        let v = self.detection.max_generated;
+        if v > crate::generation::MAX_GENERATED {
+            crate::generation::MAX_GENERATED
+        } else {
+            v
+        }
+    }
+
     /// Fail fast on an explicit `--config` path that cannot be read or parsed.
     /// Auto-discovered files never fail (they warn in [`Self::file_snapshot`]).
     ///
@@ -344,14 +367,19 @@ impl Cli {
     }
 
     /// Assemble [`PayloadOpts`] from CLI flags. Unknown `--fetch-using`
-    /// values fall back to `Direct` (clap constrains choices anyway).
+    /// values warn + fall back to `Direct` (clap constrains choices anyway;
+    /// manual/MCP constructions hit this path).
     #[must_use]
     pub fn payload_opts(&self) -> crate::techniques::payload_opts::PayloadOpts {
         use crate::techniques::payload_opts::FetchUsing;
         let fetch_using = match self.detection.fetch_using.as_deref() {
             Some("boolean") => FetchUsing::Boolean,
             Some("time") => FetchUsing::Time,
-            _ => FetchUsing::Direct,
+            Some("direct" | "") | None => FetchUsing::Direct,
+            Some(other) => {
+                tracing::warn!(value = %other, "unknown --fetch-using, falling back to direct");
+                FetchUsing::Direct
+            }
         };
         crate::techniques::payload_opts::PayloadOpts {
             prefix: self.evasion.prefix.clone(),
@@ -702,6 +730,8 @@ mod tests {
                 jitter: None,
                 allow_private: false,
                 max_redirects: None,
+                discover_params: false,
+                max_discover: 0,
             },
             detection: DetectionOpts {
                 threads: None,
@@ -732,6 +762,8 @@ mod tests {
                 ai_api_key: None,
                 ai_max_suggestions: 3,
                 ai_timeout: 30,
+                generative: None,
+                max_generated: 4,
             },
             evasion: EvasionOpts {
                 prefix: None,
@@ -1085,5 +1117,28 @@ mod tests {
         assert_eq!(cli.effective_ai_max_suggestions(), 3);
         cli.detection.ai_timeout = 0;
         assert_eq!(cli.effective_ai_timeout(), 1);
+    }
+
+    #[test]
+    fn generative_defaults_to_off_byte_identical() {
+        use crate::generation::GenerativeMode;
+        let cli = blank_cli();
+        assert_eq!(cli.effective_generative_mode(), GenerativeMode::Off);
+        assert_eq!(cli.effective_max_generated(), 4);
+        let mut cli = blank_cli();
+        cli.detection.generative = Some("conservative".to_owned());
+        assert_eq!(
+            cli.effective_generative_mode(),
+            GenerativeMode::Conservative
+        );
+        cli.detection.generative = Some("  AGGRESSIVE ".to_owned());
+        assert_eq!(cli.effective_generative_mode(), GenerativeMode::Aggressive);
+        cli.detection.generative = Some("nope".to_owned());
+        assert_eq!(cli.effective_generative_mode(), GenerativeMode::Off);
+        cli.detection.max_generated = 99;
+        assert_eq!(
+            cli.effective_max_generated(),
+            crate::generation::MAX_GENERATED
+        );
     }
 }

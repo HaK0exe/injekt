@@ -470,7 +470,9 @@ impl HttpClient {
     }
 
     fn record_throttle(&self, status: u16) {
-        if status == 403 {
+        // `406` counts with `403`: both are WAF deny/challenge codes in
+        // `Baseline::WAF_BLOCK_STATUSES`; `429` stays separate (rate-limit).
+        if status == 403 || status == 406 {
             self.throttle_403.fetch_add(1, Ordering::Relaxed);
         } else if status == 429 {
             self.throttle_429.fetch_add(1, Ordering::Relaxed);

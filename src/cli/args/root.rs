@@ -177,6 +177,18 @@ pub struct ReconCrawlArgs {
     pub include_subdomains: bool,
     #[arg(long)]
     pub ignore_robots: bool,
+    /// Enable parameter discovery fuzzing after crawl completes.
+    /// After the normal crawl finishes, each known candidate is retested
+    /// with a curated wordlist via differential oracle (status/length/body diff).
+    /// Opt-in: 0 finding is emitted; candidates are forwarded to the normal
+    /// detection pipeline so they can be scored like any other param.
+    #[arg(long, default_value_t = false)]
+    pub discover_params: bool,
+    /// Maximum number of discovery fuzzing rounds (bounded by request budget).
+    /// Default 32 keeps total added requests <= 32 * |candidates| capped at
+    /// a safe multiple of threads; set to 0 to use a heuristic of min(64, |candidates|).
+    #[arg(long, default_value_t = 0)]
+    pub max_discover: usize,
 }
 
 #[derive(Parser, Debug, Clone)]

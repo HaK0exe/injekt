@@ -73,6 +73,9 @@ pub async fn run_scan(
     if let Err(e) = cli.validate_explicit_config() {
         anyhow::bail!("{e}");
     }
+    if let Err(e) = cli.validate_ai_opts() {
+        anyhow::bail!("{e}");
+    }
     tracing::info!(resolution=%cli.resolution_summary(), "recon config resolved");
     let client = build_client(cli, cli.http.allow_private)?;
     let crawl_report = crawl(cli, client.clone(), &args.crawl, &cancel).await?;

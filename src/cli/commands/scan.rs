@@ -36,6 +36,9 @@ pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult
     if let Err(e) = cli.validate_explicit_config() {
         return Err(crate::error::InjektError::Other(e.into()).into());
     }
+    if let Err(e) = cli.validate_ai_opts() {
+        return Err(crate::error::InjektError::Other(e.into()).into());
+    }
     // `--import` is not a scan-resume flag: session resume lives in
     // `replay --file` (decrypt + summary) and `recon import --file`.
     // Fail fast instead of silently ignoring it.
@@ -51,7 +54,7 @@ pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult
     info!(resolution=%cli.resolution_summary(), "scan config resolved");
     let target = cli
         .effective_target()
-        .ok_or_else(|| crate::error::InjektError::Other("target required".into()))?;
+        .ok_or_else(|| crate::error::InjektError::NoTarget)?;
 
     let client = build_client(cli, cli.http.allow_private)?;
     let cfg = build_engine_config(cli, EnumGate::Passthrough);

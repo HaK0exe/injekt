@@ -46,6 +46,14 @@ pub struct HttpOpts {
     /// cross-origin regardless of this value.
     #[arg(long = "max-redirects", global = true, value_parser = clap::value_parser!(u8).range(0..=10), env = "INJEKT_MAX_REDIRECTS", help_heading = "HTTP")]
     pub max_redirects: Option<u8>,
+
+    /// Enable parameter discovery fuzzing after crawl completes
+    #[arg(long, global = true, help_heading = "HTTP")]
+    pub discover_params: bool,
+
+    /// Maximum number of discovery fuzzing rounds
+    #[arg(long, global = true, default_value_t = 0, help_heading = "HTTP")]
+    pub max_discover: usize,
 }
 
 // Manual `Debug` for `HttpOpts` so `--cookies` / `--proxy` / `--headers`
@@ -66,6 +74,8 @@ impl core::fmt::Debug for HttpOpts {
             .field("jitter", &self.jitter)
             .field("allow_private", &self.allow_private)
             .field("max_redirects", &self.max_redirects)
+            .field("discover_params", &self.discover_params)
+            .field("max_discover", &self.max_discover)
             .finish_non_exhaustive()
     }
 }

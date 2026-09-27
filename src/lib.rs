@@ -4,11 +4,13 @@
 #![deny(clippy::dbg_macro)]
 #![deny(clippy::todo)]
 
+pub mod ai;
 pub mod cli;
 pub mod dbms;
 pub mod detection;
 pub mod engine;
 pub mod extraction;
+pub mod generation;
 pub mod http;
 pub mod mcp;
 pub mod mutation;

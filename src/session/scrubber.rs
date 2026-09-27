@@ -97,6 +97,8 @@ fn is_sensitive_header(name: &str) -> bool {
             | "x-session-token"
             | "x-csrf-token"
             | "x-csrftoken"
+            | "x-client-id"
+            | "client-id"
             | "api-key"
             | "api-secret"
             | "api-token"
@@ -106,7 +108,11 @@ fn is_sensitive_header(name: &str) -> bool {
             | "id-token"
             | "client-secret"
             | "session-token"
+            | "sessionid"
             | "csrf-token"
+            | "token"
+            | "aws-secret"
+            | "private-key"
     )
 }
 
@@ -116,7 +122,7 @@ fn scrub_headers(input: &str) -> String {
         // Both patterns are static; if either fails to compile, skip header
         // scrubbing for this input — never panic in prod.
         Regex::new(
-            r"(?i)(authorization|proxy-authorization|proxy-authenticate|www-authenticate|authentication|cookie2?|set-cookie2?|x-api-key|x-api-token|x-api-secret|x-auth-token|x-access-token|x-session-token|x-csrf-token|x-csrftoken|api-key|api-secret|api-token|apikey|access-token|refresh-token|id-token|client-secret|session-token|csrf-token)\s*:\s*[^\r\n]+",
+            r"(?i)(authorization|proxy-authorization|proxy-authenticate|www-authenticate|authentication|cookie2?|set-cookie2?|x-api-key|x-api-token|x-api-secret|x-auth-token|x-access-token|x-session-token|x-csrf-token|x-csrftoken|x-client-id|client-id|api-key|api-secret|api-token|apikey|access-token|refresh-token|id-token|client-secret|session-token|sessionid|csrf-token|token|aws-secret|private-key)\s*:\s*[^\r\n]+",
         )
         .or_else(|_| Regex::new(r"(?i)authorization\s*:\s*[^\r\n]+"))
         .ok()

@@ -88,6 +88,9 @@ pub async fn run(cli: &Cli, args: &AutoArgs, cancel: CancellationToken) -> anyho
     if let Err(e) = cli.validate_explicit_config() {
         anyhow::bail!("{e}");
     }
+    if let Err(e) = cli.validate_ai_opts() {
+        anyhow::bail!("{e}");
+    }
     let auto_target = args.target.clone().or_else(|| cli.effective_target());
     let targets = super::common::resolve_targets(cli, auto_target.as_deref())?;
 
@@ -299,6 +302,8 @@ async fn run_auto_recon(
         max_candidates: 500,
         include_subdomains: false,
         ignore_robots: false,
+        discover_params: cli.http.discover_params,
+        max_discover: cli.http.max_discover,
     };
     tracing::info!(target = %scrubber.scrub(&seed), "auto recon crawl");
     let crawl = super::recon::run_crawl(cli, cancel.clone(), &crawl_args).await?;

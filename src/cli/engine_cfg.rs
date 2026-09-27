@@ -143,5 +143,24 @@ pub fn build_engine_config(cli: &Cli, enum_gate: EnumGate) -> EngineConfig {
             max_stores: cli.effective_second_order_max_stores(),
             ..crate::engine::orchestrator::SecondOrderConfig::default()
         },
+        ai: crate::ai::AiSuggestConfig::from_cli(
+            cli.detection.ai_suggest,
+            cli.detection
+                .ai_provider
+                .as_deref()
+                .and_then(crate::ai::AiProviderKind::from_name),
+            cli.detection.ai_endpoint.clone(),
+            cli.detection.ai_model.clone(),
+            cli.detection
+                .ai_api_key
+                .clone()
+                .map(secrecy::SecretString::from),
+            cli.effective_ai_max_suggestions(),
+            cli.effective_ai_timeout(),
+        ),
+        generative: crate::generation::GenerativeConfig::from_parts(
+            cli.effective_generative_mode(),
+            cli.effective_max_generated(),
+        ),
     }
 }

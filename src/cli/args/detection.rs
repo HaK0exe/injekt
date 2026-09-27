@@ -316,6 +316,39 @@ pub struct DetectionOpts {
         hide_short_help = true
     )]
     pub ai_timeout: u64,
+
+    /// Payload generation mode (Track A grammar, deterministic + seeded):
+    /// `off` = historical lists only (default, byte-identical),
+    /// `conservative` = historical first, then core-predicate pairs
+    /// (`EqInt`/`EqStr`/`Like`/`In`/`Between` × fences/logics) up to
+    /// `--max-generated`, `aggressive` = whole historical list plus all
+    /// predicates (core + `Rlike`/`CaseWhen`/`Div`/`Xor`/`ChrFunc`,
+    /// dialect-aware). Generated pairs are deduped against history
+    /// (zero redundant requests) and flow through the unchanged tamper /
+    /// evaluation / budget pipeline.
+    #[arg(
+        long = "generative",
+        global = true,
+        env = "INJEKT_GENERATIVE",
+        value_parser = ["off", "conservative", "aggressive"],
+        help_heading = "Detection",
+        hide_short_help = true
+    )]
+    pub generative: Option<String>,
+
+    /// Max generated pairs per parameter and technique [default: 4, range 0..=32].
+    /// `0` disables generation even when `--generative` is set. 32 covers the
+    /// max cyclic gap between spaceless shapes for any seed rotation.
+    #[arg(
+        long = "max-generated",
+        global = true,
+        default_value_t = 4,
+        value_parser = clap::value_parser!(u8).range(0..=32),
+        env = "INJEKT_MAX_GENERATED",
+        help_heading = "Detection",
+        hide_short_help = true
+    )]
+    pub max_generated: u8,
 }
 
 // Manual `Debug` for `DetectionOpts`: `--data` may carry `password=` secrets
@@ -356,6 +389,8 @@ impl core::fmt::Debug for DetectionOpts {
             .field("ai_api_key", &redacted_opt(&self.ai_api_key))
             .field("ai_max_suggestions", &self.ai_max_suggestions)
             .field("ai_timeout", &self.ai_timeout)
+            .field("generative", &self.generative)
+            .field("max_generated", &self.max_generated)
             .finish_non_exhaustive()
     }
 }

@@ -7,7 +7,7 @@ use crate::{
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
@@ -152,6 +152,8 @@ impl InjektServer {
                 jitter: None,
                 allow_private: false,
                 max_redirects: None,
+                discover_params: false,
+                max_discover: 0,
             },
             detection: crate::cli::args::DetectionOpts {
                 threads: None,
@@ -187,6 +189,10 @@ impl InjektServer {
                 ai_api_key: None,
                 ai_max_suggestions: 3,
                 ai_timeout: 30,
+                // Generation stays CLI-only like `--ai-suggest` (explicit
+                // operator opt-in; MCP keeps the historical lists).
+                generative: None,
+                max_generated: 4,
             },
             evasion: crate::cli::args::EvasionOpts {
                 prefix: None,
@@ -322,6 +328,8 @@ impl InjektServer {
         }
         cli.http.cookies = cookies;
         cli.http.allow_private = allow_private.unwrap_or(false);
+        cli.http.discover_params = false; // default, will be overridden if needed
+        cli.http.max_discover = 0; // default
     }
 
     fn build_recon_crawl(params: ReconCrawlParams) -> (Cli, ReconCrawlArgs) {
@@ -333,6 +341,8 @@ impl InjektServer {
             max_candidates: params.max_candidates.unwrap_or(500),
             include_subdomains: params.include_subdomains.unwrap_or(false),
             ignore_robots: params.ignore_robots.unwrap_or(false),
+            discover_params: params.discover_params.unwrap_or(false),
+            max_discover: params.max_discover.unwrap_or(0),
         };
         let mut cli = Self::base_cli();
         cli.command = Some(Commands::Recon(ReconArgs {
@@ -345,6 +355,8 @@ impl InjektServer {
         cli.http.retries = params.retries;
         cli.http.delay = params.delay;
         cli.http.max_redirects = params.max_redirects;
+        cli.http.discover_params = params.discover_params.unwrap_or(false);
+        cli.http.max_discover = params.max_discover.unwrap_or(0);
         Self::apply_common_network_opts(
             &mut cli,
             params.proxy,
@@ -367,6 +379,8 @@ impl InjektServer {
                 max_candidates: params.max_candidates.unwrap_or(500),
                 include_subdomains: params.include_subdomains.unwrap_or(false),
                 ignore_robots: params.ignore_robots.unwrap_or(false),
+                discover_params: params.discover_params.unwrap_or(false),
+                max_discover: params.max_discover.unwrap_or(0),
             },
             auto_enumerate: params.auto_enumerate.unwrap_or(false),
         };
@@ -427,6 +441,8 @@ impl InjektServer {
         cli.http.retries = params.retries;
         cli.http.delay = params.delay;
         cli.http.max_redirects = params.max_redirects;
+        cli.http.discover_params = params.discover_params.unwrap_or(false);
+        cli.http.max_discover = params.max_discover.unwrap_or(0);
         Self::apply_common_network_opts(
             &mut cli,
             params.proxy,
@@ -656,8 +672,8 @@ impl InjektServer {
 // each one awaits; signature isn't ours to change.
 #[allow(clippy::unused_async_trait_impl)]
 impl ServerHandler for InjektServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "injekt",
                 env!("CARGO_PKG_VERSION"),
@@ -821,6 +837,10 @@ pub struct ReconCrawlParams {
     pub allow_private: Option<bool>,
     /// Max redirects followed per request (default: 5, 0 = do not follow)
     pub max_redirects: Option<u8>,
+    /// Enable parameter discovery fuzzing after crawl completes.
+    pub discover_params: Option<bool>,
+    /// Maximum number of discovery fuzzing rounds
+    pub max_discover: Option<usize>,
 }
 
 /// Parameters for the `recon_scan` tool (crawl + test discovered parameters).
@@ -943,6 +963,10 @@ pub struct ReconScanParams {
     pub allow_private: Option<bool>,
     /// Max redirects followed per request (default: 5, 0 = do not follow)
     pub max_redirects: Option<u8>,
+    /// Enable parameter discovery fuzzing after crawl completes.
+    pub discover_params: Option<bool>,
+    /// Maximum number of discovery fuzzing rounds
+    pub max_discover: Option<usize>,
     /// Disable redaction in output (local debugging only)
     pub no_redact: Option<bool>,
 }
