@@ -2,10 +2,10 @@
 
 use crate::session::state::SessionState;
 use argon2::{Algorithm, Argon2, Params, Version};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
+    XChaCha20Poly1305, XNonce,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -37,7 +37,10 @@ struct EncryptedBlob {
     kdf: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// `Debug` is manual: `findings` render via the scrubbed [`Finding`]
+/// impl, `extracted` (dump DB rows) shows a count only — a `{:?}` of a
+/// snapshot must never carry secret material into logs.
+#[derive(Serialize, Deserialize)]
 struct Snapshot {
     findings: Vec<crate::session::state::Finding>,
     /// Extracted DB data (banner, tables, dump rows, …) — the whole point of
@@ -93,6 +96,18 @@ impl Zeroize for Snapshot {
         self.request_count.zeroize();
         self.started_at = None;
         self.seed = None;
+    }
+}
+
+impl core::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("findings", &self.findings)
+            .field("extracted_count", &self.extracted.len())
+            .field("request_count", &self.request_count)
+            .field("trace_count", &self.trace.len())
+            .field("seed", &self.seed)
+            .finish_non_exhaustive()
     }
 }
 
@@ -358,6 +373,30 @@ mod tests {
         assert!(json_str.contains("findings"));
         assert!(json_str.contains("request_count"));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn snapshot_debug_hides_extracted_dump() {
+        // NOTE: the scrubber redacts keyed secrets (`?token=`, `session=`);
+        // bare opaque words without key context cannot be distinguished from
+        // prose without false positives, so fixtures use keyed secrets.
+        let snapshot = Snapshot {
+            findings: vec![Finding::new(
+                "https://example.com/?token=secret123",
+                "id@query",
+                TechniqueKind::Boolean,
+                0.9,
+                "boolean split, session=secret123",
+            )],
+            extracted: vec!["dump row secret123".to_owned()],
+            request_count: 3,
+            started_at: None,
+            trace: Vec::new(),
+            seed: Some(42),
+        };
+        let rendered = format!("{snapshot:?}");
+        assert!(!rendered.contains("secret123"), "{rendered}");
+        assert!(rendered.contains("extracted_count"), "{rendered}");
     }
 
     #[test]
