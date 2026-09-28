@@ -2,9 +2,10 @@
 
 use clap::Args;
 
-/// Target selection: every ingestion source is additive
-/// (`--target`, `--bulk-file`, `--raw-file`, `--raw-dir`, `--stdin`,
-/// `--openapi-file`, `--sitemap-file`).
+/// Target selection. Bulk ingestion (`--bulk-file`, `--raw-dir`, `--stdin`,
+/// `--openapi-file`, `--sitemap-file`, `collect_targets`) is additive;
+/// single-scan (`--target` / `scan --target` / `--raw-file`) is exclusive —
+/// `--raw-file` wins and `--target` is ignored (see `Cli::resolve`).
 #[derive(Clone, Args)]
 #[non_exhaustive]
 pub struct TargetOpts {

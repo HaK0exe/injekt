@@ -12,7 +12,14 @@ pub enum RawRequestError {
     Header(String),
     #[error("missing host")]
     MissingHost,
+    #[error("too many headers ({0} > {MAX_HEADERS})")]
+    TooManyHeaders(usize),
 }
+
+/// Cap on parsed header lines: the file itself is capped at 2 MiB
+/// (`MAX_RAW_FILE_BYTES`), but a header-only bomb of tiny lines would
+/// otherwise bloat the `HashMap` before any limit bites.
+pub const MAX_HEADERS: usize = 100;
 
 /// Parsed Burp/ZAP style raw request.
 ///
@@ -65,11 +72,19 @@ impl RawRequest {
         let method = parts[0].to_owned();
         let path = parts[1].to_owned();
         let http_version = parts.get(2).unwrap_or(&"HTTP/1.1").to_string();
+        // A garbage third token (`GET / FOO`) is not a request line worth
+        // ingesting: Burp/ZAP always write `HTTP/1.1` (or `HTTP/2`).
+        if !http_version.starts_with("HTTP/") {
+            return Err(RawRequestError::RequestLine(request_line.to_owned()));
+        }
 
         let mut headers = HashMap::new();
         for line in lines {
             if line.is_empty() {
                 continue;
+            }
+            if headers.len() >= MAX_HEADERS {
+                return Err(RawRequestError::TooManyHeaders(headers.len() + 1));
             }
             if let Some((k, v)) = line.split_once(':') {
                 // Lowercase at insertion: single canonical form, O(1) lookups
@@ -186,5 +201,31 @@ mod tests {
             r.to_url_with_port_hint().as_deref(),
             Some("http://example.com/?id=1")
         );
+    }
+
+    #[test]
+    fn rejects_garbage_http_version() {
+        let raw = "GET /?id=1 FOO\nHost: example.com\n\n";
+        assert!(matches!(
+            RawRequest::parse(raw),
+            Err(RawRequestError::RequestLine(_))
+        ));
+        // `HTTP/2` stays accepted.
+        let raw = "GET /?id=1 HTTP/2\nHost: example.com\n\n";
+        assert!(RawRequest::parse(raw).is_ok());
+    }
+
+    #[test]
+    fn rejects_header_bomb() {
+        use std::fmt::Write as _;
+        let mut raw = String::from("GET / HTTP/1.1\nHost: example.com\n");
+        for i in 0..MAX_HEADERS {
+            let _ = writeln!(raw, "X-Pad-{i}: v");
+        }
+        raw.push('\n');
+        assert!(matches!(
+            RawRequest::parse(&raw),
+            Err(RawRequestError::TooManyHeaders(_))
+        ));
     }
 }
