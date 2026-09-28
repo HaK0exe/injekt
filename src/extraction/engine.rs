@@ -4,9 +4,14 @@ use crate::error::InjektError;
 use crate::extraction::verification::verify_length;
 use futures::StreamExt;
 use secrecy::SecretString;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const MAX_LEN: usize = 4096;
+/// Base pacing between oracle vote retries: back-to-back bursts trip
+/// rate-limiters (`429` → abstention → aborted extraction), so retries are
+/// spaced `BASE * attempt` (100/200/300ms — negligible vs probe latency).
+const RETRY_PACING_BASE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -58,10 +63,23 @@ impl ExtractionEngine {
         let mut votes_true = 0usize;
         let mut votes_cast = 0usize;
         let mut last_err: Option<InjektError> = None;
+        // Linear pacing without casts: first vote immediate, then
+        // 100/200/300ms… between retries.
+        let mut pacing = Duration::ZERO;
         for _ in 0..max_retries.max(1) {
             if cancel.is_cancelled() {
                 return Err(InjektError::Cancelled);
             }
+            // Pace retries (skip before the first vote): instant bursts
+            // self-induce `429` on rate-limited targets, turning every vote
+            // into an abstention and aborting the extraction.
+            if !pacing.is_zero() {
+                tokio::select! {
+                    () = cancel.cancelled() => return Err(InjektError::Cancelled),
+                    () = tokio::time::sleep(pacing) => {},
+                }
+            }
+            pacing += RETRY_PACING_BASE;
             // Official tokio pattern: race the probe against cancellation.
             let probe = tokio::select! {
                 () = cancel.cancelled() => return Err(InjektError::Cancelled),
