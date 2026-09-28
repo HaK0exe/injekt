@@ -64,8 +64,11 @@ pub async fn scan_candidates(
                 if cancel.is_cancelled() {
                     return;
                 }
-                let engine =
-                    Engine::new(config, client, cancel.clone()).with_baseline_cache(baseline_cache);
+                // Shared client: per-engine detectability drains are skipped
+                // (they would race); the aggregate is drained once below.
+                let engine = Engine::new(config, client, cancel.clone())
+                    .with_baseline_cache(baseline_cache)
+                    .with_shared_client();
                 if let Err(error) = engine.run_candidate(&candidate).await {
                     errors.lock().await.push(format!(
                         "{} {} {}: {error}",
@@ -83,6 +86,16 @@ pub async fn scan_candidates(
         })
         .await;
     bar.finish_with_message("recon scan done");
+    // Single drain of the shared client's throttle counters: run-wide
+    // aggregate (per-engine attribution is meaningless under concurrency).
+    let (detect_403, detect_429) = client.take_detectability_counts();
+    if detect_403 != 0 || detect_429 != 0 {
+        tracing::info!(
+            count_403 = detect_403,
+            count_429 = detect_429,
+            "recon scan detectability (shared client aggregate)"
+        );
+    }
     let mut findings = findings.lock().await.clone();
     findings.sort_by(|left, right| {
         left.target

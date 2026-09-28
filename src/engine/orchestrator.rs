@@ -596,6 +596,11 @@ pub struct Engine {
     cancel: CancellationToken,
     scrubber: Scrubber,
     baseline_cache: Option<Arc<crate::recon::BaselineCache>>,
+    /// `true` when `client` is shared across concurrent engines (recon
+    /// scan): per-engine drains would race (`swap(0)` attributed to the
+    /// first finisher), so absorbs are skipped and the owner drains once
+    /// at the end of the whole run.
+    shared_client: bool,
 }
 
 /// Outcome of one concurrent baseline fetch (Phase 3, `join_all` borné).
@@ -621,7 +626,18 @@ impl Engine {
             cancel,
             scrubber,
             baseline_cache: None,
+            shared_client: false,
         }
+    }
+
+    /// Share ownership of `client` across concurrent engines (recon scan):
+    /// per-engine detectability drains are skipped (they would race) and
+    /// the caller drains once at the end via
+    /// [`HttpClient::take_detectability_counts`].
+    #[must_use]
+    pub fn with_shared_client(mut self) -> Self {
+        self.shared_client = true;
+        self
     }
 
     #[must_use]
@@ -1088,7 +1104,14 @@ impl Engine {
     /// Drain the [`HttpClient`] throttle counters into the run's
     /// detectability counters (C10, bench Annexe A). Take-semantics: each run
     /// is absorbed exactly once, even if the client is reused across runs.
+    /// Skipped when the client is shared across concurrent engines
+    /// ([`Engine::with_shared_client`]): the `swap(0)` would be attributed
+    /// to whichever engine finishes first, so the owner drains once at the
+    /// end of the whole run instead.
     async fn absorb_detectability(&self) {
+        if self.shared_client {
+            return;
+        }
         let (c403, c429) = self.client.take_detectability_counts();
         if c403 != 0 || c429 != 0 {
             self.state.write().await.add_detectability(c403, c429);
