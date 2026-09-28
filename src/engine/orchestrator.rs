@@ -1228,7 +1228,7 @@ impl Engine {
             }
             lock = cache.lock_for_key(&key) => lock,
         };
-        let _per_key = tokio::select! {
+        let per_key_guard = tokio::select! {
             biased;
             () = self.cancel.cancelled() => {
                 return Err(crate::error::InjektError::Cancelled);
@@ -1241,7 +1241,10 @@ impl Engine {
         if let Some((cached_baseline, cached_tampers, cached_opts)) = cache.get(&key).await
             && !(cached_baseline.is_waf_blocked() || cached_baseline.is_waf_blocking())
         {
-            return Ok(Some((cached_baseline, cached_tampers, cached_opts)));
+            let hit = (cached_baseline, cached_tampers, cached_opts);
+            drop(per_key_guard);
+            cache.remove_lock(&key).await;
+            return Ok(Some(hit));
         }
         // Blocking entry (or miss): bypass and re-collect below.
         let collected = self.collect_baseline_uncached(target, raw_request).await?;
@@ -1250,11 +1253,13 @@ impl Engine {
         {
             cache
                 .insert(
-                    key,
+                    key.clone(),
                     (fresh_baseline.clone(), fresh_tampers.clone(), *fresh_opts),
                 )
                 .await;
         }
+        drop(per_key_guard);
+        cache.remove_lock(&key).await;
         Ok(collected)
     }
 
