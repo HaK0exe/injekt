@@ -1065,7 +1065,11 @@ impl HttpClient {
 fn map_url_error(url: &str, e: &crate::target::url::UrlError) -> ClientError {
     use crate::target::url::UrlError;
     match e {
-        UrlError::PrivateIp => ClientError::PrivateHost(url.to_owned()),
+        // Scrubbed: `spec.url` may carry `?token=` secrets or userinfo and
+        // this error surfaces in `eprintln!`/logs via `Display`.
+        UrlError::PrivateIp => {
+            ClientError::PrivateHost(crate::session::scrubber::Scrubber::new(false).scrub(url))
+        }
         UrlError::Invalid(reason) => ClientError::InvalidUrl(reason.clone()),
         UrlError::Scheme(scheme) => {
             ClientError::InvalidUrl(format!("unsupported scheme: {scheme}"))
@@ -1182,5 +1186,17 @@ mod tests {
         assert!(rendered.contains("example.com"), "{rendered}");
         assert!(rendered.contains("[REDACTED]"), "{rendered}");
         assert!(rendered.contains("body_len"), "{rendered}");
+    }
+
+    #[test]
+    fn private_host_error_scrubs_url_secrets() {
+        let err = map_url_error(
+            "http://user:pass@127.0.0.1/?token=secret123",
+            &crate::target::url::UrlError::PrivateIp,
+        );
+        let rendered = format!("{err}");
+        assert!(!rendered.contains("secret123"), "{rendered}");
+        assert!(!rendered.contains("pass"), "{rendered}");
+        assert!(rendered.contains("127.0.0.1"), "{rendered}");
     }
 }
