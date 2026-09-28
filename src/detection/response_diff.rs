@@ -19,20 +19,42 @@ impl DiffResult {
 }
 
 const MAX_LEVENSHTEIN_LEN: usize = 1024;
+/// Volatile JSON string fields normalized to `""` (per-response randomness,
+/// CSRF tokens). Exact `"field"` match only, so real data is untouched.
+const VOLATILE_JSON_STRING_FIELDS: &[&str] = &[
+    "request_id",
+    "csrf_token",
+    "csrftoken",
+    "csrfmiddlewaretoken",
+    "_token",
+    "nonce",
+];
+/// Volatile JSON numeric fields normalized to `0` (epoch floats, timestamps).
+const VOLATILE_JSON_NUMERIC_FIELDS: &[&str] = &["generated_at", "timestamp"];
 /// Bench anti-noise: `bench/app.py::noisy()` injects a random `request_id`
 /// (8 hex chars) + `generated_at` (epoch float) into every JSON envelope so
-/// naive string-compare diffing breaks. Normalize both fields to fixed
+/// naive string-compare diffing breaks. Normalize volatile fields to fixed
 /// placeholders before any similarity so two identical pages with different
 /// noise compare ~1.0. Handles pretty-printed (`"request_id": "abc",`) and
 /// compact (`"request_id":"abc"`) shapes; unknown fields are untouched.
-/// Bodies without either marker are returned unchanged (cheap path).
+/// Bodies without any volatile marker are returned unchanged (cheap path).
 #[must_use]
 pub fn normalize_response_for_diff(body: &str) -> String {
-    if !body.contains("request_id") && !body.contains("generated_at") {
+    let has_volatile = VOLATILE_JSON_STRING_FIELDS
+        .iter()
+        .chain(VOLATILE_JSON_NUMERIC_FIELDS.iter())
+        .any(|f| body.contains(f));
+    if !has_volatile {
         return body.to_owned();
     }
-    let normalized_id = normalize_json_field(body, "request_id", "\"\"");
-    normalize_json_field(&normalized_id, "generated_at", "0")
+    let mut out = body.to_owned();
+    for field in VOLATILE_JSON_STRING_FIELDS {
+        out = normalize_json_field(&out, field, "\"\"");
+    }
+    for field in VOLATILE_JSON_NUMERIC_FIELDS {
+        out = normalize_json_field(&out, field, "0");
+    }
+    out
 }
 
 /// Replace the value of one `"field": <value>` JSON member with `placeholder`,
@@ -158,27 +180,28 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 
 #[inline]
 fn truncate(s: &str) -> &str {
-    if s.len() <= MAX_LEVENSHTEIN_LEN {
-        s
-    } else {
-        // Byte slicing can split a multi-byte char (emoji/CJK/accents) and
-        // panic. Walk back to the previous char boundary instead.
-        let mut end = MAX_LEVENSHTEIN_LEN;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        &s[..end]
+    // Char-based (not byte-based): 1024 CJK chars are ~3 KiB but cost the
+    // same DP as 1024 ASCII chars. Byte slicing would also under-truncate
+    // CJK to ~341 chars and overstate similarity denominators.
+    match s.char_indices().nth(MAX_LEVENSHTEIN_LEN) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
     }
 }
 
 /// Choose similarity strategy based on body size: Levenshtein for small, Jaccard for large.
 /// Both inputs are normalized for bench noise (`request_id`/`generated_at`)
 /// before comparison so per-response randomness never reads as a differential.
+///
+/// The switch is char-based: byte length would route ~350 CJK/emoji chars
+/// (>1024 bytes) to Jaccard while Levenshtein measures chars — degraded
+/// precision on non-ASCII targets.
 #[must_use]
 pub fn adaptive_similarity(a: &str, b: &str) -> f64 {
     let norm_a = normalize_response_for_diff(a);
     let norm_b = normalize_response_for_diff(b);
-    if norm_a.len() > MAX_LEVENSHTEIN_LEN || norm_b.len() > MAX_LEVENSHTEIN_LEN {
+    if norm_a.chars().count() > MAX_LEVENSHTEIN_LEN || norm_b.chars().count() > MAX_LEVENSHTEIN_LEN
+    {
         jaccard(&norm_a, &norm_b)
     } else {
         levenshtein_similarity(&norm_a, &norm_b)
@@ -276,17 +299,27 @@ mod tests {
     }
     #[test]
     fn truncate_never_splits_char_boundary() {
-        // `🌍` is 4 bytes: pad so the 4096-byte cut lands mid-char.
+        // `🌍` is 4 bytes: char-based truncation keeps whole chars.
         let s = format!("{}{}", "a".repeat(4095), "🌍".repeat(8));
-        assert!(s.len() > MAX_LEVENSHTEIN_LEN);
+        assert!(s.chars().count() > MAX_LEVENSHTEIN_LEN);
         let t = truncate(&s);
-        assert!(t.len() <= MAX_LEVENSHTEIN_LEN);
+        assert!(t.chars().count() <= MAX_LEVENSHTEIN_LEN);
         assert!(s.starts_with(t));
         // Must not panic and must stay valid UTF-8 (len check is enough:
         // `&s[..end]` would have panicked above on a split boundary).
         assert!(t.is_char_boundary(t.len()));
         // Similarity over such bodies must not panic either.
         let _ = levenshtein_similarity(&s, &s);
+    }
+    #[test]
+    fn cjk_bodies_use_levenshtein_not_jaccard() {
+        // 400 CJK chars = 1200 bytes: the old byte-length switch routed this
+        // to Jaccard; char-based routing keeps precise Levenshtein.
+        let a = "漢".repeat(400);
+        let b = format!("{}{}{}", "漢".repeat(200), "字", "漢".repeat(199));
+        assert!(a.len() > MAX_LEVENSHTEIN_LEN);
+        assert!(a.chars().count() <= MAX_LEVENSHTEIN_LEN);
+        assert!(adaptive_similarity(&a, &b) > 0.95);
     }
     #[test]
     fn bench_noise_normalized_before_similarity() {
@@ -307,5 +340,23 @@ mod tests {
         let body = "{\"data\": [1, 2, 3]}";
         assert_eq!(normalize_response_for_diff(body), body);
         assert_eq!(normalize_response_for_diff(""), "");
+    }
+    #[test]
+    fn csrf_nonce_noise_normalized_before_similarity() {
+        // Django/Laravel shape: per-response CSRF + timestamp must not read
+        // as a differential (false positive).
+        let a = "{\"data\":1,\"csrf_token\":\"abc123\",\"timestamp\":1757328000.1}";
+        let b = "{\"data\":1,\"csrf_token\":\"xyz789\",\"timestamp\":1757328001.9}";
+        assert!(adaptive_similarity(a, b) > 0.95);
+        let diff = diff_against_baseline(a, b, 100.0, 105.0, 100.0);
+        assert!(!diff.is_significant());
+        // Real data fields are untouched: placeholders replace only volatile
+        // values, data differences survive normalization.
+        let norm_c =
+            normalize_response_for_diff("{\"data\":[1,2,3,4,5,6],\"csrf_token\":\"same\"}");
+        let norm_d = normalize_response_for_diff("{\"data\":[9,8,7],\"csrf_token\":\"same\"}");
+        assert!(norm_c.contains("[1,2,3,4,5,6]"));
+        assert!(norm_d.contains("[9,8,7]"));
+        assert_ne!(norm_c, norm_d);
     }
 }
