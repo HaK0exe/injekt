@@ -41,6 +41,7 @@ scan
 --dbs
 --delay
 --depth
+--discover-params
 --dry-run
 --dump
 --enumerate
@@ -64,6 +65,7 @@ scan
 --level
 --marker
 --max-candidates
+--max-discover
 --max-duration
 --max-generated
 --max-pages
