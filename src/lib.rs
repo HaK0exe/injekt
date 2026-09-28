@@ -51,13 +51,17 @@ pub mod error {
 
     impl From<std::io::Error> for InjektError {
         fn from(err: std::io::Error) -> Self {
-            Self::Other(Box::new(err))
+            // Typed (not `Other`): IO failures get the `io error:` prefix in
+            // CLI output instead of a bare boxed message.
+            Self::Io(err.to_string())
         }
     }
 
     impl From<reqwest::Error> for InjektError {
         fn from(err: reqwest::Error) -> Self {
-            Self::Other(Box::new(err))
+            // Typed (not `Other`): transport failures render as
+            // `http error: …` like the hand-built `Http` sites.
+            Self::Http(err.to_string())
         }
     }
 
@@ -92,4 +96,17 @@ pub mod error {
     }
 
     pub type Result<T, E = InjektError> = core::result::Result<T, E>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error::InjektError;
+
+    #[test]
+    fn io_conversion_renders_typed_prefix() {
+        let err = InjektError::from(std::io::Error::other("disk gone"));
+        assert!(matches!(err, InjektError::Io(_)));
+        let rendered = format!("{err}");
+        assert!(rendered.starts_with("io error:"), "{rendered}");
+    }
 }
