@@ -1305,15 +1305,22 @@ impl Engine {
                     if self.cancel.is_cancelled() {
                         return BaselineOutcome::Cancelled;
                     }
-                    let start = Instant::now();
                     let spec = raw_request.map_or_else(
                         || RequestSpec::get(target.as_str().to_owned()),
                         |raw| request_spec_from_raw(target, raw),
                     );
-                    let resp = self.client.send_with_retry(spec, &self.cancel).await;
-                    let elapsed = start.elapsed();
-                    match resp {
-                        Ok(r) => {
+                    // Pure-send timing: `elapsed_send` covers only the last
+                    // successful `req.send()` — never local pacing (jitter /
+                    // rate-limit / backoff). Pacing-inflated durations widened
+                    // `mean/stddev` and desensitized the `time` detector.
+                    let timed = self
+                        .client
+                        .send_with_retry_timed_for_class(spec, RequestClass::Default, &self.cancel)
+                        .await;
+                    match timed {
+                        Ok(t) => {
+                            let elapsed = t.elapsed_send;
+                            let r = t.resp;
                             let status = r.status().as_u16();
                             // Clone headers BEFORE the body read consumes the response.
                             // Values truncated to 128 chars (OPSEC: bounds Set-Cookie
