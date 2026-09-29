@@ -33,7 +33,7 @@
   - JWT tokens (`eyJ…`)
   - AWS keys (`AKIA[0-9A-Z]{16}`)
   - PEM private keys
-  - Replaces with `[REDACTED]` or 8-char hex hash
+  - Replaces with `[REDACTED]` or 16-hex hash
 - **Identity rotation** (`src/http/identity.rs`): Realistic UA pool (Chrome 126 / Firefox 128 / Safari 17.5) with matching `Sec-CH-UA`
 - **Jitter** (`src/http/jitter.rs`): `rand_distr::Normal` — never regular cadence
 - **Proxy enforcement**: `socks5h://` required (remote DNS); `socks5://` rejected with `DnsLeak` error
@@ -121,7 +121,7 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--max-duration <SECS>` | Global detection time budget (**OPT-IN**): detection stops cooperatively once the shared detection clock exceeds `SECS` (running technique finishes early, clean `Done`, no error, no new finding; the union starvation guard is skipped once spent). `None` = unlimited (default, historical behaviour) | — |
 | `--request-budget <N>` | Global request budget (**OPT-IN** calibration): detection stops cooperatively once total `request_count` reaches `N` (current technique finishes, clean `Done`, no error, no new finding; concurrent params may overshoot by one technique each). Per-param scheduler is seeded with the same value for visibility (`budget_total`). `None` = unlimited (default, historical behaviour — A1 evasion needs ~1032 req live, never cap by default) | — |
 | `--seed <N>` | Deterministic run seed, recorded in the report as `seed` (C1 metrology). Seeds all non-cryptographic RNG (tamper scripts, request jitter, UA rotation, retry backoff): runs with the same seed are deterministic. Crypto randomness (export salt/nonce) always stays OS-random | — |
-| `--confirm` | Strict second-pass confirmation (planned C6; **currently warning-only, not implemented** — in-detection 3-trial confirmation still applies regardless of this flag) | `false` |
+| `--confirm` | Strict second-pass confirmation (C6 real): re-sondes every confirmed finding with fresh payloads + derived seed after detection (OOB excluded, ~2x requests worst-case). Never creates new findings — only drops those that fail re-validation. In-detection 3-trial confirmation still applies regardless of this flag | `false` |
 | `--ignore-code <LIST>` | Status codes treated as negative probes (e.g. `--ignore-code 429,503`); never yields a finding. Baseline/WAF detection runs **before** this filter and is never ignored | — |
 | `--raw-file <PATH>` | Raw HTTP request file (Burp/ZAP export) — **takes priority over `--target`** (see [Target resolution](#target-resolution)) | — |
 | `--tamper <LIST>` | WAF tampers (24 total, see [Tamper scripts](#tamper-scripts)): `space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,randomcase,versionedcomment,versionedmorekeywords,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2paren,versionedfuzz,jsonunicodeescape,numericobfuscate,linecomment,base64encode` (opt-in: breaks boolean differentials). Presets: `cloudflare-generic` (=`randomcase,space2comment,versionedmorekeywords`), `aggressive` (=`randomcase,space2paren,versionedfuzz,equaltolike`) | auto `space2comment,randomcase` on active WAF blocking |
@@ -130,6 +130,15 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--oob-domain <DOMAIN>` | Collaborator base domain (enables OOB probes, **OPT-IN**) | — |
 | `--oob-poll-url <URL>` | Poll URL with `{token}` placeholder (auto-confirm callbacks) | — |
 | `--oob-wait-secs <N>` | Seconds to wait for async DB-side OOB query before polling | `5` |
+| `--ai-suggest` | AI suggestion second-pass (**OPT-IN**, post-échec uniquement): after a finding-less run blocked by WAF (`403/406/429`), app-filter (`400` streak), live WAF footprint, or `--confirm` drop, ask an external LLM for up to `--ai-max-suggestions` boolean TRUE/FALSE pairs, validate them locally, then re-probe (bounded, silent on failure; one LLM call max per parameter per run). OFF = 0 LLM call. Sends abstract signals only (context summary, DBMS belief, WAF vendor, payload skeletons) — never cookies/headers/target body/extracted data | `false` |
+| `--ai-provider <openai\|anthropic>` | LLM wire format: `openai` (Chat Completions) or `anthropic` (Messages). Required with `--ai-suggest` | — |
+| `--ai-endpoint <URL>` | LLM endpoint (`http(s)://`; prefer a local gateway, e.g. Ollama). Required with `--ai-suggest` | — |
+| `--ai-model <NAME>` | LLM model name. Required with `--ai-suggest` | — |
+| `--ai-api-key <STR>` | LLM API key (env `INJEKT_AI_API_KEY` preferred, never in config files; fully redacted in logs). Optional — local gateways often need none | — |
+| `--ai-max-suggestions <1-5>` | Max LLM-suggested TRUE/FALSE pairs re-probed per parameter (1 pair = 2 requests) | `3` |
+| `--ai-timeout <SECS>` | HTTP timeout for LLM provider calls | `30` |
+| `--generative <MODE>` | Payload generation mode (deterministic grammar, seeded): `off` = historical lists only (default, byte-identical), `conservative` = historical first then core-predicate pairs up to `--max-generated`, `aggressive` = whole historical list plus all predicates. Core includes spaceless shapes (`'OR(1)=(1)-- -`, no ` OR ` keyword — bypasses naive signature WAFs) and whitespace alternatives (tab/newline separators, `%09`/`%0A`) plus `EqInt`/`EqStr`/`Like`/`In`/`Between` × fences/logics; aggressive adds `Rlike`/`CaseWhen`/`Div`/`Xor`/`ChrFunc` (dialect-aware). Generated pairs are deduped against history (zero redundant requests) and flow through the unchanged tamper/evaluation/budget pipeline; findings cite `gen:<fence>+<logic>+<pred>[+tab\|+nl]` in evidence | `off` |
+| `--max-generated <0-32>` | Max generated pairs per parameter and technique (`0` disables generation even when `--generative` is set; 32 covers the max cyclic gap between spaceless shapes for any seed rotation) | `4` |
 | `--dbms <KIND>` | Force DBMS: `mysql`, `postgres`, `mssql`, `oracle` | auto-fingerprint |
 | `--extract` | Enable data extraction (opt-in, uses `SecretString`) | `false` |
 | `--output <PATH>` | Write report to file in `--format` serialization (0o600 on Unix, relative path, never overwrites an existing file) | stdout |
@@ -141,6 +150,8 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--import <PATH>` | Legacy flag: rejected by `scan` (use `replay --file` to inspect an export, `recon import --file` for candidates) | — |
 | `--no-redact` | **Disable scrubbing (local debugging only!)** | `false` |
 | `--allow-private` | Allow loopback/private IPs (anti-SSRF bypass, lab only) | `false` |
+| `--max-redirects <N>` | Max redirects followed per request (`0` = do not follow; every hop re-validated, secrets stripped cross-origin) | `5` |
+| `--allow-secret-reuse` | Replay `--cookies`/`--headers` across origins in bulk/import runs (explicit opt-in; without it multi-origin runs with secrets fail closed) | `false` |
 | `-v, --verbose` | Debug logs (`tracing` at `debug` level) | `info` |
 | `--no-banner` | Suppress startup banner | `false` |
 
@@ -151,8 +162,11 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 # Basic scan (all techniques, 5 threads)
 injekt --target "https://example.com/search?q=1" --threads 5
 
-# Explicit scan subcommand
+# Explicit scan subcommand (alias historique déprécié — préférer la cible globale -u/--target ou `auto`)
 injekt scan --target "https://example.com/?id=1"
+
+# Pipeline recommandé : ingestion → scan → escalation → énumération
+injekt auto --target "https://example.com/?id=1"
 
 # Specific techniques + DBMS
 injekt --target "https://example.com/?id=1" --techniques boolean,error --dbms mysql
@@ -247,8 +261,9 @@ they stay available to single-payload techniques as explicit opt-in).
 # Crawl only (discover parameters, no testing)
 injekt recon crawl --target "example.com" --depth 2 --max-pages 100
 
-# Crawl + scan discovered parameters
+# Crawl + scan discovered parameters (`recon scan` = alias ; voie recommandée : `auto --with-recon`)
 injekt recon scan --target "example.com" --auto-enumerate --dbs
+injekt auto --target "example.com" --with-recon --auto-enumerate --dbs
 
 # Import previously discovered candidates
 injekt recon import --file discovered.json --test
@@ -282,7 +297,7 @@ injekt recon import --file discovered.json --test --enumerate
 ```bash
 INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
 ```
-Decrypts an `--export-encrypted` snapshot (`INJEKT_PASSPHRASE` or TTY prompt) and prints a scrubbed summary (findings, request count). Inspection only — re-run `scan --target <url>` to resume testing.
+Decrypts an `--export-encrypted` snapshot (`INJEKT_PASSPHRASE` or TTY prompt) and prints a scrubbed summary (findings, request count). Inspection only — re-run `injekt --target <url>` (ou `auto --target <url>`) to resume testing.
 
 #### `info` — Capability Information
 ```bash
@@ -394,6 +409,7 @@ injekt mcp
 | `--method` override | Same as above |
 | `--import` / `replay` / `--export-encrypted` | No TTY for passphrase; `export_encrypted` is rejected with `invalid_params` |
 | `--bulk-file` | Multi-target orchestration stays CLI-side |
+| `--allow-secret-reuse` | Bulk/import-only gate; MCP tools are single-target (gate passes trivially) |
 | `--level` / `--confirm` / `--seed` / `--ignore-code` | Not in the tool schema — MCP runs at **level 1, no second-pass confirm, unseeded** |
 | `-v/--verbose`, `--no-banner` | Transport-level concerns (stderr is logs, stdout is JSON-RPC) |
 
@@ -420,8 +436,8 @@ The `Scrubber` (`src/session/scrubber.rs`) processes all output:
 |---------|-------------|
 | `Authorization: Bearer <token>` | `Authorization: [REDACTED]` |
 | `Cookie: session=xyz` | `Cookie: [REDACTED]` |
-| JWT `eyJhbGciOiJ…` | `[REDACTED]` (8-char hash) |
-| AWS `AKIA[0-9A-Z]{16}` | `[REDACTED]` (8-char hash) |
+| JWT `eyJhbGciOiJ…` | `[REDACTED]` (16-hex hash) |
+| AWS `AKIA[0-9A-Z]{16}` | `[REDACTED]` (16-hex hash) |
 | PEM `-----BEGIN PRIVATE KEY-----` | `[REDACTED]` |
 | `Set-Cookie` headers | `[REDACTED]` |
 
@@ -659,8 +675,9 @@ injekt -u "https://target.onion/?id=1" \
 #    not -u — the global -u does NOT satisfy recon's required --target.
 injekt recon crawl --target "https://example.com" --depth 3 --max-pages 200 --output discovered.json
 
-# 2. Scan discovered parameters
+# 2. Scan discovered parameters (`recon scan` = alias → préférer `auto --with-recon`)
 injekt recon scan --target "https://example.com" --auto-enumerate --dbs --output scan-report.json
+injekt auto --target "https://example.com" --with-recon --auto-enumerate --dbs --output scan-report.json
 
 # 3. Import and test offline candidates
 injekt recon import --file discovered.json --test --enumerate --output final-report.json
@@ -676,7 +693,7 @@ https://site2.com/search?q=test
 https://site3.com/api?user=admin
 EOF
 
-# Bulk scan with aggregated JSON report
+# Bulk scan with aggregated JSON report (bulk auto-détecté : --bulk-file / --stdin / --openapi-file / --sitemap-file / --raw-dir, pas de sous-commande dédiée)
 injekt --bulk-file targets.txt --output bulk-report.json --threads 3
 ```
 
@@ -712,6 +729,20 @@ injekt -u "https://example.com/?id=1" --export-encrypted session.enc
 # Inspect later (decrypt + scrubbed summary; not a full scan resume)
 INJEKT_PASSPHRASE='...' injekt replay --file session.enc
 ```
+
+### Terminal UI/UX
+
+The terminal keeps diagnostic logs on **stderr** and human-readable scan
+results on **stdout**. A single-target scan ends with a compact summary showing
+the status (`CLEAN`, `FINDINGS`, `INCONCLUSIVE`, or `CANCELLED`), target, request count, and
+elapsed time. `CLEAN` means that a complete run produced no confirmed finding;
+it is not an absolute security guarantee. `INCONCLUSIVE` means the run stopped
+early or the oracle was unusable (unstable/all-5xx baseline, `--request-budget`
+/ `--max-duration` stop) — never read it as "not injectable".
+
+Colors are disabled automatically for `NO_COLOR`, `TERM=dumb`, `CLICOLOR=0`,
+or redirected output. `--no-banner` disables only the startup banner. For
+machine-readable output, use `--output` with `--format json|sarif|junit|md`.
 
 ---
 
@@ -800,7 +831,9 @@ auto-discovered files only warn. `injekt info` lists `profiles`.
     ```
     The parser (`src/target/raw_request.rs`) replays method + headers + cookies + body; bodies covered: urlencoded, JSON (nested), XML/SOAP, multipart field values. `--raw-dir` bulk ingestion stays URL-only.
 2. Global `-u/--target <URL>`.
-3. `scan --target <URL>` (subcommand-level).
+3. `scan --target <URL>` (subcommand-level, alias historique déprécié — masqué de `-h`).
+
+Bulk auto-détecté : `--bulk-file` / `--stdin` / `--openapi-file` / `--sitemap-file` / `--raw-dir` (aucune sous-commande bulk dédiée).
 
 `--bulk-file` conflicts with `--target` / `--raw-file` (one mode at a time) and with
 `--export-encrypted` (use `--output` for the aggregated report). Format: one target per

@@ -72,6 +72,49 @@ pub fn confirm(trials: &[Trial]) -> ConfirmationResult {
     ConfirmationResult::new(confirmed, score.clamp(0.0, 1.0), n)
 }
 
+/// Aggregate per-trial similarities for evidence display.
+///
+/// Returns the mean `(true_conf, false_conf)` over *passing* trials (same
+/// per-trial pass rule as [`confirm`]), so the rendered `true_sim` /
+/// `false_sim` reflect the measured majority instead of whichever trial ran
+/// last. Neutral transport trials (`0.5`/`0.5`) and ignored-status trials
+/// (`0.0`/`1.0`) never pass and are excluded. When no trial passes (e.g. an
+/// inverted oracle decided on the swapped pass), falls back to the mean over
+/// all trials; empty input yields `(0.0, 0.0)`.
+///
+/// Decision inputs (`score`, `false_positive_prob`) still come from
+/// [`confirm`]/[`confirm_either`]; this only affects display.
+#[must_use]
+// Trial counts are small (single-digit confirmation retries); usize->f64 precision loss is not reachable.
+#[allow(clippy::cast_precision_loss)]
+pub fn aggregate_sims(trials: &[Trial]) -> (f64, f64) {
+    fn passes(t: &Trial) -> bool {
+        t.true_conf > 0.6
+            && (t.false_conf < 0.4 || (t.true_conf > 0.9 && t.true_conf - t.false_conf > 0.5))
+    }
+    let mut sum_true = 0.0;
+    let mut sum_false = 0.0;
+    let mut count = 0usize;
+    for t in trials.iter().filter(|t| passes(t)) {
+        sum_true += t.true_conf;
+        sum_false += t.false_conf;
+        count += 1;
+    }
+    if count == 0 {
+        // No passing trial: mean over all trials (inverted/degenerate
+        // shapes), still more representative than the last trial alone.
+        for t in trials {
+            sum_true += t.true_conf;
+            sum_false += t.false_conf;
+        }
+        count = trials.len();
+    }
+    if count == 0 {
+        return (0.0, 0.0);
+    }
+    (sum_true / count as f64, sum_false / count as f64)
+}
+
 /// Confirm a boolean oracle in EITHER direction.
 ///
 /// A boolean injection has two stable states; either one may coincide with
@@ -259,5 +302,48 @@ mod tests {
         ];
         let (r, _) = confirm_either(&trials);
         assert!(!r.confirmed);
+    }
+    #[test]
+    fn aggregate_sims_means_passing_trials_only() {
+        // Two passing trials + one neutral transport trial: the neutral
+        // trial must not drag the evidence mean.
+        let (t, f) = aggregate_sims(&[
+            Trial {
+                true_conf: 0.9,
+                false_conf: 0.1,
+            },
+            Trial {
+                true_conf: 0.5,
+                false_conf: 0.5,
+            },
+            Trial {
+                true_conf: 0.8,
+                false_conf: 0.2,
+            },
+        ]);
+        assert!((t - 0.85).abs() < 1e-9, "{t}");
+        assert!((f - 0.15).abs() < 1e-9, "{f}");
+    }
+    #[test]
+    fn aggregate_sims_falls_back_to_all_when_none_pass() {
+        // Inverted oracle (decided on the swapped pass): no original trial
+        // passes, so evidence is the mean over all trials.
+        let (t, f) = aggregate_sims(&[
+            Trial {
+                true_conf: 0.3,
+                false_conf: 0.9,
+            },
+            Trial {
+                true_conf: 0.3,
+                false_conf: 0.9,
+            },
+            Trial {
+                true_conf: 0.3,
+                false_conf: 0.9,
+            },
+        ]);
+        assert!((t - 0.3).abs() < 1e-9, "{t}");
+        assert!((f - 0.9).abs() < 1e-9, "{f}");
+        assert_eq!(aggregate_sims(&[]), (0.0, 0.0));
     }
 }

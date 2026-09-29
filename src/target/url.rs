@@ -4,8 +4,22 @@ use thiserror::Error;
 use url::Url;
 
 /// Newtype against primitive obsession.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is manual + scrubbed: the URL may carry `?token=` secrets or
+/// `user:pass@` userinfo, so a derived `Debug` would leak them into any
+/// `tracing::debug!("{target:?}")`. `Display` stays the full URL on purpose
+/// (it builds requests — never log it raw, use [`TargetUrl::scrubbed`]).
+#[derive(Clone, PartialEq, Eq)]
 pub struct TargetUrl(Url);
+
+impl core::fmt::Debug for TargetUrl {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let scrubber = crate::session::scrubber::Scrubber::new(false);
+        f.debug_tuple("TargetUrl")
+            .field(&scrubber.scrub(self.0.as_str()))
+            .finish()
+    }
+}
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -23,6 +37,9 @@ pub enum UrlError {
 impl TargetUrl {
     /// Parse strictly, normalize, reject private IPs unless `allow_private`.
     ///
+    /// Bare hosts without a scheme (`example.com`, `example.com:8080/a?id=1`)
+    /// default to `https://` (same rule as the recon crawler).
+    ///
     /// ```rust
     /// use injekt::target::url::TargetUrl;
     /// let t = TargetUrl::parse("http://example.com/?id=1", false).unwrap();
@@ -35,7 +52,20 @@ impl TargetUrl {
     /// `allow_private` is `false`.
     #[track_caller]
     pub fn parse(input: &str, allow_private: bool) -> Result<Self, UrlError> {
-        let url = Url::parse(input).map_err(|e| UrlError::Invalid(e.to_string()))?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err(UrlError::Invalid("empty url".to_owned()));
+        }
+        // Bare hosts (`example.com`, `example.com:8080/path?id=1`) are
+        // documented as valid targets (auto/recon accept them): default to
+        // `https://` like the recon crawler does. Full URLs keep their scheme
+        // so `ftp://` is still rejected as `Scheme`, not silently rewritten.
+        let with_scheme = if trimmed.contains("://") {
+            trimmed.to_owned()
+        } else {
+            format!("https://{trimmed}")
+        };
+        let url = Url::parse(&with_scheme).map_err(|e| UrlError::Invalid(e.to_string()))?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err(UrlError::Scheme(url.scheme().to_owned()));
         }
@@ -53,6 +83,14 @@ impl TargetUrl {
     #[must_use]
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+
+    /// Scrubbed rendering for logs/reports (`?token=` values and userinfo
+    /// redacted, host kept). Prefer this over `Display` anywhere operator
+    /// logs or reports are produced.
+    #[must_use]
+    pub fn scrubbed(&self) -> String {
+        crate::session::scrubber::Scrubber::new(false).scrub(self.0.as_str())
     }
 
     /// Extract GET parameters as (key, value).
@@ -338,6 +376,34 @@ mod tests {
     fn parse_valid() {
         let u = TargetUrl::parse("https://example.com/search?q=hello&id=1", true).unwrap();
         assert_eq!(u.query_params().len(), 2);
+    }
+
+    #[test]
+    fn debug_and_scrubbed_redact_secrets_but_keep_host() {
+        let u =
+            TargetUrl::parse("https://user:pass@example.com/search?token=secret123", true).unwrap();
+        // Full URL still available for requests via Display/as_str.
+        assert!(u.as_str().contains("secret123"));
+        let debug = format!("{u:?}");
+        assert!(!debug.contains("secret123"), "{debug}");
+        assert!(!debug.contains("pass"), "{debug}");
+        assert!(debug.contains("example.com"), "{debug}");
+        let shown = u.scrubbed();
+        assert!(!shown.contains("secret123"), "{shown}");
+        assert!(shown.contains("example.com"), "{shown}");
+    }
+
+    #[test]
+    fn bare_host_defaults_to_https() {
+        // `auto --target example.com` must not fail with
+        // "relative URL without a base".
+        let u = TargetUrl::parse("example.com", true).unwrap();
+        assert_eq!(u.as_str(), "https://example.com/");
+        let u = TargetUrl::parse("example.com:8080/a?id=1", true).unwrap();
+        assert!(u.as_str().starts_with("https://example.com:8080/"));
+        // Private bare hosts still rejected without the lab flag.
+        assert!(TargetUrl::parse("127.0.0.1", false).is_err());
+        assert!(TargetUrl::parse("127.0.0.1", true).is_ok());
     }
 
     #[test]

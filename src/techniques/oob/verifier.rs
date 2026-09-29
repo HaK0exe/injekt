@@ -43,13 +43,25 @@ pub fn expand_poll_url(poll_url: &str, token: &str) -> String {
 
 /// Decide whether a poll response body means "token seen".
 ///
-/// Accepts generic shims: body containing the token (case-insensitive), or
-/// JSON `{"seen":true}` / non-empty `"interactions"` (interactsh-style).
+/// Token-scoped verdict (fail-closed): the body must echo `token`
+/// (case-insensitive) AND carry a positive signal (`{"seen":true}`,
+/// non-empty `"interactions"`, or a plain-text echo). A bare
+/// `{"seen":true}` or interaction log that does not mention this token —
+/// e.g. a stale callback for another token in a shared collaborator inbox —
+/// never confirms (cross-token false positive). An empty token never
+/// confirms either.
+///
+/// Contract for shim operators: the poll response must echo the requested
+/// token for auto-confirmation; a backend that cannot attribute responses
+/// to tokens cannot auto-confirm (use `NoopVerifier` + manual check).
 #[must_use]
 pub fn poll_body_means_seen(body: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
     let lower = body.to_ascii_lowercase();
-    if !token.is_empty() && lower.contains(&token.to_ascii_lowercase()) {
-        return true;
+    if !lower.contains(&token.to_ascii_lowercase()) {
+        return false;
     }
     let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
     if compact.contains("\"seen\":true") {
@@ -62,7 +74,8 @@ pub fn poll_body_means_seen(body: &str, token: &str) -> bool {
             return !rest[..end].trim().is_empty();
         }
     }
-    false
+    // Plain-text shim echoing the token counts as seen.
+    true
 }
 
 /// HTTP polling verifier for generic collaborator shims.
@@ -220,13 +233,24 @@ mod tests {
             "seen OOBABC123 in dns log",
             "oobabc123"
         ));
-        assert!(poll_body_means_seen(r#"{"seen":true}"#, "oobzzz"));
-        assert!(!poll_body_means_seen(r#"{"seen": false, "x":1}"#, "oobzzz"));
+        // Token-scoped: `seen:true` must echo the token, otherwise a stale
+        // callback for another token would confirm this one (cross-token FP).
+        assert!(!poll_body_means_seen(r#"{"seen":true}"#, "oobzzz"));
         assert!(poll_body_means_seen(
-            r#"{"interactions":[{"id":1}]}"#,
+            r#"{"seen":true,"token":"oobzzz"}"#,
+            "oobzzz"
+        ));
+        assert!(!poll_body_means_seen(r#"{"seen": false, "x":1}"#, "oobzzz"));
+        assert!(!poll_body_means_seen(
+            r#"{"interactions":[{"id":1,"token":"oobaaa"}]}"#,
+            "oobzzz"
+        ));
+        assert!(poll_body_means_seen(
+            r#"{"interactions":[{"id":1,"data":"oobzzz"}]}"#,
             "oobzzz"
         ));
         assert!(!poll_body_means_seen(r#"{"interactions":[]}"#, "oobzzz"));
         assert!(!poll_body_means_seen("nothing yet", "oobzzz"));
+        assert!(!poll_body_means_seen(r#"{"seen":true}"#, ""));
     }
 }

@@ -61,8 +61,9 @@ struct ParameterCandidate {
 # Discovery only
 injekt recon crawl --target monplanq.com --depth 2 --max-pages 100
 
-# Discovery + auto-test + optional enumeration
+# Discovery + auto-test + optional enumeration (`recon scan` = alias → préférer `auto --with-recon`)
 injekt recon scan --target monplanq.com --auto-enumerate --dbs
+injekt auto --target monplanq.com --with-recon --auto-enumerate --dbs
 
 # Import discovered params from file
 injekt recon import --file discovered.json --test --enumerate

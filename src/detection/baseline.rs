@@ -133,6 +133,53 @@ impl Baseline {
         String::from_utf8_lossy(&self.representative_body).into_owned()
     }
 
+    /// Returns whether the samples are stable enough to be used as an oracle.
+    ///
+    /// A differential detector cannot distinguish injection from application
+    /// noise when the baseline itself changes between requests.  Status
+    /// consistency is required, then the median pairwise body agreement is
+    /// checked. The baseline stores hashes rather than raw samples, so this
+    /// gate intentionally fails closed for changing bodies; dynamic-field
+    /// normalization belongs to the later response-diff stage.
+    /// This is deliberately conservative: callers should report an
+    /// inconclusive scan rather than manufacture a finding from an unstable
+    /// page.
+    #[must_use]
+    pub fn is_stable(&self) -> bool {
+        if self.status_codes.len() < 3 || self.body_hashes.len() < 3 {
+            return false;
+        }
+        if self.status_codes.windows(2).any(|pair| pair[0] != pair[1]) {
+            return false;
+        }
+        let bodies: Vec<String> = self
+            .body_hashes
+            .iter()
+            .zip(self.body_lengths.iter())
+            .map(|(hash, length)| format!("{hash}:{length}"))
+            .collect();
+        // Exact hashes are a cheap fast path. A changing body cannot be
+        // safely normalized here because raw baseline samples are not kept.
+        if bodies.iter().all(|body| body == &bodies[0]) {
+            return true;
+        }
+        let mut similarities = Vec::new();
+        for (idx, left) in self.body_hashes.iter().enumerate() {
+            for (right_idx, right) in self.body_hashes.iter().enumerate().skip(idx + 1) {
+                if left == right && self.body_lengths[idx] == self.body_lengths[right_idx] {
+                    similarities.push(1.0);
+                } else {
+                    // Hashes intentionally do not retain bodies.  A body that
+                    // differs cannot be safely normalized here, so it is
+                    // treated as unstable; this keeps the gate fail-closed.
+                    similarities.push(0.0);
+                }
+            }
+        }
+        similarities.sort_by(f64::total_cmp);
+        similarities[similarities.len() / 2] >= 0.8
+    }
+
     #[must_use]
     pub fn is_waf_blocked(&self) -> bool {
         let blocked = self
@@ -261,6 +308,24 @@ mod tests {
         assert!(!bl.is_waf_suspected());
         assert!(!bl.is_waf_blocking());
         assert_eq!(bl.waf_evidence_suffix(), "");
+    }
+
+    #[test]
+    fn stable_requires_same_status_and_body() {
+        let samples = vec![
+            sample(200, b"same", &[]),
+            sample(200, b"same", &[]),
+            sample(200, b"same", &[]),
+        ];
+        assert!(Baseline::new(&samples).is_stable());
+
+        let mut different_status = samples.clone();
+        different_status[2].status = 302;
+        assert!(!Baseline::new(&different_status).is_stable());
+
+        let mut different_body = samples;
+        different_body[2].body = b"different".to_vec();
+        assert!(!Baseline::new(&different_body).is_stable());
     }
 
     #[test]

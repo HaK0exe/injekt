@@ -230,12 +230,12 @@ fn bulk_flag_parses_short_and_long() {
     use clap::Parser as _;
     use injekt::cli::args::Cli;
     let cli = Cli::try_parse_from(["injekt", "scan", "-m", "targets.txt"]).expect("parse -m");
-    assert_eq!(cli.bulk_file.as_deref(), Some("targets.txt"));
+    assert_eq!(cli.target_opts.bulk_file.as_deref(), Some("targets.txt"));
     let cli = Cli::try_parse_from(["injekt", "scan", "--bulk-file", "t.txt"]).expect("parse long");
-    assert_eq!(cli.bulk_file.as_deref(), Some("t.txt"));
+    assert_eq!(cli.target_opts.bulk_file.as_deref(), Some("t.txt"));
     let cli = Cli::try_parse_from(["injekt", "scan", "--target", "http://example.com/?id=1"])
         .expect("parse target");
-    assert!(cli.bulk_file.is_none());
+    assert!(cli.target_opts.bulk_file.is_none());
 }
 
 #[tokio::test]
@@ -253,7 +253,10 @@ async fn bulk_conflicts_with_target_and_export() {
         "--allow-private",
     ])
     .expect("parse conflict");
-    let err = commands::scan::run(cli, CancellationToken::new())
+    let Some(injekt::cli::args::Commands::Scan(scan_args)) = &cli.command else {
+        panic!("expected scan command");
+    };
+    let err = commands::scan::run(&cli, scan_args, CancellationToken::new())
         .await
         .expect_err("bulk+target must fail");
     assert!(

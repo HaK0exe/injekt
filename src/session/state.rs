@@ -155,7 +155,11 @@ impl WafInfo {
 }
 
 /// A single confirmed finding — kept in RAM only.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is manual + scrubbed (see below): `target`/`parameter`/`evidence`
+/// may carry `?token=` secrets or userinfo, so a derived `Debug` would leak
+/// them into any `tracing::debug!("{finding:?}")`.
+#[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Finding {
     pub target: String,
@@ -190,6 +194,29 @@ pub struct Finding {
 
 fn default_false_positive_prob() -> f64 {
     1.0
+}
+
+// Manual `Debug`: `target`/`parameter`/`evidence` are scrubbed (query secrets,
+// userinfo, tokens) and evidence is truncated — `Debug` is for triage, full
+// evidence lives in reports. Never `derive(Debug)` here.
+impl core::fmt::Debug for Finding {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let scrubber = super::scrubber::Scrubber::new(false);
+        let evidence: String = scrubber.scrub(&self.evidence).chars().take(256).collect();
+        f.debug_struct("Finding")
+            .field("target", &scrubber.scrub(&self.target))
+            .field("parameter", &scrubber.scrub(&self.parameter))
+            .field("technique", &self.technique)
+            .field("confidence", &self.confidence)
+            .field("false_positive_prob", &self.false_positive_prob)
+            .field("severity", &self.severity)
+            .field("dbms", &self.dbms)
+            .field("evidence", &evidence)
+            .field("evidence_hashes", &self.evidence_detail.hashes.len())
+            .field("waf", &self.waf)
+            .field("timestamp", &self.timestamp)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Finding {
@@ -402,7 +429,10 @@ impl Zeroize for StoredProbe {
 /// s.increment_requests();
 /// assert_eq!(s.request_count(), 1);
 /// ```
-#[derive(Debug, Default)]
+///
+/// `Debug` is manual: `findings` render via the scrubbed [`Finding`] impl,
+/// `extracted` (dump DB material) only ever shows a count — never values.
+#[derive(Default)]
 pub struct SessionState {
     #[allow(dead_code)]
     findings: Vec<Finding>,
@@ -417,6 +447,22 @@ pub struct SessionState {
     /// Reasoning trace (C6): hashes only, RAM-only, zeroized on drop.
     /// Never holds clear payload/body/cookie/token.
     trace: crate::reasoning::ReasoningTrace,
+    /// Param keys (`id@query`) whose boolean probe hit the app signature
+    /// filter (`400` streak ≥ `FILTER_STREAK_LIMIT`, A1-style). Drives the
+    /// `--ai-suggest` trigger (post-échec uniquement). RAM-only, cleared on
+    /// `wipe`/drop like the rest of the session.
+    app_filter_hits: Vec<String>,
+    /// Param keys (`id@query`) dont au moins une sonde a reçu `403`/`406`/`429`
+    /// en phase détection (WAF/challenge/rate-limit live). Distinct de
+    /// `app_filter_hits` (`400` applicatif) et des compteurs `detectability`
+    /// absorbés en fin de run : mémorisé pour le trigger `--ai-suggest`.
+    /// RAM-only, cleared on `wipe`/drop.
+    waf_hits: Vec<String>,
+    /// Param keys déjà couvertes par un passage `--ai-suggest` ce run
+    /// (détection ou post-confirm). Un seul appel LLM par param : borne les
+    /// coûts même en cas de triggers multiples. RAM-only, cleared on
+    /// `wipe`/drop.
+    ai_attempted: Vec<String>,
     /// Effective run seed (`--seed`), recorded for `--explain` / replay.
     /// `None` = historical OS-random behaviour.
     seed: Option<u64>,
@@ -457,6 +503,18 @@ impl Zeroize for SessionState {
         self.detectability = Detectability::default();
         self.started_at = None;
         self.trace.zeroize();
+        for hit in &mut self.app_filter_hits {
+            hit.zeroize();
+        }
+        self.app_filter_hits.clear();
+        for hit in &mut self.waf_hits {
+            hit.zeroize();
+        }
+        self.waf_hits.clear();
+        for hit in &mut self.ai_attempted {
+            hit.zeroize();
+        }
+        self.ai_attempted.clear();
         self.seed = None;
     }
 }
@@ -469,6 +527,22 @@ impl Drop for SessionState {
 
 impl ZeroizeOnDrop for SessionState {}
 
+// Manual `Debug`: findings use the scrubbed `Finding` impl; `extracted`
+// (dumped DB rows) and `stored` markers only show counts — a `{:?}` dump of
+// RAM must never carry secret material into logs.
+impl core::fmt::Debug for SessionState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SessionState")
+            .field("findings", &self.findings)
+            .field("extracted_count", &self.extracted.len())
+            .field("stored_count", &self.stored.len())
+            .field("request_count", &self.request_count)
+            .field("detectability", &self.detectability)
+            .field("seed", &self.seed)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SessionState {
     #[must_use]
     pub fn new() -> Self {
@@ -480,6 +554,9 @@ impl SessionState {
             detectability: Detectability::default(),
             started_at: Some(Utc::now()),
             trace: crate::reasoning::ReasoningTrace::new(),
+            app_filter_hits: Vec::new(),
+            waf_hits: Vec::new(),
+            ai_attempted: Vec::new(),
             seed: None,
         }
     }
@@ -631,6 +708,49 @@ impl SessionState {
         self.detectability
     }
 
+    /// Record that `param_key` (`id@query`) hit the app signature filter
+    /// (boolean `400` streak pruned early). Bounded: one entry per param
+    /// (deduped), set only from the boolean probe. Drives `--ai-suggest`.
+    pub fn note_app_filter_hit(&mut self, param_key: &str) {
+        if !self.app_filter_hits.iter().any(|k| k == param_key) {
+            self.app_filter_hits.push(param_key.to_owned());
+        }
+    }
+
+    /// `true` when `param_key` was pruned by the app signature filter.
+    #[must_use]
+    pub fn app_filter_hit(&self, param_key: &str) -> bool {
+        self.app_filter_hits.iter().any(|k| k == param_key)
+    }
+
+    /// Record a live WAF/challenge/rate-limit hit (`403`/`406`/`429`) on a
+    /// probe for `param_key`. Bounded: one entry per param (deduped).
+    pub fn note_waf_hit(&mut self, param_key: &str) {
+        if !self.waf_hits.iter().any(|k| k == param_key) {
+            self.waf_hits.push(param_key.to_owned());
+        }
+    }
+
+    /// `true` when `param_key` saw a live WAF hit during detection.
+    #[must_use]
+    pub fn waf_hit(&self, param_key: &str) -> bool {
+        self.waf_hits.iter().any(|k| k == param_key)
+    }
+
+    /// Record an `--ai-suggest` pass for `param_key` (one LLM call max per
+    /// param per run, detection + post-confirm sharing this lock).
+    pub fn note_ai_attempted(&mut self, param_key: &str) {
+        if !self.ai_attempted.iter().any(|k| k == param_key) {
+            self.ai_attempted.push(param_key.to_owned());
+        }
+    }
+
+    /// `true` when `param_key` already got its AI pass.
+    #[must_use]
+    pub fn has_ai_attempted(&self, param_key: &str) -> bool {
+        self.ai_attempted.iter().any(|k| k == param_key)
+    }
+
     #[must_use]
     pub fn started_at(&self) -> Option<DateTime<Utc>> {
         self.started_at
@@ -670,6 +790,18 @@ impl SessionState {
         self.request_count = 0;
         self.detectability = Detectability::default();
         self.trace.zeroize();
+        for hit in &mut self.app_filter_hits {
+            hit.zeroize();
+        }
+        self.app_filter_hits.clear();
+        for hit in &mut self.waf_hits {
+            hit.zeroize();
+        }
+        self.waf_hits.clear();
+        for hit in &mut self.ai_attempted {
+            hit.zeroize();
+        }
+        self.ai_attempted.clear();
         self.seed = None;
     }
 }
@@ -699,7 +831,55 @@ impl Clone for SessionState {
             detectability: self.detectability,
             started_at: self.started_at,
             trace: self.trace.clone(),
+            app_filter_hits: self.app_filter_hits.clone(),
+            waf_hits: self.waf_hits.clone(),
+            ai_attempted: self.ai_attempted.clone(),
             seed: self.seed,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secret_finding() -> Finding {
+        Finding::new(
+            "https://example.com/search?token=secret123&id=1",
+            "id",
+            TechniqueKind::Boolean,
+            0.9,
+            "boolean TRUE/FALSE split, session=secret123",
+        )
+    }
+
+    #[test]
+    fn finding_debug_redacts_secrets_but_keeps_host() {
+        let finding = secret_finding();
+        let rendered = format!("{finding:?}");
+        assert!(!rendered.contains("secret123"), "{rendered}");
+        assert!(rendered.contains("example.com"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    }
+
+    #[test]
+    fn finding_debug_truncates_evidence() {
+        let mut finding = secret_finding();
+        finding.evidence = "x".repeat(10_000);
+        let rendered = format!("{finding:?}");
+        assert!(rendered.len() < 10_000, "{rendered}");
+    }
+
+    #[test]
+    fn session_debug_hides_extracted_values() {
+        use secrecy::SecretString;
+        let mut state = SessionState::new();
+        state
+            .extracted
+            .push(SecretString::from("admin:secret123".to_owned()));
+        state.increment_requests();
+        let rendered = format!("{state:?}");
+        assert!(!rendered.contains("secret123"), "{rendered}");
+        assert!(rendered.contains("extracted_count"), "{rendered}");
     }
 }

@@ -20,12 +20,17 @@ injekt recon crawl --target "https://example.com/app" \
 | `--target <HOST\|URL>` | requis | Host nu ou URL. **Ici `--target` long uniquement** (le `-u` global ne satisfait pas recon). |
 | `--depth` | 2 (max 16) | Profondeur de crawl. 2 = tri, 3-4 = exhaustif. |
 | `--max-pages` | 100 (max 100 000) | Budget pages. Borner pour OPSEC/temps client MCP. |
-| `--max-per-template` | 3 | Anti-piège : max pages par forme (path + noms de params). Protège contre pagination/calendrier/listing qui brûleraient le budget. |
+| `--max-per-template` | 3 (min 1) | Anti-piège : max pages par forme (path + noms de params). Protège contre pagination/calendrier/listing qui brûleraient le budget. |
+| `--max-candidates` | 500 | Plafond de candidats conservés. Les formes redondantes sont purgées en premier (sinon galeries/listings = centaines de sosies qui brûlent le budget scan). |
 | `--include-subdomains` | false | Élargit le scope — **uniquement si autorisé au contrat**. |
 | `--ignore-robots` | false | Ignore `robots.txt`. Par défaut on le respecte. |
 
 Le crawler est **statique** (pas de headless) : scope same-origin, déduplication,
 `robots.txt` supporté. Timeout HTTP recon = **15 s hardcodé** (`--timeout` ne s'applique pas).
+Bornes runtime (clamp silencieux, pas d'erreur) : `depth` → min(…, 16),
+`max-pages` → min(…, 100 000), `max-candidates` → min(…, 100 000),
+`max-per-template` → max(…, 1). En revanche `--max-pages 0` / `--max-candidates 0`
+= **erreur dure** (refusé avant tout crawl).
 
 Sortie : candidats `ParameterCandidate` (URL + location Query/Body/Header/Cookie + nom).
 **Relire les candidats avant de tester** — c'est votre surface d'attaque contractuelle.
@@ -33,8 +38,11 @@ Sortie : candidats `ParameterCandidate` (URL + location Query/Body/Header/Cookie
 ## 2.2 `recon scan` — crawl + test
 
 ```bash
-# Crawl puis test de chaque paramètre découvert :
+# Crawl puis test de chaque paramètre découvert.
+# `recon scan` = alias fin DÉPRÉCIÉ (warning loggé) → préférer `auto --with-recon`
+# (alias = single-pass, `--no-escalate` implicite, comportement par ailleurs identique) :
 injekt recon scan --target "example.com" --auto-enumerate --dbs
+injekt auto --target "example.com" --with-recon --auto-enumerate --dbs
 
 # Avec cadrage + techniques réduites (discret) :
 injekt recon scan --target "example.com" --depth 2 --max-pages 50 \
@@ -63,12 +71,17 @@ injekt recon import --file discovered.json --test --enumerate
 
 - `--test` = scan actif (requêtes réseau). Sans `--test` = listing offline.
 - `--enumerate` = énumération sur findings confirmés.
+- `--test` sur candidats multi-origines + `--cookies`/`Authorization` =
+  **gate `--allow-secret-reuse`** (fail-closed sans le flag, voir §2.4) :
+  `recon import` vérifie les URLs candidates avant tout tir.
 - Idéal pour : revue client du scope → re-test après fix → partage d'équipe sans re-crawler.
 
-## 2.4 Ingestion massive (sans crawler)
+## 2.4 Ingestion massive (sans crawler, bulk auto-détecté)
 
-Priorité `Cli::effective_target()` : `--raw-file` > `-u/--target` global > `scan --target`.
+Priorité `Cli::effective_target()` : `--raw-file` > `-u/--target` global > `scan --target` (alias historique déprécié).
 `--bulk-file` est **exclusif** avec `--target`/`--raw-file`.
+Bulk auto-détecté : `--bulk-file` / `--stdin` / `--openapi-file` / `--sitemap-file` / `--raw-dir`
+(aucune sous-commande bulk dédiée — `auto` et la cible globale détectent seuls).
 
 ```bash
 # Bulk : 1 cible/ligne, `#` commentaires, lignes vides ignorées, doublons dédupliqués, max 1000 (erreur dure au-delà)
@@ -92,15 +105,39 @@ injekt --raw-file req.txt --method POST --headers "X-Test: 1" --cookies "sess=ab
 injekt --raw-dir ./burp-exports/ --output bulk-report.json
 
 # OpenAPI 3.x (servers + paths → query params) et Sitemap (<loc>) :
+# Toujours --dry-run d'abord sur TOUT ingest (openapi/sitemap/raw-dir/stdin :
+# le volume surprise = dépassement de scope) :
 injekt --openapi-file openapi.json --dry-run    # toujours dry-run d'abord !
 injekt --openapi-file openapi.json --output report.json
 injekt --sitemap-file sitemap.xml --dry-run
 injekt --sitemap-file sitemap.xml --output report.json
+injekt --raw-dir ./burp-exports/ --dry-run
+cat targets.txt | injekt --stdin --dry-run
 ```
 
 Bodies couverts par `--raw-file` : urlencoded, JSON imbriqué, XML/SOAP, multipart (valeurs de champs).
-`--raw-dir` reste URL-only (pas de bodies). En bulk, `--cookies`/`Authorization` sont
-**rejoués sur chaque cible** (warning loggé — attention au cross-scope).
+`--raw-dir` reste URL-only (pas de bodies).
+
+### Secrets & redirects en bulk/import (gates fail-closed)
+
+- En bulk, `--cookies` / headers `Authorization:` / `Cookie:` sont **rejoués sur
+  chaque cible** (warning loggé — attention au cross-scope).
+- **Gate `--allow-secret-reuse`** (global, défaut `false`) : un run multi-origines
+  (scheme/host/port distincts) qui porte des secrets d'auth **échoue avant tout tir**
+  sans le flag (`refusing to replay --cookies/--headers across N origins…`).
+  Avec le flag = replay explicite opt-in (warning loggé). Mono-origine = passe toujours.
+  Le gate couvre le bulk (`--bulk-file`/`--stdin`/`--openapi-file`/`--sitemap-file`/`--raw-dir`)
+  **et** `recon import --test` (URLs candidates arbitraires). Lignes inparsables =
+  comptées distinctes (fail-closed, jamais open).
+- **Bulk multi-clients = non** : le bulk est **séquentiel**, client HTTP reconstruit
+  par cible (isolation `CookieJar`/`RateLimiter` — pas de jar partagé entre cibles).
+  `--bulk-file` est en outre **exclusif** avec `--target`/`--raw-file`, et incompatible
+  avec `--export-encrypted` (utiliser `--output` pour le rapport agrégé).
+- **`--max-redirects <N>`** (global, `0..=10`, défaut `5`, env `INJEKT_MAX_REDIRECTS`) :
+  `0` = ne suit aucune redirection (la 3xx est rendue telle quelle — aucun hop
+  cross-origin ne peut alors porter `--cookies`/`--headers`/cookies du jar).
+  Chaque hop suivi est **re-validé SSRF** et strippe les secrets cross-origin,
+  quelle que soit la valeur. Valeurs > 10 clampées défensivement.
 
 ## 2.5 Ciblage fin : `-p`, `--method`, `--data`, `--marker`
 
@@ -135,3 +172,7 @@ injekt --target "https://example.com/?id=1*" --marker "*"
 - [ ] `robots.txt` respecté sauf dérogation écrite (`--ignore-robots` tracé au rapport).
 - [ ] 1-2 cibles pilotes identifiées pour le scan (pas tout le domaine d'un coup).
 - [ ] `discovered.json` archivé (rejouable via `recon import`).
+- [ ] `--dry-run` passé sur chaque ingest (openapi/sitemap/raw-dir/stdin) avant tir.
+- [ ] Bulk + secrets (`--cookies`/`Authorization`) : `--allow-secret-reuse` conscient
+      (sans lui, multi-origines = fail-closed) ; `--max-redirects` relu (`0` si secrets sensibles).
+- [ ] `recon scan` évité au profit de `auto --with-recon` (alias déprécié, single-pass).

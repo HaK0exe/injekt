@@ -36,7 +36,24 @@ pub fn jitter_from_str(s: &str) -> Jitter {
 /// Returns an error if `--proxy`, `--headers`, or `--cookies` fail to parse,
 /// or if the underlying client fails to build.
 pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<HttpClient> {
-    let jitter = jitter_from_str(&cli.effective_jitter());
+    let value = cli.effective_jitter();
+    let jitter = {
+        let parsed = jitter_from_str(&value);
+        // Preserve the historical recon warning on unparseable input (the
+        // shared helper already fell back to the floored default).
+        if value
+            .split(',')
+            .filter_map(|p| p.trim().parse::<f64>().ok())
+            .count()
+            != 2
+        {
+            tracing::warn!(
+                value = %value,
+                "invalid jitter (expected \"mean_ms,std_ms\"), using default 750,250"
+            );
+        }
+        parsed
+    };
 
     let rl = Arc::new(RateLimiter::new(cli.effective_rate_limit()));
 
@@ -65,7 +82,8 @@ pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<Http
         .jitter(jitter)
         .rate_limiter(rl)
         .retry_policy(retry)
-        .allow_private(allow_private);
+        .allow_private(allow_private)
+        .redirect_policy(cli.effective_redirect_policy());
 
     if let Some(proxy) = cli.effective_proxy() {
         match crate::http::proxy::ProxyConfig::parse(&proxy) {
@@ -79,7 +97,7 @@ pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<Http
         }
     }
 
-    for header in &cli.headers {
+    for header in &cli.http.headers {
         let Some((name, value)) = header.split_once(':') else {
             // Never echo the raw header: it may be `Authorization: <secret>`.
             return Err(InjektError::Http(
@@ -97,7 +115,7 @@ pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<Http
         );
     }
 
-    if let Some(cookies) = &cli.cookies {
+    if let Some(cookies) = &cli.http.cookies {
         builder = builder.user_header(
             http::header::COOKIE,
             HeaderValue::from_str(cookies)

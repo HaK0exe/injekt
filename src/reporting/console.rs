@@ -3,6 +3,7 @@
 use crate::session::scrubber::Scrubber;
 use crate::session::state::Finding;
 use owo_colors::OwoColorize;
+use std::time::Duration;
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
 
@@ -143,6 +144,66 @@ pub fn print_findings(findings: &[Finding], scrubber: &Scrubber) {
     }
 }
 
+/// Pure verdict mapping: `Cancelled`/`Inconclusive` engine states never
+/// surface as `CLEAN`, even with 0 findings. Unit-testable.
+#[must_use]
+pub fn run_status(state: &str, findings: usize) -> &'static str {
+    let lowered = state.to_ascii_lowercase();
+    // Cancel wins even with hits (operator interrupted the run).
+    if lowered.contains("cancel") {
+        "CANCELLED"
+    } else if findings > 0 {
+        // A hit is a hit, even on a truncated run.
+        "FINDINGS"
+    } else if lowered.contains("inconclusive") || lowered.contains("incomplete") {
+        "INCONCLUSIVE"
+    } else {
+        "CLEAN"
+    }
+}
+
+/// Print the compact human-facing result of one scan.
+///
+/// Logs remain on stderr while this summary stays with findings on stdout.
+/// It reports confirmed findings only; `CLEAN` means a complete run produced
+/// no finding, `INCONCLUSIVE` means the run stopped early or the oracle was
+/// unusable (unstable/all-5xx baseline, budget/duration stop) — never read it
+/// as "not injectable". `CANCELLED` means the operator interrupted the run.
+pub fn print_run_summary(
+    target: &str,
+    state: &str,
+    request_count: u64,
+    elapsed: Duration,
+    findings: usize,
+    scrubber: &Scrubber,
+) {
+    let target = scrubber.scrub(target);
+    let status = run_status(state, findings);
+    let elapsed = elapsed.as_secs_f64();
+    let color = crate::cli::output::console::stdout_colors_enabled();
+
+    println!();
+    if color {
+        let status_text = match status {
+            "CANCELLED" | "INCONCLUSIVE" => status.yellow().bold().to_string(),
+            "CLEAN" => status.green().bold().to_string(),
+            _ => status.red().bold().to_string(),
+        };
+        println!("{} {}", "◆".bright_cyan().bold(), "Scan complete".bold());
+        println!("  {} {}", "Status".dimmed(), status_text);
+        println!("  {} {}", "Target".dimmed(), target);
+        println!("  {} {}", "Requests".dimmed(), request_count);
+        println!("  {} {:.1}s", "Duration".dimmed(), elapsed);
+    } else {
+        println!("Scan complete");
+        println!("  Status: {status}");
+        println!("  Target: {target}");
+        println!("  Requests: {request_count}");
+        println!("  Duration: {elapsed:.1}s");
+    }
+    println!();
+}
+
 /// Print extracted DB data (banner, tables, dump rows, …) collected during
 /// the scan. Not scrubbed: this is the requested payoff of
 /// `--dump`/`--banner`/`--current-user`/etc, not collateral secret leakage,
@@ -214,5 +275,17 @@ mod tests {
             sf.evidence.contains("abc123"),
             "no_redact should pass through"
         );
+    }
+
+    #[test]
+    fn interrupted_runs_never_map_to_clean() {
+        // Interrupted/incomplete runs with 0 findings must not look CLEAN.
+        assert_eq!(run_status("Done", 0), "CLEAN");
+        assert_eq!(run_status("Done", 2), "FINDINGS");
+        assert_eq!(run_status("Cancelled", 0), "CANCELLED");
+        assert_eq!(run_status("Cancelled", 3), "CANCELLED");
+        assert_eq!(run_status("Inconclusive", 0), "INCONCLUSIVE");
+        // A hit on a truncated run still surfaces as FINDINGS.
+        assert_eq!(run_status("Inconclusive", 1), "FINDINGS");
     }
 }

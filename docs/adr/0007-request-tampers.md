@@ -48,7 +48,8 @@ in `HttpClient`.
 ### CLI
 ```bash
 injekt --target "https://ex/?id=1" --hpp --techniques boolean
-injekt recon scan --target ex.com --hpp --chunked --auto-enumerate --dbs
+injekt auto --target ex.com --with-recon --hpp --chunked --auto-enumerate --dbs
+# (ancien: `recon scan --target ex.com --hpp --chunked --auto-enumerate --dbs` — alias conservé)
 ```
 `info` lists request tampers. Flags are global (work for `scan` and `recon`).
 

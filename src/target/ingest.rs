@@ -36,7 +36,7 @@ pub const MAX_RAW_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// (`open` + `take(max+1)`), not just a `metadata().len()` pre-check: the
 /// file can grow between `stat` and `read` (TOCTOU), bypassing a pre-check
 /// cap into OOM. Returns a descriptive error with the faulty path.
-fn read_limited_file(path: &str, max_bytes: u64) -> anyhow::Result<String> {
+pub(crate) fn read_limited_file(path: &str, max_bytes: u64) -> anyhow::Result<String> {
     use std::io::Read as _;
     let file =
         std::fs::File::open(path).map_err(|e| anyhow::anyhow!("cannot read file '{path}': {e}"))?;
@@ -78,17 +78,33 @@ pub fn collect_targets(
         if trimmed.is_empty() || !seen.insert(trimmed.clone()) {
             return false;
         }
-        if let Err(e) = TargetUrl::parse(&trimmed, allow_private) {
-            // Scrubbed: targets may carry `?token=` / `user:pass@` secrets.
-            let scrubbed = crate::session::scrubber::Scrubber::new(false).scrub(&trimmed);
-            tracing::warn!(target = %scrubbed, error=%e, "skipping invalid ingestion target");
-            return false;
+        match TargetUrl::parse(&trimmed, allow_private) {
+            Ok(parsed) => {
+                // Bare hosts (`example.com`) are accepted via `https://`
+                // default: store the normalized URL so downstream `Engine`
+                // and HTTP layers never see a scheme-less string.
+                if trimmed.contains("://") {
+                    out.push(trimmed);
+                } else {
+                    // `seen` already deduped the raw form; also dedupe the
+                    // normalized form against earlier full URLs.
+                    let normalized = parsed.normalized();
+                    if seen.insert(normalized.clone()) {
+                        out.push(normalized);
+                    }
+                }
+            }
+            Err(e) => {
+                // Scrubbed: targets may carry `?token=` / `user:pass@` secrets.
+                let scrubbed = crate::session::scrubber::Scrubber::new(false).scrub(&trimmed);
+                tracing::warn!(target = %scrubbed, error=%e, "skipping invalid ingestion target");
+                return false;
+            }
         }
-        out.push(trimmed);
         false
     };
 
-    let allow_private = cli.allow_private;
+    let allow_private = cli.http.allow_private;
 
     match cli.try_effective_target() {
         Ok(Some(t)) => {
@@ -105,7 +121,7 @@ pub fn collect_targets(
         anyhow::bail!("ingestion exceeds {MAX_BULK_TARGETS} targets");
     }
 
-    if let Some(path) = cli.bulk_file.as_deref() {
+    if let Some(path) = cli.target_opts.bulk_file.as_deref() {
         let content = if path == "-" {
             read_stdin_all()?
         } else {
@@ -118,7 +134,7 @@ pub fn collect_targets(
             }
         }
     }
-    if cli.stdin && cli.bulk_file.as_deref() != Some("-") {
+    if cli.target_opts.stdin && cli.target_opts.bulk_file.as_deref() != Some("-") {
         let content = read_stdin_all()?;
         for t in parse_targets_text(&content) {
             if push(t, allow_private) {
@@ -126,7 +142,7 @@ pub fn collect_targets(
             }
         }
     }
-    if let Some(path) = cli.openapi_file.as_deref() {
+    if let Some(path) = cli.target_opts.openapi_file.as_deref() {
         let content = read_limited_file(path, MAX_INGEST_FILE_BYTES)
             .map_err(|e| anyhow::anyhow!("cannot read OpenAPI file '{path}': {e}"))?;
         for t in parse_openapi_targets(&content) {
@@ -135,7 +151,7 @@ pub fn collect_targets(
             }
         }
     }
-    if let Some(path) = cli.sitemap_file.as_deref() {
+    if let Some(path) = cli.target_opts.sitemap_file.as_deref() {
         let content = read_limited_file(path, MAX_INGEST_FILE_BYTES)
             .map_err(|e| anyhow::anyhow!("cannot read sitemap file '{path}': {e}"))?;
         for t in parse_sitemap_targets(&content) {
@@ -144,7 +160,7 @@ pub fn collect_targets(
             }
         }
     }
-    if let Some(dir) = cli.raw_dir.as_deref() {
+    if let Some(dir) = cli.target_opts.raw_dir.as_deref() {
         for t in load_raw_dir_targets(dir)? {
             if push(t, allow_private) {
                 anyhow::bail!("ingestion exceeds {MAX_BULK_TARGETS} targets");
@@ -426,17 +442,8 @@ pub fn load_raw_dir_targets(dir: &str) -> anyhow::Result<Vec<String>> {
         // Scheme by explicit port: `Host: x:80` is plain HTTP — trying
         // `https://x:80` first would fail closed on a valid target.
         // Absolute-form targets carry their own scheme already.
-        let is_absolute = req.path.starts_with("http://") || req.path.starts_with("https://");
-        let host_port_80 = req.headers.get("host").is_some_and(|h| h.ends_with(":80"));
-        if is_absolute {
-            if let Some(url) = req.to_url("https") {
-                out.push(url);
-            }
-        } else if host_port_80 {
-            if let Some(url) = req.to_url("http").or_else(|| req.to_url("https")) {
-                out.push(url);
-            }
-        } else if let Some(url) = req.to_url("https").or_else(|| req.to_url("http")) {
+        // Shared with `--raw-file` via `RawRequest::to_url_with_port_hint`.
+        if let Some(url) = req.to_url_with_port_hint() {
             out.push(url);
         }
     }
@@ -460,6 +467,7 @@ fn read_stdin_all() -> anyhow::Result<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -518,5 +526,19 @@ mod tests {
             "/users/1/posts/1"
         );
         assert_eq!(replace_path_templates("users"), "/users");
+    }
+
+    #[test]
+    fn limited_read_rejects_oversize_file() {
+        // `--raw-file` and ingestion share this cap: no unbounded RAM.
+        let mut path = std::env::temp_dir();
+        path.push(format!("injekt-test-oversize-{}.txt", std::process::id()));
+        let len = usize::try_from(MAX_RAW_FILE_BYTES + 16).expect("cap fits usize");
+        let big = "x".repeat(len);
+        std::fs::write(&path, &big).expect("write temp oversize file");
+        let err = read_limited_file(&path.to_string_lossy(), MAX_RAW_FILE_BYTES)
+            .expect_err("must reject oversize file");
+        assert!(err.to_string().contains("too large"), "{err}");
+        std::fs::remove_file(&path).expect("cleanup temp file");
     }
 }

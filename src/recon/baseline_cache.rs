@@ -76,6 +76,16 @@ impl BaselineCache {
         fresh
     }
 
+    /// Drop the per-key mutex after a collect. In-flight holders keep their
+    /// `Arc` clone so waiters still serialize correctly; late arrivals mint
+    /// a fresh mutex (singleflight window shrinks — at most one redundant
+    /// baseline, never incorrect). Bounds map growth on bulk multi-origin
+    /// runs where the lock would otherwise linger forever per origin.
+    pub async fn remove_lock(&self, key: &str) {
+        let mut guard = self.key_locks.lock().await;
+        guard.remove(key);
+    }
+
     /// Cache key for a target + optional raw request.
     ///
     /// `host:port:scheme` without raw, `host:port:scheme:raw_hash` with raw.

@@ -137,7 +137,8 @@ fn truncate24(value: &str) -> String {
 ///
 /// - Removes anything between `<` and the next `>` (simple char-by-char
 ///   state machine, no regex, so no catastrophic backtracking).
-/// - An unclosed `<` discards the remainder (no panic).
+/// - An unclosed `<` is emitted literally with its remainder (no data loss:
+///   `a < b` stays `a < b`, so baseline comparison is not skewed).
 /// - Decodes `&lt;`, `&gt;`, `&quot;`, `&#x27;`, then `&amp;` last to
 ///   avoid double-decoding `&amp;lt;` into `<`.
 /// - Collapses all whitespace runs into single spaces (and trims).
@@ -147,16 +148,27 @@ fn truncate24(value: &str) -> String {
 pub fn strip_html(body: &str) -> String {
     let mut without_tags = String::with_capacity(body.len());
     let mut in_tag = false;
+    let mut tag_buf = String::new();
     for c in body.chars() {
         if in_tag {
             if c == '>' {
                 in_tag = false;
+                tag_buf.clear();
+            } else {
+                // `<` inside a tag is kept in the buffer: if the tag never
+                // closes, the whole remainder flushes literally (no loss).
+                tag_buf.push(c);
             }
         } else if c == '<' {
             in_tag = true;
+            tag_buf.clear();
         } else {
             without_tags.push(c);
         }
+    }
+    if in_tag {
+        without_tags.push('<');
+        without_tags.push_str(&tag_buf);
     }
     let decoded = without_tags
         .replace("&lt;", "<")
@@ -359,8 +371,10 @@ mod tests {
 
     #[test]
     fn strip_html_no_panic_on_malformed() {
-        assert_eq!(strip_html("<a <b"), "");
-        assert_eq!(strip_html("<unclosed"), "");
+        // Unclosed `<` is kept literally (no data loss for baseline compare).
+        assert_eq!(strip_html("<a <b"), "<a <b");
+        assert_eq!(strip_html("<unclosed"), "<unclosed");
+        assert_eq!(strip_html("a < b"), "a < b");
         assert_eq!(strip_html("a > b"), "a > b");
         assert_eq!(strip_html("&unknown; stays"), "&unknown; stays");
         assert_eq!(strip_html("<<<>>>"), ">>");
@@ -370,8 +384,8 @@ mod tests {
     fn strip_html_unicode_safe() {
         assert_eq!(strip_html("<p>héllo 🌍</p>"), "héllo 🌍");
         assert_eq!(strip_html("日本語 <b>テスト</b> &amp;"), "日本語 テスト &");
-        // Lone angle brackets / emoji must not panic.
-        assert_eq!(strip_html("<🦀 <b"), "");
+        // Lone angle brackets / emoji must not panic, remainder kept.
+        assert_eq!(strip_html("<🦀 <b"), "<🦀 <b");
     }
 
     #[test]

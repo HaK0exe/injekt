@@ -6,16 +6,19 @@ use anyhow::Context as _;
 /// Returns an error if neither `--file` nor `--import` is given, the file
 /// exceeds 10 MiB, the file can't be read, the passphrase is missing/too
 /// short, or decryption fails.
-// Takes `Cli` by value to match the other command-runner entry points' calling convention.
-#[allow(clippy::needless_pass_by_value)]
-pub fn run(cli: crate::cli::args::Cli) -> anyhow::Result<()> {
+pub fn run(
+    args: &crate::cli::args::ReplayArgs,
+    opts: &crate::cli::args::OutputOpts,
+) -> anyhow::Result<()> {
     const MAX_REPLAY_BYTES: u64 = 10 * 1024 * 1024;
-    let file = if let Some(crate::cli::args::Commands::Replay(a)) = &cli.command {
-        a.file.clone()
-    } else {
-        cli.import
+    // `ReplayArgs::file` is required via clap; empty (manual/MCP
+    // constructions) falls back to legacy `--import`.
+    let file = if args.file.trim().is_empty() {
+        opts.import
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--file or --import required"))?
+    } else {
+        args.file.clone()
     };
     // Hard cap on the read itself (`take`), not a `metadata().len()`
     // pre-check (TOCTOU: the file can grow between `stat` and `read`).
@@ -38,7 +41,7 @@ pub fn run(cli: crate::cli::args::Cli) -> anyhow::Result<()> {
     if let Ok(passphrase) = passphrase_for_replay() {
         match crate::session::export::EncryptedExport::decrypt_from_file(&passphrase, &file) {
             Ok(plain) => {
-                print_snapshot_summary(&plain, &cli)?;
+                print_snapshot_summary(&plain, opts)?;
                 return Ok(());
             }
             Err(e) => {
@@ -74,9 +77,9 @@ fn passphrase_for_replay() -> anyhow::Result<secrecy::SecretString> {
 }
 
 /// Scrubbed human summary of a decrypted snapshot (no secrets printed).
-fn print_snapshot_summary(plain: &[u8], cli: &crate::cli::args::Cli) -> anyhow::Result<()> {
+fn print_snapshot_summary(plain: &[u8], opts: &crate::cli::args::OutputOpts) -> anyhow::Result<()> {
     let v: serde_json::Value = serde_json::from_slice(plain).context("invalid snapshot JSON")?;
-    let scrubber = crate::session::scrubber::Scrubber::new(cli.no_redact);
+    let scrubber = crate::session::scrubber::Scrubber::new(opts.no_redact);
     let findings = v.get("findings").and_then(serde_json::Value::as_array);
     let extracted = v.get("extracted").and_then(serde_json::Value::as_array);
     let request_count = v
@@ -135,7 +138,7 @@ fn print_snapshot_summary(plain: &[u8], cli: &crate::cli::args::Cli) -> anyhow::
     // `--explain <param>`: one-line verdict from the exported snapshot
     // (evidence + trace hashes, no re-sonde, offline). Trace is hashes-only
     // so the render goes through the `Scrubber` like findings.
-    if let Some(wanted) = cli.explain.as_deref() {
+    if let Some(wanted) = opts.explain.as_deref() {
         print_snapshot_explain(&v, wanted, request_count, seed);
     }
     println!("note: replay inspects the export; re-run `scan --target <url>` to resume testing");

@@ -109,14 +109,17 @@ injekt --target "https://example.com/?id=1" --profile aggressive --level 3
 injekt --config ./injekt.toml --target "https://example.com/?id=1"
 INJEKT_PROFILE=stealth INJEKT_THREADS=2 injekt --target "https://example.com/?id=1"
 
-# Scan subcommand (equivalent)
+# Scan subcommand (alias historique déprécié — préférer la cible globale -u/--target ou `auto`)
 injekt scan --target "https://example.com/?id=1"
+injekt auto --target "https://example.com/?id=1"   # pipeline recommandé : ingestion → scan → escalation → énumération
 
 # Discover parameterized URLs and forms without testing
 injekt recon crawl --target "example.com" --depth 2 --max-pages 100
 
 # Crawl, test each discovered parameter, then enumerate confirmed findings
+# (`recon scan` = alias ; voie recommandée : `auto --with-recon`)
 injekt recon scan --target "example.com" --auto-enumerate --dbs
+injekt auto --target "example.com" --with-recon --auto-enumerate --dbs
 
 # Import previously discovered candidates
 injekt recon import --file discovered.json --test
@@ -133,7 +136,12 @@ injekt --target "https://example.com/?id=1" --tamper versionedcomment,charencode
 
 # Request-level tampers: HPP (?id=1&id=PAYLOAD) and chunked (streamed body)
 injekt --target "https://example.com/?id=1" --hpp --techniques boolean
-injekt recon scan --target "example.com" --hpp --chunked --auto-enumerate --dbs
+injekt auto --target "example.com" --with-recon --hpp --chunked --auto-enumerate --dbs
+# (ancien: `recon scan --target "example.com" --hpp --chunked --auto-enumerate --dbs` — alias conservé)
+
+# Bulk auto-détecté : --bulk-file / --stdin / --openapi-file / --sitemap-file / --raw-dir
+# (aucun sous-mode bulk à nommer — `auto` et la cible globale détectent l'ingestion massive seuls)
+injekt --bulk-file targets.txt --output bulk-report.json --threads 3
 
 # OPSEC: Tor + jitter + rate limit + no private IP bypass
 injekt --target "https://example.com/?id=1" \
@@ -155,6 +163,37 @@ injekt mcp  # See [MCP Documentation](docs/MCP.md) for client setup
 # Output
 injekt --target "https://example.com/?id=1" --output report.json
 cat report.json | jq .
+```
+
+## Terminal UI/UX
+
+Terminal streams are intentionally separated: logs (`INFO`, `WARNING`,
+`DEBUG`) go to **stderr**, while human-readable findings go to **stdout**.
+This keeps redirected results usable without progress messages mixed in.
+
+At the end of a single-target scan, injekt prints a compact summary:
+
+```text
+◆ Scan complete
+  Status: CLEAN | FINDINGS | INCONCLUSIVE | CANCELLED
+  Target: https://example.com/?id=1
+  Requests: 42
+  Duration: 12.4s
+```
+
+`CLEAN` means that a complete run produced no confirmed finding; it is not an
+absolute guarantee that the target is secure. `INCONCLUSIVE` means the run
+stopped early or the oracle was unusable (unstable/all-5xx baseline,
+`--request-budget` / `--max-duration` stop) — never read it as "not
+injectable". `--no-banner` disables only the
+startup banner. Colors are automatically disabled with `NO_COLOR`,
+`TERM=dumb`, `CLICOLOR=0`, or when output is redirected.
+
+For machine-readable output, use `--output` with `--format` (`json`, `sarif`,
+`junit`, or `md`):
+
+```bash
+injekt --target "https://example.com/?id=1" --output report.sarif --format sarif
 ```
 
 **Raw request (Burp/ZAP):**
@@ -231,6 +270,8 @@ Options:
       --import <PATH>             Import encrypted snapshot
       --no-redact                 Disable scrubbing (local only!)
       --allow-private             Allow loopback/private IPs (anti-SSRF bypass, lab only)
+      --max-redirects <N>         Max redirects followed per request [default: 5, 0 = do not follow]
+      --allow-secret-reuse        Replay --cookies/--headers across origins in bulk/import (explicit opt-in)
       --no-banner                 Suppress startup banner (stderr; stdout stays clean)
   -v, --verbose                   Debug logs (tracing)
   -h, --help
@@ -238,12 +279,15 @@ Options:
 ```
 
 Recon subcommands (note: recon takes `--target`, not `-u`):
-
 ```bash
 injekt recon crawl --target <HOST|URL> [--depth N] [--max-pages N] [--max-per-template N] [--include-subdomains] [--ignore-robots]
-injekt recon scan --target <HOST|URL> [--depth N] [--max-pages N] [--auto-enumerate]
+injekt recon scan --target <HOST|URL> [--depth N] [--max-pages N] [--auto-enumerate]   # alias → préférer `auto --target <HOST> --with-recon`
 injekt recon import --file discovered.json [--test] [--enumerate]
 ```
+> Voies recommandées : cible unique → `injekt --target <URL>` (ou `injekt auto --target <URL>`) ;
+> `scan --target` n'est qu'un alias historique déprécié (masqué de `-h`, visible dans `--help`).
+> Bulk auto-détecté : `--bulk-file` / `--stdin` / `--openapi-file` / `--sitemap-file` / `--raw-dir`
+> (pas de sous-commande bulk dédiée).
 
 ### Presets & config (non-breaking)
 
@@ -282,7 +326,7 @@ Env: `INJEKT_PROFILE`, `INJEKT_CONFIG`, `INJEKT_THREADS`, `INJEKT_TIMEOUT`,
 See [`docs/OPSEC.md`](docs/OPSEC.md) and [Full Documentation](DOCUMENTATION.md#opsec-features) — summary:
 
 - **No disk writes** unless `--export-encrypted`; `SessionState` is `Arc<RwLock<…>>` and `ZeroizeOnDrop`.
-- **Scrubber** (`src/session/scrubber.rs`): `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, JWT `eyJ…`, `AKIA[0-9A-Z]{16}`, PEM → `[REDACTED]` or 8-hex hash.
+- **Scrubber** (`src/session/scrubber.rs`): `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, JWT `eyJ…`, `AKIA[0-9A-Z]{16}`, PEM → `[REDACTED]` (tokens exacts `[REDACTED-JWT]`/`[REDACTED-AWS-KEY]`/`[REDACTED-PEM]`, hash 16-hex).
 - **Identity** (`src/http/identity.rs`): realistic UA pool (Chrome 126 / Firefox 128 / Safari 17.5) with matching `Sec-CH-UA`.
 - **Jitter** (`src/http/jitter.rs`): `rand_distr::Normal` in **milliseconds**, never regular cadence (default 750±250ms, floor 200ms — active even without `--jitter`).
 - **Rate limit**: token bucket, default **10 req/s** unless `--rate-limit` is set.

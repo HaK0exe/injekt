@@ -12,7 +12,14 @@ pub enum RawRequestError {
     Header(String),
     #[error("missing host")]
     MissingHost,
+    #[error("too many headers ({0} > {MAX_HEADERS})")]
+    TooManyHeaders(usize),
 }
+
+/// Cap on parsed header lines: the file itself is capped at 2 MiB
+/// (`MAX_RAW_FILE_BYTES`), but a header-only bomb of tiny lines would
+/// otherwise bloat the `HashMap` before any limit bites.
+pub const MAX_HEADERS: usize = 100;
 
 /// Parsed Burp/ZAP style raw request.
 ///
@@ -65,11 +72,19 @@ impl RawRequest {
         let method = parts[0].to_owned();
         let path = parts[1].to_owned();
         let http_version = parts.get(2).unwrap_or(&"HTTP/1.1").to_string();
+        // A garbage third token (`GET / FOO`) is not a request line worth
+        // ingesting: Burp/ZAP always write `HTTP/1.1` (or `HTTP/2`).
+        if !http_version.starts_with("HTTP/") {
+            return Err(RawRequestError::RequestLine(request_line.to_owned()));
+        }
 
         let mut headers = HashMap::new();
         for line in lines {
             if line.is_empty() {
                 continue;
+            }
+            if headers.len() >= MAX_HEADERS {
+                return Err(RawRequestError::TooManyHeaders(headers.len() + 1));
             }
             if let Some((k, v)) = line.split_once(':') {
                 // Lowercase at insertion: single canonical form, O(1) lookups
@@ -122,6 +137,24 @@ impl RawRequest {
         };
         Some(format!("{scheme}://{host}{path}"))
     }
+
+    /// Port-aware URL reconstruction shared by `--raw-file` and `--raw-dir`.
+    ///
+    /// `Host: x:80` is plain HTTP — trying `https://x:80` first would fail
+    /// closed on a valid target. Absolute-form targets carry their own scheme.
+    #[must_use]
+    pub fn to_url_with_port_hint(&self) -> Option<String> {
+        let is_absolute = self.path.starts_with("http://") || self.path.starts_with("https://");
+        if is_absolute {
+            return self.to_url("https");
+        }
+        let host_port_80 = self.headers.get("host").is_some_and(|h| h.ends_with(":80"));
+        if host_port_80 {
+            self.to_url("http").or_else(|| self.to_url("https"))
+        } else {
+            self.to_url("https").or_else(|| self.to_url("http"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +178,54 @@ mod tests {
         let raw = "POST /login HTTP/1.1\nHost: x\nContent-Type: application/x-www-form-urlencoded\n\nuser=admin&pass=1";
         let r = RawRequest::parse(raw).unwrap();
         assert_eq!(r.body.unwrap(), "user=admin&pass=1");
+    }
+
+    #[test]
+    fn port_hint_prefers_http_for_port_80() {
+        let raw = "GET /?id=1 HTTP/1.1\nHost: example.com:80\n\n";
+        let r = RawRequest::parse(raw).unwrap();
+        assert_eq!(
+            r.to_url_with_port_hint().as_deref(),
+            Some("http://example.com:80/?id=1")
+        );
+        let raw = "GET /?id=1 HTTP/1.1\nHost: example.com\n\n";
+        let r = RawRequest::parse(raw).unwrap();
+        assert_eq!(
+            r.to_url_with_port_hint().as_deref(),
+            Some("https://example.com/?id=1")
+        );
+        // Absolute-form wins regardless of Host.
+        let raw = "GET http://example.com/?id=1 HTTP/1.1\nHost: other.test:80\n\n";
+        let r = RawRequest::parse(raw).unwrap();
+        assert_eq!(
+            r.to_url_with_port_hint().as_deref(),
+            Some("http://example.com/?id=1")
+        );
+    }
+
+    #[test]
+    fn rejects_garbage_http_version() {
+        let raw = "GET /?id=1 FOO\nHost: example.com\n\n";
+        assert!(matches!(
+            RawRequest::parse(raw),
+            Err(RawRequestError::RequestLine(_))
+        ));
+        // `HTTP/2` stays accepted.
+        let raw = "GET /?id=1 HTTP/2\nHost: example.com\n\n";
+        assert!(RawRequest::parse(raw).is_ok());
+    }
+
+    #[test]
+    fn rejects_header_bomb() {
+        use std::fmt::Write as _;
+        let mut raw = String::from("GET / HTTP/1.1\nHost: example.com\n");
+        for i in 0..MAX_HEADERS {
+            let _ = writeln!(raw, "X-Pad-{i}: v");
+        }
+        raw.push('\n');
+        assert!(matches!(
+            RawRequest::parse(&raw),
+            Err(RawRequestError::TooManyHeaders(_))
+        ));
     }
 }
