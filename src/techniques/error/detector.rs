@@ -45,9 +45,10 @@ impl ErrorDetector {
                 "mysql_generic",
             ),
             // Postgres: explicit `invalid input syntax for type/integer`
-            // (chr()||version() variant surfaces here) + legacy substrings.
+            // (chr()||version() variant surfaces here) + legacy substrings +
+            // `division by zero` (PortSwigger conditional-error payloads).
             (
-                r"(?i)PostgreSQL.*ERROR|pg_query|invalid input syntax for (type|integer)|cannot cast|invalid input syntax",
+                r"(?i)PostgreSQL.*ERROR|pg_query|invalid input syntax for (type|integer)|cannot cast|invalid input syntax|division by zero",
                 "postgres",
             ),
             // P0-1 framework wrappers (2026): the DB error is wrapped in a
@@ -81,9 +82,10 @@ impl ErrorDetector {
                 "node_sql",
             ),
             // MSSQL CONVERT/CAST channel: Msg 245 (Conversion failed) /
-            // Msg 8114 (Error converting data type varchar to int).
+            // Msg 8114 (Error converting data type varchar to int) /
+            // Msg 8134 (divide by zero, PortSwigger conditional-error).
             (
-                r"(?i)Msg\s+(245|8114)|Conversion failed.*varchar|Error converting data type (varchar|nvarchar).*int|Syntax error converting.*varchar",
+                r"(?i)Msg\s+(245|8114|8134)|Conversion failed.*varchar|Error converting data type (varchar|nvarchar).*int|Syntax error converting.*varchar|divide by zero",
                 "mssql_convert",
             ),
             // MSSQL generic: driver + FOR XML PATH variant.
@@ -407,7 +409,7 @@ fn extract_version(body: &str) -> Option<SecretString> {
 
     #[allow(clippy::expect_used)]
     let msg = MSG_RE.get_or_init(|| {
-        Regex::new(r"(?i)(Msg\s+(?:245|8114)[^\n<]{0,200})").expect("msg code regex")
+        Regex::new(r"(?i)(Msg\s+(?:245|8114|8134)[^\n<]{0,200})").expect("msg code regex")
     });
     if let Some(c) = msg.captures(body)
         && let Some(m) = c.get(1)
@@ -485,6 +487,15 @@ mod tests {
     }
 
     #[test]
+    fn detects_pg_division_by_zero_conditional() {
+        // PortSwigger conditional-error shape: `1/(SELECT 0)`.
+        let d = ErrorDetector::new();
+        let r = d.evaluate("ERROR: division by zero");
+        assert!(r.is_vulnerable, "{r:?}");
+        assert_eq!(r.matched_pattern.as_deref(), Some("postgres"));
+    }
+
+    #[test]
     fn detects_pg_chr_variant_reports_postgres() {
         let d = ErrorDetector::new();
         let r = d.evaluate("ERROR: invalid input syntax for integer: \"~13.2~\" pg_query failed");
@@ -514,6 +525,19 @@ mod tests {
         assert!(
             exposed(&r).is_some_and(|e| e.contains("8114")),
             "bare Msg code should be extracted, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn detects_mssql_msg8134_divide_by_zero() {
+        // PortSwigger conditional-error shape: `1/0` (Msg 8134).
+        let d = ErrorDetector::new();
+        let r = d.evaluate("Msg 8134, Level 16, State 1: Divide by zero error encountered.");
+        assert!(r.is_vulnerable, "{r:?}");
+        assert_eq!(r.matched_pattern.as_deref(), Some("mssql_convert"));
+        assert!(
+            exposed(&r).is_some_and(|e| e.contains("8134")),
+            "bare Msg 8134 code should be extracted, got {r:?}"
         );
     }
 

@@ -711,6 +711,18 @@ impl Engine {
             self.absorb_detectability().await;
             return Ok(EngineState::Cancelled);
         }
+        // Budget spent before baseline: skip the 3-sample sequence entirely
+        // (cooperative plafond, same as fingerprint/extraction guards below).
+        // Mid-baseline overshoot (≤3 concurrent samples) stays within the
+        // documented one-technique tolerance.
+        if BudgetConfig::is_over_request_budget(
+            self.state.read().await.request_count(),
+            self.config.budget.request_budget,
+        ) {
+            warn!("request-budget spent, skipping baseline");
+            self.absorb_detectability().await;
+            return Ok(EngineState::Inconclusive);
+        }
 
         let candidate_param = candidate.map(crate::recon::ParameterCandidate::target_parameter);
         let raw_request = self.build_raw_request(candidate);
@@ -1260,7 +1272,9 @@ impl Engine {
         };
         // Blocked in either sense (status-count or marker-signal): never serve
         // from cache, otherwise a transient 403/406/429 poisons later candidates.
-        // Must mirror `effective_tampers` below (`is_waf_blocked() || is_waf_blocking()`).
+        // Conservative: cache bypass on `blocked || blocking` even though
+        // `effective_tampers` below additionally requires vendor/marker
+        // corroboration for the `blocked` case.
         if let Some((cached_baseline, cached_tampers, cached_opts)) = cache.get(&key).await
             && !(cached_baseline.is_waf_blocked() || cached_baseline.is_waf_blocking())
         {
@@ -1269,8 +1283,18 @@ impl Engine {
             cache.remove_lock(&key).await;
             return Ok(Some(hit));
         }
-        // Blocking entry (or miss): bypass and re-collect below.
-        let collected = self.collect_baseline_uncached(target, raw_request).await?;
+        // Blocking entry (or miss): bypass and re-collect below. The lock is
+        // always released, including on probe error (`?`): otherwise the
+        // per-key mutex orphans in the map and the singleflight window breaks
+        // (redundant baselines + unbounded map growth on bulk runs).
+        let collected = match self.collect_baseline_uncached(target, raw_request).await {
+            Ok(c) => c,
+            Err(e) => {
+                drop(per_key_guard);
+                cache.remove_lock(&key).await;
+                return Err(e);
+            }
+        };
         if let Some((fresh_baseline, fresh_tampers, fresh_opts)) = collected.as_ref()
             && !(fresh_baseline.is_waf_blocked() || fresh_baseline.is_waf_blocking())
         {
@@ -1522,9 +1546,13 @@ impl Engine {
         }
         // Effective tampers: only an active WAF block auto-enables a bypass.
         // Mere CDN presence (for example `cf-ray` on a normal 200 response)
-        // remains informational and must not alter probe semantics.
-        let effective_tampers: Vec<Tamper> = if (baseline.is_waf_blocked()
-            || baseline.is_waf_blocking())
+        // remains informational and must not alter probe semantics. A bare
+        // `403/406/429` count without vendor/marker corroboration (app auth,
+        // content negotiation, self-induced 429 at high `--threads`) must not
+        // auto-tamper either — that would poison probes and bypass the cache.
+        let waf_corroborated = baseline.is_waf_blocking() || baseline.is_waf_suspected();
+        let effective_tampers: Vec<Tamper> = if (baseline.is_waf_blocking()
+            || (baseline.is_waf_blocked() && waf_corroborated))
             && self.config.evasion.tampers.is_empty()
         {
             info!(
@@ -3255,6 +3283,13 @@ impl Engine {
         effective_opts: ProbeOpts,
         matcher: &crate::detection::matcher::MatcherConfig,
     ) {
+        if BudgetConfig::is_over_request_budget(
+            self.state.read().await.request_count(),
+            self.config.budget.request_budget,
+        ) {
+            warn!("request-budget spent, skipping fingerprint");
+            return;
+        }
         let findings_snapshot = self.state.read().await.findings().to_vec();
         if findings_snapshot.is_empty() {
             return;
@@ -3483,6 +3518,13 @@ impl Engine {
         effective_tampers: &[Tamper],
         effective_opts: ProbeOpts,
     ) -> crate::error::Result<()> {
+        if BudgetConfig::is_over_request_budget(
+            self.state.read().await.request_count(),
+            self.config.budget.request_budget,
+        ) {
+            warn!("request-budget spent, skipping extraction");
+            return Ok(());
+        }
         // Gate: unconfirmed 0.55 error findings alone must never trigger the
         // heavy boolean oracle (~270-700 req into `inference inconsistency`).
         // Require a boolean finding, an error with `extracted=yes`, or an
@@ -3831,6 +3873,13 @@ impl Engine {
         effective_tampers: &[Tamper],
         effective_opts: ProbeOpts,
     ) -> crate::error::Result<()> {
+        if BudgetConfig::is_over_request_budget(
+            self.state.read().await.request_count(),
+            self.config.budget.request_budget,
+        ) {
+            warn!("request-budget spent, skipping enumeration");
+            return Ok(());
+        }
         // Reuse extraction context (`--dbms` hint wins over guessing).
         // Guess from confirmed findings only (see fingerprint gating).
         let (first_param, target_for_extract) = self.first_finding_param(target).await;
@@ -8995,39 +9044,31 @@ mod orchestrator_gating_tests {
         // P0-2: `variables`-envelope probes ride last so L1 (`take(2)`)
         // stays byte-identical to the historical direct sweep.
         let v = super::json_scan_payloads(None);
-        assert_eq!(v.len(), 5, "{v:?}");
+        assert_eq!(v.len(), 8, "{v:?}");
+        for (i, p) in v.iter().enumerate().take(6) {
+            assert!(
+                !p.true_payload.contains("variables"),
+                "direct {i}: {}",
+                p.true_payload
+            );
+        }
         assert!(
-            !v[0].true_payload.contains("variables"),
+            v[6].true_payload.contains("\"variables\""),
             "{}",
-            v[0].true_payload
+            v[6].true_payload
         );
         assert!(
-            !v[1].true_payload.contains("variables"),
+            v[7].true_payload.contains("\"variables\""),
             "{}",
-            v[1].true_payload
-        );
-        assert!(
-            !v[2].true_payload.contains("variables"),
-            "{}",
-            v[2].true_payload
-        );
-        assert!(
-            v[3].true_payload.contains("\"variables\""),
-            "{}",
-            v[3].true_payload
-        );
-        assert!(
-            v[4].true_payload.contains("\"variables\""),
-            "{}",
-            v[4].true_payload
+            v[7].true_payload
         );
         // DBMS-narrowed belief keeps only its own envelope probe.
         let mysql = super::json_scan_payloads(Some("mysql"));
-        assert_eq!(mysql.len(), 3, "{mysql:?}");
-        assert!(mysql[2].true_payload.contains("\"variables\""));
-        // sqlite has no envelope probe (falls back to generic direct).
+        assert_eq!(mysql.len(), 4, "{mysql:?}");
+        assert!(mysql[3].true_payload.contains("\"variables\""));
+        // sqlite has no envelope probe (narrow 2-payload JSON1 sweep).
         let sqlite = super::json_scan_payloads(Some("sqlite"));
-        assert_eq!(sqlite.len(), 3, "{sqlite:?}");
+        assert_eq!(sqlite.len(), 2, "{sqlite:?}");
         assert!(
             sqlite.iter().all(|p| !p.true_payload.contains("variables")),
             "{sqlite:?}"

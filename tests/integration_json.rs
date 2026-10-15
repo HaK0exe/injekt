@@ -165,8 +165,10 @@ async fn json_in_all_techniques() {
 /// GraphQL backend: only `variables`-envelope probes reach the resolver —
 /// direct JSON payloads (no `variables` framing) stay on the baseline.
 /// The backend wraps the driver error in `{"errors":[{"message":...}]};
-/// the passthrough channel (P0-2) must attribute it to MySQL at L2+
-/// (L1 only tries the 2 direct payloads).
+/// the passthrough channel (P0-2) must attribute it to MySQL at L3
+/// (generic direct sweep grew to 5 with the Team82 WAF-bypass variants,
+/// so L2 `take(4)` no longer reaches the envelope; DBMS-narrowed MySQL
+/// still reaches it at L2 with 3 direct + 1 envelope).
 #[tokio::test]
 async fn graphql_variables_envelope_passthrough() {
     let server = MockServer::start().await;
@@ -186,7 +188,7 @@ async fn graphql_variables_envelope_passthrough() {
     let client = test_client();
     let mut cfg = EngineConfig::default();
     cfg.budget.threads = 1;
-    cfg.budget.level = 2;
+    cfg.budget.level = 3;
     cfg.techniques = vec!["json".to_owned()];
     cfg.net.allow_private = true;
     cfg.no_redact = true;

