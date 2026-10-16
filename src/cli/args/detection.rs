@@ -170,7 +170,12 @@ pub struct DetectionOpts {
     /// finding with fresh payloads + derived seed after detection (OOB
     /// excluded, ~2x requests worst-case, documented). Never creates new
     /// findings — only drops those that fail re-validation. In-detection
-    /// 3-trial confirmation still applies regardless of this flag.
+    /// 3-trial confirmation still applies regardless of this flag. Without
+    /// this flag, confirmed non-High findings on boolean/error/union/stacked
+    /// are already re-validated automatically (bounded second-pass; time/
+    /// json/nosql are excluded — their second-pass re-probes a narrower
+    /// channel window); `--confirm` extends the re-validation to ALL
+    /// confirmed findings and enables the C5 mini-mutation.
     #[arg(long, global = true, help_heading = "Detection")]
     pub confirm: bool,
 

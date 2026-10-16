@@ -36,7 +36,9 @@ pub fn jitter_from_str(s: &str) -> Jitter {
 /// Returns an error if `--proxy`, `--headers`, or `--cookies` fail to parse,
 /// or if the underlying client fails to build.
 pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<HttpClient> {
-    let value = cli.effective_jitter();
+    // P0: single config-file load per build (was 8 loads via effective_*).
+    let snap = cli.resolve_snapshot();
+    let value = cli.effective_jitter_with(&snap);
     let jitter = {
         let parsed = jitter_from_str(&value);
         // Preserve the historical recon warning on unparseable input (the
@@ -55,19 +57,20 @@ pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<Http
         parsed
     };
 
-    let rl = Arc::new(RateLimiter::new(cli.effective_rate_limit()));
+    let rl = Arc::new(RateLimiter::new(cli.effective_rate_limit_with(&snap)));
 
     let retry = crate::http::retry::RetryPolicy {
-        max_retries: cli.effective_retries(),
-        base_delay: Duration::from_millis(cli.effective_delay()),
+        max_retries: cli.effective_retries_with(&snap),
+        base_delay: Duration::from_millis(cli.effective_delay_with(&snap)),
         max_delay: Duration::from_secs(5),
     };
 
-    let mut builder = HttpClient::builder().timeout(Duration::from_secs(cli.effective_timeout()));
+    let mut builder =
+        HttpClient::builder().timeout(Duration::from_secs(cli.effective_timeout_with(&snap)));
     // Seeded UA rotation + jitter/retry: the same `--seed` yields the same
     // identity pick and delay sequence (C1 metrology); `None` preserves the
     // historical OS-random behaviour.
-    let seed = cli.effective_seed();
+    let seed = cli.effective_seed_with(&snap);
     let mut seed_rng = crate::seeded_rng::make_rng(seed);
     // Realistic browser identity (UA + Sec-CH-UA + Accept*): without it every
     // request goes out with no User-Agent at all, which trips protocol-anomaly
@@ -85,7 +88,7 @@ pub fn build_client(cli: &Cli, allow_private: bool) -> crate::error::Result<Http
         .allow_private(allow_private)
         .redirect_policy(cli.effective_redirect_policy());
 
-    if let Some(proxy) = cli.effective_proxy() {
+    if let Some(proxy) = cli.effective_proxy_with(&snap) {
         match crate::http::proxy::ProxyConfig::parse(&proxy) {
             Ok(p) => builder = builder.proxy(p),
             Err(e) => {

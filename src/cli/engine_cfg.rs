@@ -28,6 +28,8 @@ pub enum EnumGate {
 // unified scan+recon builder: one struct literal per EngineConfig section, split would reintroduce drift.
 #[must_use]
 pub fn build_engine_config(cli: &Cli, enum_gate: EnumGate) -> EngineConfig {
+    // P0: single config-file load per build (was ~25 loads via effective_*).
+    let snap = cli.resolve_snapshot();
     let tampers = if cli.detection.tamper.is_empty() {
         Vec::new()
     } else {
@@ -68,8 +70,8 @@ pub fn build_engine_config(cli: &Cli, enum_gate: EnumGate) -> EngineConfig {
     }
     EngineConfig {
         budget: crate::engine::orchestrator::BudgetConfig {
-            threads: cli.effective_threads(),
-            level: cli.effective_level(),
+            threads: cli.effective_threads_with(&snap),
+            level: cli.effective_level_with(&snap),
             request_budget: cli.effective_request_budget(),
             max_duration_secs: cli.effective_max_duration(),
         },
@@ -88,7 +90,7 @@ pub fn build_engine_config(cli: &Cli, enum_gate: EnumGate) -> EngineConfig {
         oob: crate::engine::orchestrator::OobConfig {
             oob_domain: cli.detection.oob_domain.clone(),
             oob_poll_url: cli.detection.oob_poll_url.clone(),
-            oob_wait_secs: cli.effective_oob_wait_secs(),
+            oob_wait_secs: cli.effective_oob_wait_secs_with(&snap),
         },
         enumeration: crate::engine::orchestrator::EnumConfig {
             extract: cli.enumeration.extract,
@@ -120,17 +122,17 @@ pub fn build_engine_config(cli: &Cli, enum_gate: EnumGate) -> EngineConfig {
             match cli.detection.fetch_using.as_deref() {
                 Some("boolean") => vec!["boolean".to_owned()],
                 Some("time") => vec!["time".to_owned()],
-                _ => cli.effective_techniques(),
+                _ => cli.effective_techniques_with(&snap),
             }
         } else {
-            cli.effective_techniques()
+            cli.effective_techniques_with(&snap)
         },
         test_params: cli.detection.params.clone(),
         post_data: cli.detection.data.clone(),
         matcher: cli.matcher_config(),
         confirm: cli.detection.confirm,
         no_mutation: cli.evasion.no_mutation,
-        seed: cli.effective_seed(),
+        seed: cli.effective_seed_with(&snap),
         explain: cli.output_opts.explain.clone(),
         no_redact: cli.output_opts.no_redact,
         dbms_hint: cli.normalized_dbms_hint(),

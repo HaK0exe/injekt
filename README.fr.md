@@ -174,7 +174,10 @@ permet de rediriger les findings sans mélanger les messages de progression.
 n'est pas une garantie de sécurité absolue. `INCONCLUSIVE` signifie que le run
 s'est arrêté tôt ou que l'oracle était inutilisable (baseline instable / tout-5xx,
 `--request-budget` / `--max-duration`) — ne jamais le lire comme "non injectable". `--no-banner` désactive uniquement
-la bannière de démarrage. Les couleurs sont automatiquement désactivées avec
+la bannière de démarrage. Le wordmark tourne sur tous les arts embarqués dans
+`ascii_art.txt` (tirage au sort par run — déterministe avec `--seed`) ;
+épinglez-en un avec `INJEKT_BANNER_ART=<nom>`, listez-les avec
+`INJEKT_BANNER_ART=list`. Les couleurs sont automatiquement désactivées avec
 `NO_COLOR`, `TERM=dumb`, `CLICOLOR=0` ou lorsque la sortie est redirigée.
 
 Pour une sortie destinée à une machine, utilisez `--output` avec `--format`

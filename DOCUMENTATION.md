@@ -741,7 +741,10 @@ early or the oracle was unusable (unstable/all-5xx baseline, `--request-budget`
 / `--max-duration` stop) — never read it as "not injectable".
 
 Colors are disabled automatically for `NO_COLOR`, `TERM=dumb`, `CLICOLOR=0`,
-or redirected output. `--no-banner` disables only the startup banner. For
+or redirected output. `--no-banner` disables only the startup banner. The
+banner wordmark rotates across every art bundled in `ascii_art.txt` (one
+random draw per run — deterministic under `--seed`); pin one with
+`INJEKT_BANNER_ART=<name>` or list them with `INJEKT_BANNER_ART=list`. For
 machine-readable output, use `--output` with `--format json|sarif|junit|md`.
 
 ---
@@ -760,6 +763,7 @@ machine-readable output, use `--output` with `--format json|sarif|junit|md`.
 | `INJEKT_SEED` | Deterministic RNG seed (same as `--seed`) |
 | `INJEKT_PROXY`, `INJEKT_DBMS`, `INJEKT_TAMPER`, `INJEKT_TARGET` | Target/evasion |
 | `INJEKT_FORMAT` | Report serialization (same as `--format`) |
+| `INJEKT_BANNER_ART` | Startup banner art: a name from `ascii_art.txt`, `random` or `list` (stderr only, deterministic under `--seed`) |
 | `INJEKT_OOB_DOMAIN`, `INJEKT_OOB_POLL_URL`, `INJEKT_OOB_WAIT_SECS` | OOB collaborator |
 
 ### Presets (`--profile`)

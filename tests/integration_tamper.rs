@@ -24,14 +24,85 @@ fn baseline_body() -> &'static str {
     "welcome normal page id=1 content baseline 42"
 }
 
+/// Décode une passe de séquences `%XX` (hex, casse libre) ; les séquences
+/// invalides restent verbatim. Retourne les octets pour que les bornes
+/// `start..end` restent alignées même sur des octets non-ASCII.
+fn percent_decode_once(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i] == b'%'
+            && i + 3 <= text.len()
+            && let Ok(hex) = std::str::from_utf8(&text[i + 1..i + 3])
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(text[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Évalue la première comparaison entière `(\d+)=(\d+)` d'un payload encodé :
+/// `Some(true)` = branche logiquement vraie, `Some(false)` = fausse,
+/// `None` = pas de comparaison entière.
+///
+/// Deux passes de décodage `%XX` : l'injection point encode une passe de plus
+/// que ce que verrait la base (`%` → `%25`) et les tampers à blancs encodés
+/// (`%09`, `%0A`…) terminent parfois sur un chiffre hexadécimal qui, sans
+/// décodage, collerait au littéral suivant (`%25091%3D1` lu comme `25091=1`).
+/// Après les deux passes, le texte est celui vu par la base (blancs réels) et
+/// le littéral de la comparaison est isolé.
+///
+/// P0.2 : les contrôles `r=r`/`r1=r2` utilisent des entiers aléatoires ; un
+/// mock qui ne matche que les littéraux historiques (`1=2`) ne les verrait
+/// pas et serait vété comme faux positif — ce mock évalue donc la logique
+/// comme un vrai oracle.
+fn eval_int_comparison(text: &str) -> Option<bool> {
+    let decoded = percent_decode_once(&percent_decode_once(text.as_bytes()));
+    let bytes = decoded.as_slice();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'=' {
+            i += 1;
+            continue;
+        }
+        let mut start = i;
+        while start > 0 && bytes[start - 1].is_ascii_digit() {
+            start -= 1;
+        }
+        let rhs_start = i + 1;
+        let mut end = rhs_start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if start < i
+            && end > rhs_start
+            && let (Ok(lhs), Ok(rhs)) = (
+                std::str::from_utf8(&bytes[start..i])
+                    .unwrap_or("")
+                    .parse::<u64>(),
+                std::str::from_utf8(&bytes[rhs_start..end])
+                    .unwrap_or("")
+                    .parse::<u64>(),
+            )
+        {
+            return Some(lhs == rhs);
+        }
+        i = rhs_start;
+    }
+    None
+}
+
 /// Mock that simulates a WAF: blocks original " OR " with %20, but allows space2comment bypass %2f%2a
 fn waf_tamper_responder(req: &wiremock::Request) -> ResponseTemplate {
     let url = req.url.to_string().to_ascii_lowercase();
     let baseline = baseline_body();
     // True tampered contains `/**/` which is encoded as `%2f**%2f` (stars stay literal) or `**`
     let is_tampered = url.contains("**");
-    let has_true = url.contains("1%3d1") || url.contains("1=1");
-    let has_false = url.contains("1%3d2") || url.contains("1=2");
 
     // Baseline request has no injected OR/1=1/1=2 payload — return baseline
     if !url.contains("or") && !url.contains("%27") {
@@ -39,12 +110,14 @@ fn waf_tamper_responder(req: &wiremock::Request) -> ResponseTemplate {
     }
     // If tampered, simulate boolean diff: true -> baseline-like, false -> different
     if is_tampered {
-        if has_true && !has_false {
-            return ResponseTemplate::new(200).set_body_string(baseline);
-        }
-        if has_false {
-            return ResponseTemplate::new(200)
-                .set_body_string("tampered false branch — completely different content 99 unique");
+        match eval_int_comparison(&url) {
+            Some(true) => return ResponseTemplate::new(200).set_body_string(baseline),
+            Some(false) => {
+                return ResponseTemplate::new(200).set_body_string(
+                    "tampered false branch — completely different content 99 unique",
+                );
+            }
+            None => {}
         }
     }
     // Original (WAF blocked) -> always baseline, so true and false look same => no vuln
@@ -196,15 +269,14 @@ fn dash_waf_responder(req: &wiremock::Request) -> ResponseTemplate {
         return ResponseTemplate::new(200).set_body_string(baseline);
     }
     let is_dash = url.contains("--%25");
-    let has_true = url.contains("1%3d1") || url.contains("1=1");
-    let has_false = url.contains("1%3d2") || url.contains("1=2");
     if is_dash {
-        if has_true && !has_false {
-            return ResponseTemplate::new(200).set_body_string(baseline);
-        }
-        if has_false {
-            return ResponseTemplate::new(200)
-                .set_body_string("dash false branch — completely different content 77 unique");
+        match eval_int_comparison(&url) {
+            Some(true) => return ResponseTemplate::new(200).set_body_string(baseline),
+            Some(false) => {
+                return ResponseTemplate::new(200)
+                    .set_body_string("dash false branch — completely different content 77 unique");
+            }
+            None => {}
         }
     }
     ResponseTemplate::new(200).set_body_string(baseline)
@@ -335,15 +407,15 @@ fn blank_waf_responder(req: &wiremock::Request) -> ResponseTemplate {
     if !url.contains("or") && !url.contains("%27") {
         return ResponseTemplate::new(200).set_body_string(baseline);
     }
-    let has_true = url.contains("1%3d1") || url.contains("1=1");
-    let has_false = url.contains("1%3d2") || url.contains("1=2");
     if url.contains("%25") {
-        if has_true && !has_false {
-            return ResponseTemplate::new(200).set_body_string(baseline);
-        }
-        if has_false {
-            return ResponseTemplate::new(200)
-                .set_body_string("blank false branch — completely different content 79 unique");
+        match eval_int_comparison(&url) {
+            Some(true) => return ResponseTemplate::new(200).set_body_string(baseline),
+            Some(false) => {
+                return ResponseTemplate::new(200).set_body_string(
+                    "blank false branch — completely different content 79 unique",
+                );
+            }
+            None => {}
         }
     }
     ResponseTemplate::new(200).set_body_string(baseline)
@@ -425,16 +497,15 @@ fn versioned_more_waf_responder(req: &wiremock::Request) -> ResponseTemplate {
     if !url.contains("or") && !url.contains("%27") {
         return ResponseTemplate::new(200).set_body_string(baseline);
     }
-    let has_true = url.contains("1%3d1") || url.contains("1=1");
-    let has_false = url.contains("1%3d2") || url.contains("1=2");
     if url.contains("50000") {
-        if has_true && !has_false {
-            return ResponseTemplate::new(200).set_body_string(baseline);
-        }
-        if has_false {
-            return ResponseTemplate::new(200).set_body_string(
-                "versioned-more false branch — completely different content 80 unique",
-            );
+        match eval_int_comparison(&url) {
+            Some(true) => return ResponseTemplate::new(200).set_body_string(baseline),
+            Some(false) => {
+                return ResponseTemplate::new(200).set_body_string(
+                    "versioned-more false branch — completely different content 80 unique",
+                );
+            }
+            None => {}
         }
     }
     ResponseTemplate::new(200).set_body_string(baseline)

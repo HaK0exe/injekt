@@ -233,6 +233,60 @@ pub fn contains_xpath_keyword(body: &str) -> bool {
     lower.contains("extractvalue") || lower.contains("updatexml")
 }
 
+/// Conversion/type-error signatures shared by **data-type parsing** failures
+/// (application casting or DB `CAST`/`CONVERT`), as opposed to SQL *syntax*
+/// errors.
+///
+/// These phrases are deliberately SHARED between genuine DB conversion errors
+/// and application-level "input must be an integer" rejections: a numeric
+/// parameter (`id=1`) whose app/ORM rejects any non-strictly-numeric value
+/// emits the *same* wording as a real SQL `CAST` error. This classifier must
+/// therefore NEVER be used as a standalone positive `SQLi` signal — it only
+/// labels a candidate body so the caller can run a **negative control**
+/// (send a non-numeric, SQL-syntax-free value and check whether the same
+/// phrasing comes back; the veto decision belongs to that control, P1.3).
+///
+/// Matched case-insensitively (body lowercased once):
+/// - PostgreSQL: `invalid input syntax for type integer` / `… for integer`
+/// - MSSQL: `Msg 245`, `Msg 8114`, `Conversion failed when converting`,
+///   `Error converting data type`
+/// - Java: `NumberFormatException`, `TypeMismatchException`
+/// - .NET: `System.FormatException`,
+///   `Input string was not in a correct format`
+/// - Python: `ValueError: invalid literal`
+/// - MySQL: `Out of range value`, `Incorrect integer value`,
+///   `Truncated incorrect`
+/// - SQLite/generic: `datatype mismatch`, `cannot be converted to`,
+///   `is not of type numeric`
+///
+/// Intentionally excluded: `Msg 8134` / `divide by zero` (arithmetic, not a
+/// conversion) and `ORA-01722` / `invalid number` (also the classic
+/// Oracle error-based detection channel).
+#[must_use]
+pub fn classify_cast_error(body: &str) -> bool {
+    const CAST_SIGNATURES: [&str; 17] = [
+        "invalid input syntax for type integer",
+        "invalid input syntax for integer",
+        "msg 245",
+        "msg 8114",
+        "conversion failed when converting",
+        "error converting data type",
+        "system.formatexception",
+        "numberformatexception",
+        "input string was not in a correct format",
+        "valueerror: invalid literal",
+        "typemismatchexception",
+        "out of range value",
+        "incorrect integer value",
+        "truncated incorrect",
+        "datatype mismatch",
+        "cannot be converted to",
+        "is not of type numeric",
+    ];
+    let lower = body.to_ascii_lowercase();
+    CAST_SIGNATURES.iter().any(|sig| lower.contains(sig))
+}
+
 /// ASP.NET yellow-screen guard: `Server Error in '/' Application` alone is
 /// too broad (any unhandled exception — the phrase itself contains "error",
 /// so generic tokens must NOT count). Only SQL-specific co-occurrence
@@ -805,6 +859,74 @@ mod tests {
             "strong phrase without fragment is 0.75, got {}",
             r.confidence
         );
+    }
+
+    #[test]
+    fn classify_cast_error_detects_db_and_app_phrases() {
+        // Postgres CAST channel (also emitted by app-side integer parsing).
+        assert!(classify_cast_error(
+            r#"ERROR: invalid input syntax for type integer: "~14.6~""#
+        ));
+        assert!(classify_cast_error(
+            r#"ERROR: invalid input syntax for integer: "zabc""#
+        ));
+        // MSSQL Msg 245 / 8114 conversion channel.
+        assert!(classify_cast_error(
+            "Msg 245, Level 16, State 1: Conversion failed when converting the varchar value 'zX' to data type int."
+        ));
+        assert!(classify_cast_error(
+            "Msg 8114, Level 16, State 5: Error converting data type varchar to int."
+        ));
+        // Bare Msg codes (no surrounding sentence) still classify.
+        assert!(classify_cast_error("Msg 8114"));
+        assert!(classify_cast_error("msg 245"));
+        // MySQL strict-mode conversion messages.
+        assert!(classify_cast_error(
+            "Incorrect integer value: 'zX' for column 'id' at row 1"
+        ));
+        assert!(classify_cast_error(
+            "Truncated incorrect DOUBLE value: 'zX'"
+        ));
+        assert!(classify_cast_error(
+            "Out of range value for column 'id' at row 1"
+        ));
+        // Java / .NET / Python application-level type parsers.
+        assert!(classify_cast_error(
+            r#"java.lang.NumberFormatException: For input string: "zX""#
+        ));
+        assert!(classify_cast_error(
+            "javax.persistence.TypeMismatchException: could not convert"
+        ));
+        assert!(classify_cast_error(
+            "System.FormatException: Input string was not in a correct format."
+        ));
+        assert!(classify_cast_error(
+            "ValueError: invalid literal for int() with base 10: 'zX'"
+        ));
+        // SQLite / generic ORM wording.
+        assert!(classify_cast_error("datatype mismatch"));
+        assert!(classify_cast_error("value cannot be converted to a number"));
+        assert!(classify_cast_error("column id is not of type numeric"));
+    }
+
+    #[test]
+    fn classify_cast_error_ignores_normal_syntax_and_arithmetic_bodies() {
+        // Normal page: no signature.
+        assert!(!classify_cast_error(
+            "welcome normal page id=1 content baseline 42"
+        ));
+        // Pure SQL syntax error is NOT a cast/type error (veto must not fire).
+        assert!(!classify_cast_error(
+            "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version"
+        ));
+        // Arithmetic (divide by zero) is not a conversion error either.
+        assert!(!classify_cast_error(
+            "Msg 8134, Level 16, State 1: Divide by zero error encountered."
+        ));
+        assert!(!classify_cast_error("ERROR: division by zero"));
+        // Non-panic on empty / degenerate input.
+        assert!(!classify_cast_error(""));
+        assert!(!classify_cast_error("\u{0}\u{feff}<>"));
     }
 
     #[test]

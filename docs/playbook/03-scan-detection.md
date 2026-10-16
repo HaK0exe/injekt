@@ -132,14 +132,19 @@ Cas d'usage :
 - Message métier stable ("Bienvenue X" / "0 résultats") → `--string/--not-string`.
 - API JSON → `--code` + `--dbms` + `--techniques json`.
 
-`--confirm` : seconde passe stricte C6 (réelle) — re-sonde chaque finding **confirmé**
-avec payloads frais + seed dérivé (`derive_confirm_seed(base, idx)`), OOB exclu, ~2×
-requêtes pire cas. Ne crée **jamais** de finding : seuls les re-validés survivent
+Seconde passe stricte C6 (réelle). Par défaut, les findings **confirmés non-High**
+sur les techniques dont la re-sonde rejoue le même canal qu'en première passe
+(boolean/error/union/stacked) sont **re-validés automatiquement** (payloads frais
++ seed dérivé `derive_confirm_seed(base, idx)`, coût borné, 0 requête sans
+candidat) ; `time`/`json`/`nosql` restent hors du scope auto (leurs re-sondes
+couvrent une fenêtre de canal/variante plus étroite). `--confirm` étend la
+re-validation à **tous** les findings confirmés (OOB exclu, ~2× requêtes pire
+cas). La passe ne crée **jamais** de finding : seuls les re-validés survivent
 (échec franc = drop car probable FP ; cas douteux — transport, `--ignore-code`,
 cancel = finding conservé). La confirmation in-detection (3 essais) reste active
-avec ou sans le flag. La mini-mutation C5-tardive tourne dans cette passe (confirmés
-seuls, ≤4 variantes / ≤8 requêtes par finding, tracée `mutation:<famille>`, échec
-silencieux) — `--no-mutation` la coupe (voir chap. 4).
+avec ou sans le flag. La mini-mutation C5-tardive tourne dans cette passe
+(`--confirm` seul, ≤4 variantes / ≤8 requêtes par finding, tracée
+`mutation:<famille>`, échec silencieux) — `--no-mutation` la coupe (voir chap. 4).
 
 ```bash
 # Verdict 1-ligne, 0 requête (trace RAM + evidence, ex. `TRUE≈baseline 0.91, FALSE≠baseline 0.22, 3/3, …`) :

@@ -186,7 +186,10 @@ absolute guarantee that the target is secure. `INCONCLUSIVE` means the run
 stopped early or the oracle was unusable (unstable/all-5xx baseline,
 `--request-budget` / `--max-duration` stop) — never read it as "not
 injectable". `--no-banner` disables only the
-startup banner. Colors are automatically disabled with `NO_COLOR`,
+startup banner. The wordmark rotates across every art bundled in
+`ascii_art.txt` (one random draw per run — deterministic under `--seed`);
+pin one with `INJEKT_BANNER_ART=<name>`, list them with
+`INJEKT_BANNER_ART=list`. Colors are automatically disabled with `NO_COLOR`,
 `TERM=dumb`, `CLICOLOR=0`, or when output is redirected.
 
 For machine-readable output, use `--output` with `--format` (`json`, `sarif`,
@@ -317,7 +320,8 @@ proxy = "socks5h://127.0.0.1:9050"
 
 Env: `INJEKT_PROFILE`, `INJEKT_CONFIG`, `INJEKT_THREADS`, `INJEKT_TIMEOUT`,
 `INJEKT_RETRIES`, `INJEKT_DELAY`, `INJEKT_RATE_LIMIT`, `INJEKT_JITTER`,
-`INJEKT_TECHNIQUES`, `INJEKT_LEVEL`, `INJEKT_PROXY`, `INJEKT_DBMS`, `INJEKT_TAMPER`.
+`INJEKT_TECHNIQUES`, `INJEKT_LEVEL`, `INJEKT_PROXY`, `INJEKT_DBMS`, `INJEKT_TAMPER`,
+`INJEKT_BANNER_ART` (startup art: name, `random` or `list`).
 
 ---
 

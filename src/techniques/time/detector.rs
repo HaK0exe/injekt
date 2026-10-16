@@ -26,6 +26,17 @@ const MIN_SLEEP_FRACTION: f64 = 0.5;
 const SLOW_MEAN_THRESHOLD_MS: f64 = 3000.0;
 /// Relaxed sleep fraction on slow targets (`mean > 3s`).
 const MIN_SLEEP_FRACTION_SLOW: f64 = 0.3;
+/// Robust-cutoff multiplier for baseline spike removal (P2.1).
+///
+/// Ported from sqlmap master (`lib/core/settings.py::TIME_OUTLIER_MAD_COEFF`,
+/// value `10`): "crazy bias towards central values" — a sample must sit more
+/// than ~15 raw MADs above the median to be trimmed.
+const TIME_OUTLIER_MAD_COEFF: f64 = 10.0;
+/// MAD → σ consistency constant for a normal distribution.
+///
+/// Applied exactly once, to the *raw* median absolute deviation, in
+/// [`strip_time_outliers_ms`] — never pre-scaled, never applied twice.
+const MAD_SIGMA_CONSISTENCY: f64 = 1.4826;
 
 /// Adaptive stddev floor (Phase 3): `max(100ms, mean * 0.1)`.
 ///
@@ -56,6 +67,83 @@ pub fn adaptive_min_sleep_fraction(mean_ms: f64) -> f64 {
     }
 }
 
+/// Robust spike removal for time samples (P2.1), faithful port of sqlmap
+/// master's `stripTimeOutliers` (`lib/core/common.py`, 2026).
+///
+/// A single network spike (GC pause, TCP retransmit, cold cache) landing in
+/// the baseline model inflates both `mean` and `stddev`, which explodes the
+/// anomaly bar (`mean + 2σ` here, `avg + 7σ` in sqlmap) and hides every
+/// genuine delay behind it. The median/MAD pair is robust to a minority of
+/// outliers, so the cutoff is computed from the clean bulk:
+///
+/// * `values.len() < 2` → returned unchanged (nothing to compare against);
+/// * `median = sorted[len / 2]` (upper median on even counts, identical to
+///   sqlmap's index-based `getMedian`-free form);
+/// * `mad = median(|x − median|)` — the **raw** deviation, *not* pre-scaled;
+/// * `mad <= 0` → unchanged (degenerate near-constant model: nothing robust
+///   to trim on);
+/// * `cutoff = median + mad_coeff * 1.4826 * mad` — the 1.4826 consistency
+///   constant is applied exactly once, to the raw MAD (`sqlmap`:
+///   `median + TIME_OUTLIER_MAD_COEFF * 1.4826 * mad`);
+/// * values `> cutoff` are dropped, but never more than half the sample
+///   (sqlmap's "never trim away the bulk" guard, kept verbatim — defensive
+///   by construction since at least half the values sit within one raw MAD
+///   of the median; it also protects any caller pairing a non-zero
+///   `mad_coeff` with a wide/bimodal model).
+///
+/// On a clean model no value exceeds `median + 10 * 1.4826 * MAD`, so the
+/// input is returned untouched (sqlmap docstring parity): the historical
+/// mean/stddev/threshold stay byte-identical.
+#[must_use]
+pub fn strip_time_outliers_ms(values: &[f64], mad_coeff: f64) -> Vec<f64> {
+    if values.len() < 2 {
+        return values.to_vec();
+    }
+    let mut ordered = values.to_vec();
+    ordered.sort_by(f64::total_cmp);
+    let median = ordered[ordered.len() / 2];
+    let mut deviations: Vec<f64> = values.iter().map(|v| (v - median).abs()).collect();
+    deviations.sort_by(f64::total_cmp);
+    let mad = deviations[deviations.len() / 2];
+    if mad <= 0.0 {
+        return values.to_vec();
+    }
+    let cutoff = median + mad_coeff * MAD_SIGMA_CONSISTENCY * mad;
+    let kept: Vec<f64> = values.iter().copied().filter(|v| *v <= cutoff).collect();
+    if kept.len() < values.len() / 2 {
+        values.to_vec()
+    } else {
+        kept
+    }
+}
+
+/// Byte-varied twin of a time probe payload for the *second* (confirmation)
+/// shot: the SQL comment `/*xxxxxxxx*/` (8 random hex chars drawn from the
+/// run RNG) is prefixed to `payload`.
+///
+/// Why: a reverse proxy / CDN keyed on the full URL or request bytes can
+/// answer the byte-identical second probe from its cache, replaying the first
+/// response *and its timing* — the double-shot then "confirms" a cache hit
+/// instead of a second network round-trip (Invicti 2024: caching skews
+/// time-based tests). Varying the bytes forces a fresh origin fetch while
+/// keeping the first shot and the benign control untouched (no extra
+/// requests, no coverage loss).
+///
+/// Why a comment: `/*…*/` is valid C-style SQL whitespace on every targeted
+/// DBMS (MySQL, PostgreSQL, MSSQL, Oracle, SQLite). Prefixed to an expression
+/// it is semantically a no-op, so the payload core after the comment is
+/// byte-identical — including payloads starting with `'`, where the comment
+/// lands inside the surrounding string literal (harmless) and the quote still
+/// closes it exactly as before. Coverage is never reduced.
+///
+/// The token comes from the seeded RNG (`crate::seeded_rng::make_rng`), so
+/// `--seed` runs stay deterministic.
+#[must_use]
+pub fn cache_variant(payload: &str, rng: &mut impl rand::Rng) -> String {
+    let token: u32 = rng.random();
+    format!("/*{token:08x}*/{payload}")
+}
+
 impl TimeDetector {
     #[must_use]
     pub fn new(mean: f64, stddev: f64) -> Self {
@@ -66,6 +154,22 @@ impl TimeDetector {
     }
 
     /// Build from an existing [`crate::detection::baseline::Baseline`].
+    ///
+    /// Robust moments (P2.1): the raw per-sample durations
+    /// ([`crate::detection::baseline::Baseline::durations`], filled at
+    /// collection time by `Baseline::new` — see `collect_baseline`) are passed
+    /// through [`strip_time_outliers_ms`] with `TIME_OUTLIER_MAD_COEFF` (10,
+    /// same as sqlmap master) *before* the mean/stddev are recomputed (same
+    /// Bessel-corrected formulas as `Baseline::new`, so clean samples stay
+    /// byte-identical). One spike among the 3-5 baseline samples no longer
+    /// inflates both moments and explodes the delay bar; MAD trims it from the
+    /// clean bulk. sqlmap's own `stripTimeOutliers` only trims from 15 samples
+    /// up (`MIN_TIME_RESPONSES // 2` of its 30-measurement model); we keep the
+    /// same robust stats on a 3-sample baseline (documented conservative
+    /// deviation: trimming makes the bar tighter, and the min-sleep-fraction
+    /// gate, double-shot and benign control still stand between jitter and a
+    /// finding).
+    ///
     /// Reuses the baseline's mean/stddev so the time threshold stays
     /// consistent with [`crate::detection::baseline::Baseline::threshold_ms`]
     /// at `sigma = 2.0` on fast targets (same floor of 100ms, same
@@ -81,8 +185,32 @@ impl TimeDetector {
     /// real 5s sleep (`~10s` measured) still confirms. Fast targets
     /// (`mean <= 1s`) stay byte-identical (`from_baseline_matches_threshold_ms`).
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn from_baseline(baseline: &crate::detection::baseline::Baseline) -> Self {
-        Self::new(baseline.mean_ms, baseline.stddev_ms)
+        // Imported/hand-built baselines may carry the moments without the raw
+        // durations (`durations` is RAM-only sampling data): fall back to the
+        // stored moments rather than degrading to zeros.
+        if baseline.durations.is_empty() {
+            return Self::new(baseline.mean_ms, baseline.stddev_ms);
+        }
+        let raw: Vec<f64> = baseline
+            .durations
+            .iter()
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .collect();
+        let clean = strip_time_outliers_ms(&raw, TIME_OUTLIER_MAD_COEFF);
+        // `strip_time_outliers_ms` never empties a non-empty input; the guard
+        // keeps a hypothetical future edit from dividing by zero.
+        if clean.is_empty() {
+            return Self::new(baseline.mean_ms, baseline.stddev_ms);
+        }
+        let mean = clean.iter().sum::<f64>() / clean.len() as f64;
+        let variance = if clean.len() < 2 {
+            0.0
+        } else {
+            clean.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (clean.len() - 1) as f64
+        };
+        Self::new(mean, variance.sqrt())
     }
 
     /// Anomaly bar for sleep probes: `mean + 2 * max(stddev, adaptive floor)`.
@@ -178,6 +306,19 @@ mod tests {
         Baseline::new(&samples)
     }
 
+    fn durations_baseline(ms: &[u64]) -> Baseline {
+        let samples = ms
+            .iter()
+            .map(|m| Sample {
+                status: 200,
+                body: b"ok".to_vec(),
+                duration: Duration::from_millis(*m),
+                headers: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        Baseline::new(&samples)
+    }
+
     #[test]
     fn from_baseline_matches_threshold_ms() {
         let bl = baseline(100);
@@ -253,5 +394,125 @@ mod tests {
         // Two-shot confirmation holds on slow targets too.
         let ok = det.evaluate_confirmed(10_000.0, 10_200.0, 5.0);
         assert!(ok.is_vulnerable);
+    }
+
+    #[test]
+    fn strip_outliers_drops_single_hiccup() {
+        let out = strip_time_outliers_ms(&[100.0, 110.0, 105.0, 5000.0], 10.0);
+        assert_eq!(out.len(), 3);
+        assert!(
+            !out.iter().any(|v| *v > 1000.0),
+            "lone 5s hiccup must be trimmed: {out:?}"
+        );
+        assert!(out.contains(&100.0) && out.contains(&110.0) && out.contains(&105.0));
+    }
+
+    #[test]
+    fn strip_outliers_keeps_clean_models_untouched() {
+        // Clean model: no value exceeds median + 10 * MAD (sqlmap docstring
+        // parity), so the input is returned byte-identical.
+        let clean = [100.0, 110.0, 105.0];
+        assert_eq!(strip_time_outliers_ms(&clean, 10.0), clean);
+        // Constant model: MAD == 0 -> degenerate, returned as-is.
+        let constant = [42.0; 5];
+        assert_eq!(strip_time_outliers_ms(&constant, 10.0), constant);
+    }
+
+    #[test]
+    fn strip_outliers_never_guts_half_the_sample() {
+        // Wide/bimodal models: whatever the cutoff, at least half the sample
+        // survives (anti-gutting guard).
+        for values in [
+            vec![50.0, 50.0, 50.0, 1000.0, 1000.0],
+            vec![10.0, 10.0, 1000.0, 1000.0],
+            vec![1.0, 2.0, 3.0, 4000.0, 9000.0],
+        ] {
+            let out = strip_time_outliers_ms(&values, 10.0);
+            assert!(
+                out.len() >= values.len() / 2,
+                "trimmed below half: {values:?} -> {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_outliers_handles_empty_and_single() {
+        assert!(strip_time_outliers_ms(&[], 10.0).is_empty());
+        assert_eq!(strip_time_outliers_ms(&[1000.0], 10.0), vec![1000.0]);
+    }
+
+    #[test]
+    fn from_baseline_ignores_single_polluted_sample() {
+        // One 5s hiccup among two ~100ms samples. Historical (raw) moments:
+        // mean ~1737ms, stddev ~2822ms -> threshold ~7.4s, hiding a real 3s
+        // sleep. The robust model stays tight instead.
+        let bl = durations_baseline(&[100, 110, 5000]);
+        let detector = TimeDetector::from_baseline(&bl);
+        assert!(
+            detector.baseline_mean_ms < 200.0,
+            "robust mean must not absorb the spike: {}",
+            detector.baseline_mean_ms
+        );
+        assert!(
+            detector.baseline_mean_ms < bl.mean_ms,
+            "robust mean {} must sit below raw baseline mean {}",
+            detector.baseline_mean_ms,
+            bl.mean_ms
+        );
+        assert!(
+            detector.threshold() < 500.0,
+            "robust threshold must stay under 500ms, got {}",
+            detector.threshold()
+        );
+        // A real 3s sleep is still detected against the tight bar...
+        let real_sleep = detector.evaluate(3300.0, 3.0);
+        assert!(
+            real_sleep.is_vulnerable,
+            "robust threshold must keep a real 3s sleep detectable"
+        );
+        // ... while a hiccup below the sleep fraction is still rejected.
+        assert!(!detector.evaluate(400.0, 3.0).is_vulnerable);
+    }
+
+    #[test]
+    fn from_baseline_clean_samples_match_raw_moments() {
+        // Non-constant but outlier-free samples: no trimming, byte-identical
+        // moments (the robust path must not perturb the historical model).
+        let bl = durations_baseline(&[100, 110, 105]);
+        let detector = TimeDetector::from_baseline(&bl);
+        assert!((detector.baseline_mean_ms - bl.mean_ms).abs() < f64::EPSILON);
+        assert!((detector.baseline_stddev_ms - bl.stddev_ms).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cache_variant_preserves_payload_core() {
+        let payload = "' AND SLEEP(3) -- -";
+        let mut rng = crate::seeded_rng::make_rng(Some(42));
+        let variant = cache_variant(payload, &mut rng);
+        let inner = variant
+            .strip_prefix("/*")
+            .and_then(|rest| rest.split_once("*/"));
+        let Some((token, core)) = inner else {
+            panic!("variant must be prefixed by a /*…*/ comment: {variant}");
+        };
+        assert_eq!(token.len(), 8, "8 hex chars expected: {token}");
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "{token}");
+        assert_eq!(core, payload, "SQL after the comment must stay identical");
+    }
+
+    #[test]
+    fn cache_variant_bytes_differ_and_stay_seeded() {
+        let payload = "'; SELECT pg_sleep(3) --";
+        let build = |seed: u64| {
+            let mut rng = crate::seeded_rng::make_rng(Some(seed));
+            cache_variant(payload, &mut rng)
+        };
+        let one = build(7);
+        let two = build(7);
+        let three = build(8);
+        assert_ne!(one, payload, "second shot must not replay identical bytes");
+        assert!(one.ends_with(payload));
+        assert_eq!(one, two, "same seed -> same variant");
+        assert_ne!(one, three, "different seeds -> different variant");
     }
 }

@@ -33,24 +33,113 @@ fn fragment_responder(req: &wiremock::Request) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_string(baseline_body())
 }
 
-/// Error responder WITHOUT fragment (0.75) + boolean differential
-/// (TRUE→baseline, FALSE→different) so confirmation succeeds.
+/// Décodage URL minimal (`+` = espace, `%XX`) : permet au mock d'évaluer la
+/// logique SQL réellement injectée, sans dépendance supplémentaire (même
+/// helper que `integration_control_pair.rs`).
+fn decode_url(url: &str) -> String {
+    let bytes = url.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Première comparaison entière `(\d+)\s*=\s*(\d+)` du texte décodé,
+/// guillemets simples/doubles optionnels autour des littéraux (`1 AND 1=1`,
+/// `'1'='2`, `"1"="1"`) : couvre les littéraux nus ET quotés des payloads
+/// booléens réels, y compris la paire de contrôle P0.2 `r=r` / `r1=r2`
+/// (entiers aléatoires à 4 chiffres).
+fn first_int_comparison(text: &str) -> Option<(u64, u64)> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let lhs_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let lhs_end = i;
+        let mut j = i;
+        if matches!(bytes.get(j), Some(b'\'' | b'"')) {
+            j += 1;
+        }
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b'=') {
+            i = lhs_end;
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if matches!(bytes.get(j), Some(b'\'' | b'"')) {
+            j += 1;
+        }
+        let rhs_start = j;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == rhs_start {
+            i = lhs_end;
+            continue;
+        }
+        if let (Ok(lhs), Ok(rhs)) = (
+            text[lhs_start..lhs_end].parse::<u64>(),
+            text[rhs_start..j].parse::<u64>(),
+        ) {
+            return Some((lhs, rhs));
+        }
+        i = lhs_end;
+    }
+    None
+}
+
+/// Error responder WITHOUT fragment (0.75) + real boolean oracle: the page
+/// evaluates the first integer comparison of the decoded payload (bare or
+/// quoted literals): equal → baseline (TRUE branch), unequal → different
+/// content (FALSE branch). A literal-pattern mock (`=1` → baseline,
+/// `=2` → different) is not enough anymore: P2.4 re-validates this Medium
+/// finding automatically with fresh boolean pairs — including the P0.2
+/// random control pair (`r=r` / `r1=r2`) — so the mock must actually
+/// compute the comparison.
 fn confirm_ok_responder(req: &wiremock::Request) -> ResponseTemplate {
     let lower = req.url.to_string().to_ascii_lowercase();
     if lower.contains("extractvalue") || lower.contains("updatexml") {
         return ResponseTemplate::new(200)
             .set_body_string("XPATH syntax error occurred welcome baseline");
     }
-    // FALSE branch marker `='2'` (encoded `%3d%272`) must win over TRUE:
-    // both contain `%20`/`%27` digits, only the `=`-context disambiguates.
-    if lower.contains("%3d%272") || lower.contains("='2'") || lower.contains("1%3d2") {
-        return ResponseTemplate::new(200)
-            .set_body_string("completely different false branch content 99 unique");
+    let decoded = decode_url(req.url.as_str());
+    match first_int_comparison(&decoded) {
+        Some((lhs, rhs)) if lhs != rhs => ResponseTemplate::new(200)
+            .set_body_string("completely different false branch content 99 unique"),
+        _ => ResponseTemplate::new(200).set_body_string(baseline_body()),
     }
-    if lower.contains("%3d%271") || lower.contains("='1'") || lower.contains("1%3d1") {
-        return ResponseTemplate::new(200).set_body_string(baseline_body());
-    }
-    ResponseTemplate::new(200).set_body_string(baseline_body())
 }
 
 /// Error responder WITHOUT fragment (0.75) and NO boolean differential
@@ -113,6 +202,13 @@ async fn error_with_fragment_pushes_direct_without_confirm() {
     );
 }
 
+/// First-pass error→boolean confirmation upgrades 0.75 → 0.9
+/// (`bool_confirm=true`). The finding lands in the Medium bucket, so P2.4
+/// automatically re-validates it without `--confirm` (`confirm=second-pass`,
+/// same strict pass as the flag): the oracle mock above sustains both the
+/// fresh boolean pairs and the P0.2 random control pair, so the finding is
+/// kept — the assertion below pins the upgrade, not the old "no second-pass
+/// without `--confirm`" behaviour.
 #[tokio::test]
 async fn error_without_fragment_confirmed_upgrades_to_09() {
     let server = MockServer::start().await;
