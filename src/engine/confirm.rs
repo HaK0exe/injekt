@@ -772,16 +772,34 @@ pub(crate) async fn confirm_finding_second_pass(
     }
 }
 
-/// Boolean/Json second-pass: fresh TRUE/FALSE pairs (derived seed), same
-/// 3-trial `confirm_either` majority bar as the first pass (identical
-/// payloads re-sent per trial for `--seed` determinism).
+/// Second-pass candidate: the historical boolean TRUE/FALSE base pair
+/// (quote-aware) or the full JSON/NoSQL payload — error probe included — so a
+/// finding confirmed through either channel re-probes the SAME channel with
+/// first-pass parity.
+enum SecondPassCand {
+    Boolean {
+        true_base: String,
+        false_base: String,
+    },
+    Json(crate::techniques::json::payloads::JsonPayload),
+    Nosql(crate::techniques::nosql::payloads::NosqlPayload),
+}
+
+/// Boolean/Json/NoSQL second-pass: fresh TRUE/FALSE pairs (derived seed),
+/// same 3-trial `confirm_either` majority bar as the first pass (identical
+/// payloads re-sent per trial for `--seed` determinism). Findings whose
+/// evidence carries `channel=error` (JSON `__bad__` / `NoSQL` `$where`) are
+/// re-probed on the error channel instead: one error payload per candidate,
+/// mirroring `test_json_bounded` / `test_nosql_bounded` (1 request each).
 ///
 /// Bounded retry: tries up to `payload_budget(level, 2, len)` candidates
-/// (capped at 3 pairs x 3 trials x 2 requests = 18 requests), quote-ordered
-/// exactly like first-pass detection. Keep iff ANY pair re-confirms; drop
-/// only when ALL pairs conclusively fail. Cancel keeps immediately; a run
-/// that never manages a measured trial (all transport-neutral) also keeps
-/// instead of dropping on network flakes.
+/// (boolean capped at 3 pairs x 3 trials x 2 requests = 18 requests). JSON
+/// candidates come from `json_scan_payloads` (direct sweep + GraphQL
+/// `variables` envelope) and `NoSQL` from the full catalogue, exactly like the
+/// first pass. Keep iff ANY candidate re-confirms; drop only when ALL
+/// candidates conclusively fail. Cancel keeps immediately; a run that never
+/// manages a measured probe (all transport-neutral) also keeps instead of
+/// dropping on network flakes.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn confirm_boolean_second_pass(
     client: &HttpClient,
@@ -806,23 +824,25 @@ pub(crate) async fn confirm_boolean_second_pass(
 ) -> bool {
     let mut rng = crate::seeded_rng::make_rng(seed);
     let label = dbms_label_from_finding(finding);
-    // Candidate TRUE/FALSE bases in first-pass order (quote-aware for
-    // boolean; JSON/NoSQL keep catalogue order — no quote-ordering there).
-    let candidates: Vec<(String, String)> = if finding.technique == TechniqueKind::Json {
-        let payloads = crate::techniques::json::payloads::json_payloads_for(label);
-        let take = payload_budget(level, 2, payloads.len()).clamp(1, 3);
+    // Candidates in first-pass order: boolean keeps its quote-aware pairs
+    // (unchanged behaviour); JSON mirrors `test_json_bounded`
+    // (`json_scan_payloads`: direct sweep + GraphQL `variables` envelope);
+    // NoSQL mirrors `test_nosql_bounded` (full catalogue, same budget).
+    let candidates: Vec<SecondPassCand> = if finding.technique == TechniqueKind::Json {
+        let payloads = crate::engine::schedule::json_scan_payloads(label);
+        let take = payload_budget(level, 2, payloads.len());
         payloads
-            .iter()
+            .into_iter()
             .take(take)
-            .map(|p| (p.true_payload.clone(), p.false_payload.clone()))
+            .map(SecondPassCand::Json)
             .collect()
     } else if finding.technique == TechniqueKind::Nosql {
         let payloads = crate::techniques::nosql::payloads::nosql_payloads();
-        let take = payload_budget(level, 2, payloads.len()).clamp(1, 3);
+        let take = payload_budget(level, 2, payloads.len());
         payloads
-            .iter()
+            .into_iter()
             .take(take)
-            .map(|p| (p.true_payload.clone(), p.false_payload.clone()))
+            .map(SecondPassCand::Nosql)
             .collect()
     } else {
         let mut payloads = crate::techniques::boolean::payloads::boolean_payloads_for(label);
@@ -831,7 +851,10 @@ pub(crate) async fn confirm_boolean_second_pass(
         payloads
             .iter()
             .take(take)
-            .map(|p| (p.true_payload.clone(), p.false_payload.clone()))
+            .map(|p| SecondPassCand::Boolean {
+                true_base: p.true_payload.clone(),
+                false_base: p.false_payload.clone(),
+            })
             .collect()
     };
     if candidates.is_empty() {
@@ -843,19 +866,148 @@ pub(crate) async fn confirm_boolean_second_pass(
         .filter(|t| t.is_boolean_safe())
         .cloned()
         .collect();
+    // NoSQL JSON-body operator path: same detection as `test_nosql_bounded`
+    // (`param` body + JSON sniff) — the injected shape is an operator object,
+    // not the generic string form, and string tampers don't apply there.
+    let json_operator_path: Option<String> = match &param.location {
+        ParameterLocation::Body => {
+            let body_opt = raw.and_then(|r| r.body.as_deref());
+            let ct = raw.and_then(|r| r.content_type());
+            body_opt
+                .filter(|body| {
+                    crate::target::structured::sniff_kind(ct, body)
+                        == crate::target::structured::StructuredKind::Json
+                })
+                .map(str::to_owned)
+        }
+        _ => None,
+    };
+    let trans: &[Tamper] = if json_operator_path.is_some() {
+        &[]
+    } else {
+        &safe
+    };
+    // Error-channel findings (JSON `__bad__` / NoSQL `$where`) carry their
+    // differential in the error probe, not the boolean pair: re-probe the
+    // error payload (1 request/candidate), mirroring the first pass.
+    let error_channel = finding.evidence.contains("channel=error");
     // P1.1 — purge des zones dynamiques marquées avant comparaison.
     let baseline_body =
         matcher.pre_process(&baseline.strip_dynamic_content(&baseline.representative_body_str()));
-    // Fail-open ledger: if NO pair manages a single measured trial (every
-    // trial transport-neutral), the finding could not actually be
-    // re-probed — keep it instead of dropping on network flakes.
+    // Fail-open ledger: if NO candidate manages a single measured probe (every
+    // probe transport-neutral), the finding could not actually be re-probed —
+    // keep it instead of dropping on network flakes.
     let mut any_measured = false;
-    for (true_base, false_base) in &candidates {
+    for cand in &candidates {
         if cancel.is_cancelled() {
             return true;
         }
-        let true_payload = build_final_payload_with_rng(true_base, &safe, popts, &mut rng);
-        let false_payload = build_final_payload_with_rng(false_base, &safe, popts, &mut rng);
+        if error_channel {
+            match cand {
+                SecondPassCand::Json(p) => {
+                    let probe =
+                        build_final_payload_with_rng(&p.error_payload, &safe, popts, &mut rng);
+                    let (raw_body, ms, status) = fetch_for_payload(
+                        client, state, cancel, target, target_str, param, &probe, marker_set, raw,
+                        opts, popts,
+                    )
+                    .await;
+                    // Transport/cancel: candidate not measured, never a veto.
+                    if cancel.is_cancelled() || status == 0 {
+                        continue;
+                    }
+                    if is_ignored(status, ignore_codes) {
+                        continue;
+                    }
+                    let body = matcher.pre_process(&baseline.strip_dynamic_content(&raw_body));
+                    let r = crate::techniques::json::detector::JsonDetector::new()
+                        .evaluate_error(&body);
+                    push_confirm_trace(
+                        state,
+                        &param.key(),
+                        finding.technique,
+                        mutation_plan,
+                        seed,
+                        &probe,
+                        &body,
+                        if r.is_vulnerable { r.confidence } else { 0.1 },
+                        ms,
+                    )
+                    .await;
+                    any_measured = true;
+                    // Same bar as the first pass: signature still present and
+                    // the matcher does not veto the error page.
+                    if r.is_vulnerable && matcher.matches(&body, status) != Some(false) {
+                        return true;
+                    }
+                }
+                SecondPassCand::Nosql(p) => {
+                    let (raw_body, ms, status) = crate::engine::probes::fetch_nosql_error(
+                        client,
+                        state,
+                        cancel,
+                        target,
+                        target_str,
+                        param,
+                        raw,
+                        json_operator_path.as_deref(),
+                        &p.error_payload,
+                        trans,
+                        marker_set,
+                        opts,
+                        popts,
+                        &mut rng,
+                    )
+                    .await;
+                    if cancel.is_cancelled() || status == 0 {
+                        continue;
+                    }
+                    if is_ignored(status, ignore_codes) {
+                        continue;
+                    }
+                    let body = matcher.pre_process(&baseline.strip_dynamic_content(&raw_body));
+                    let r = crate::techniques::nosql::detector::NosqlDetector::new()
+                        .evaluate_error(&body);
+                    push_confirm_trace(
+                        state,
+                        &param.key(),
+                        finding.technique,
+                        mutation_plan,
+                        seed,
+                        &p.error_payload,
+                        &body,
+                        if r.is_vulnerable { r.confidence } else { 0.1 },
+                        ms,
+                    )
+                    .await;
+                    any_measured = true;
+                    if r.is_vulnerable && matcher.matches(&body, status) != Some(false) {
+                        return true;
+                    }
+                }
+                // Boolean findings never carry `channel=error`; nothing to do.
+                SecondPassCand::Boolean { .. } => {}
+            }
+            continue;
+        }
+        // Build the payload pair once: the 3 trials must re-send the IDENTICAL
+        // payloads (seed determinism — the RNG must not advance per trial).
+        // NoSQL builds its string form inside `fetch_nosql_boolean` (operator
+        // path sends the pre-parsed `Value` as-is), exactly like first pass.
+        let (true_payload, false_payload) = match cand {
+            SecondPassCand::Boolean {
+                true_base,
+                false_base,
+            } => (
+                build_final_payload_with_rng(true_base, &safe, popts, &mut rng),
+                build_final_payload_with_rng(false_base, &safe, popts, &mut rng),
+            ),
+            SecondPassCand::Json(p) => (
+                build_final_payload_with_rng(&p.true_payload, &safe, popts, &mut rng),
+                build_final_payload_with_rng(&p.false_payload, &safe, popts, &mut rng),
+            ),
+            SecondPassCand::Nosql(p) => (p.true_payload.clone(), p.false_payload.clone()),
+        };
         // 3-trial confirmation per pair (same bar as the first pass):
         // re-send the IDENTICAL payloads (seed determinism — the RNG must
         // not advance per trial) and require a `confirm_either` majority
@@ -871,36 +1023,99 @@ pub(crate) async fn confirm_boolean_second_pass(
             if cancel.is_cancelled() {
                 return true;
             }
-            let (true_raw, true_ms, true_status) = fetch_for_payload_with_class(
-                client,
-                state,
-                cancel,
-                target,
-                target_str,
-                param,
-                &true_payload,
-                marker_set,
-                raw,
-                opts,
-                popts,
-                RequestClass::Boolean,
-            )
-            .await;
-            let (false_raw, false_ms, false_status) = fetch_for_payload_with_class(
-                client,
-                state,
-                cancel,
-                target,
-                target_str,
-                param,
-                &false_payload,
-                marker_set,
-                raw,
-                opts,
-                popts,
-                RequestClass::Boolean,
-            )
-            .await;
+            // NoSQL operator/JSON-body parity: `fetch_nosql_boolean` selects
+            // the operator-object or string shape exactly like first pass;
+            // boolean/JSON use the generic boolean fetch.
+            let (true_raw, true_ms, true_status, false_raw, false_ms, false_status) = match cand {
+                SecondPassCand::Nosql(p) => {
+                    let (true_raw, true_ms, true_status) =
+                        crate::engine::probes::fetch_nosql_boolean(
+                            client,
+                            state,
+                            cancel,
+                            target,
+                            target_str,
+                            param,
+                            raw,
+                            json_operator_path.as_deref(),
+                            &p.true_operator,
+                            &p.true_payload,
+                            trans,
+                            marker_set,
+                            opts,
+                            popts,
+                            &mut rng,
+                        )
+                        .await;
+                    let (false_raw, false_ms, false_status) =
+                        crate::engine::probes::fetch_nosql_boolean(
+                            client,
+                            state,
+                            cancel,
+                            target,
+                            target_str,
+                            param,
+                            raw,
+                            json_operator_path.as_deref(),
+                            &p.false_operator,
+                            &p.false_payload,
+                            trans,
+                            marker_set,
+                            opts,
+                            popts,
+                            &mut rng,
+                        )
+                        .await;
+                    (
+                        true_raw,
+                        true_ms,
+                        true_status,
+                        false_raw,
+                        false_ms,
+                        false_status,
+                    )
+                }
+                SecondPassCand::Boolean { .. } | SecondPassCand::Json(_) => {
+                    let (true_raw, true_ms, true_status) = fetch_for_payload_with_class(
+                        client,
+                        state,
+                        cancel,
+                        target,
+                        target_str,
+                        param,
+                        &true_payload,
+                        marker_set,
+                        raw,
+                        opts,
+                        popts,
+                        RequestClass::Boolean,
+                    )
+                    .await;
+                    let (false_raw, false_ms, false_status) = fetch_for_payload_with_class(
+                        client,
+                        state,
+                        cancel,
+                        target,
+                        target_str,
+                        param,
+                        &false_payload,
+                        marker_set,
+                        raw,
+                        opts,
+                        popts,
+                        RequestClass::Boolean,
+                    )
+                    .await;
+                    (
+                        true_raw,
+                        true_ms,
+                        true_status,
+                        false_raw,
+                        false_ms,
+                        false_status,
+                    )
+                }
+            };
             if cancel.is_cancelled() {
                 return true;
             }
@@ -923,27 +1138,30 @@ pub(crate) async fn confirm_boolean_second_pass(
             let true_body = matcher.pre_process(&baseline.strip_dynamic_content(&true_raw));
             let false_body = matcher.pre_process(&baseline.strip_dynamic_content(&false_raw));
             let res = if finding.technique == TechniqueKind::Json {
-                crate::techniques::json::detector::JsonDetector::new().evaluate_boolean(
-                    &baseline_body,
-                    &true_body,
-                    &false_body,
-                    baseline.mean_ms,
-                    true_ms,
-                    false_ms,
-                )
+                crate::techniques::json::detector::JsonDetector::new()
+                    .evaluate_boolean_with_match_ratio(
+                        &baseline_body,
+                        &true_body,
+                        &false_body,
+                        baseline.mean_ms,
+                        true_ms,
+                        false_ms,
+                        baseline.match_ratio(),
+                    )
             } else if finding.technique == TechniqueKind::Nosql {
-                crate::techniques::nosql::detector::NosqlDetector::new().evaluate_boolean(
-                    &baseline_body,
-                    &true_body,
-                    &false_body,
-                    baseline.mean_ms,
-                    true_ms,
-                    false_ms,
-                )
+                crate::techniques::nosql::detector::NosqlDetector::new()
+                    .evaluate_boolean_with_match_ratio(
+                        &baseline_body,
+                        &true_body,
+                        &false_body,
+                        baseline.mean_ms,
+                        true_ms,
+                        false_ms,
+                        baseline.match_ratio(),
+                    )
             } else {
-                // P1.2 — veto empirique sur la branche booléenne pure ; les
-                // canaux JSON/NoSQL restent sur les wrappers (sans baseline en
-                // portée, plancher `None` → comportement inchangé).
+                // P1.2 — veto empirique sur la branche booléenne pure, comme
+                // les wrappers JSON/NoSQL ci-dessus (même plancher appris).
                 crate::techniques::boolean::detector::BooleanDetector::new()
                     .evaluate_with_match_ratio(
                         &baseline_body,
@@ -956,8 +1174,8 @@ pub(crate) async fn confirm_boolean_second_pass(
                     )
             };
             // P1.2 : même traduction trial neutre qu'en première passe quand
-            // le plancher de bruit a vetoé la paire (`noise_vetoed`, jamais
-            // vrai pour les wrappers JSON/NoSQL qui n'ont pas de plancher).
+            // le plancher de bruit a vetoé la paire (`noise_vetoed`, exposé
+            // par les trois détecteurs).
             let (t_conf, f_conf) = if res.noise_vetoed {
                 (0.5, 0.5)
             } else {
@@ -1057,7 +1275,7 @@ pub(crate) async fn confirm_boolean_second_pass(
                     let verdict = if ctl_true_status == 0 || ctl_false_status == 0 {
                         crate::detection::control_pair::ControlVerdict::Neutral
                     } else {
-                        crate::detection::control_pair::control_verdict(
+                        crate::detection::control_pair::control_verdict_with_match_ratio(
                             &baseline_body,
                             &matcher.pre_process(&baseline.strip_dynamic_content(&ctl_true_raw)),
                             &matcher.pre_process(&baseline.strip_dynamic_content(&ctl_false_raw)),
@@ -1065,6 +1283,7 @@ pub(crate) async fn confirm_boolean_second_pass(
                             ctl_true_ms,
                             ctl_false_ms,
                             inverted,
+                            baseline.match_ratio(),
                         )
                     };
                     if verdict == crate::detection::control_pair::ControlVerdict::Veto {
@@ -1215,8 +1434,16 @@ pub(crate) async fn confirm_time_second_pass(
 ) -> bool {
     let mut rng = crate::seeded_rng::make_rng(seed);
     let label = dbms_label_from_finding(finding);
-    let candidates = crate::techniques::time::payloads::time_payloads_for(label, 3);
-    let take = payload_budget(level, 2, candidates.len()).clamp(1, 2);
+    // Parité de fenêtre avec `test_time_bounded` : blind sweep complet quand le
+    // finding n'a pas d'attribution DBMS, sinon famille DBMS ; budget
+    // `payload_budget(level, 4, ..)` identique à la première passe (l'ancien
+    // `clamp(1, 2)` ne re-sondait que la tête de liste et perdait les variants
+    // concat/heavy).
+    let candidates = label.map_or_else(
+        || crate::techniques::time::payloads::all_time_payloads(3),
+        |label| crate::techniques::time::payloads::time_payloads_for(Some(label), 3),
+    );
+    let take = payload_budget(level, 4, candidates.len());
     if candidates.is_empty() {
         return true;
     }

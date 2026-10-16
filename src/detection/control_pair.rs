@@ -14,13 +14,19 @@
 //!   des payloads finaux confirmés, sans toucher aux autres chiffres ;
 //! - [`control_verdict`] tranche entre « cohérent » ([`ControlVerdict::Keep`]),
 //!   « contredit » ([`ControlVerdict::Veto`]) et « non mesuré »
-//!   ([`ControlVerdict::Neutral`], jamais de veto).
+//!   ([`ControlVerdict::Neutral`], jamais de veto) ; sa variante
+//!   [`control_verdict_with_match_ratio`] accepte le plancher de bruit appris
+//!   (P1.2, `Baseline::match_ratio`) et rescapce un côté baseline-like dont la
+//!   similarité Jaccard retombe dans la bande `DIFF_TOLERANCE` autour de ce
+//!   plancher.
 //!
 //! Le budget est borné par construction : une paire dérivée coûte exactement
 //! 2 requêtes, et un payload dont le motif arithmétique manque coûte 0 requête.
 
 use crate::{
-    detection::response_diff::diff_against_baseline,
+    detection::response_diff::{
+        PageSimilarity, classify_page_similarity, diff_against_baseline, jaccard,
+    },
     seeded_rng::make_rng,
     techniques::boolean::detector::{
         DIFF_SIGMA_MS, DIFFERENT_CONFIDENCE_MIN, SIMILAR_CONFIDENCE_MAX,
@@ -98,7 +104,8 @@ pub fn derive_control_pair(
     })
 }
 
-/// Évalue la paire de contrôle contre la baseline.
+/// Évalue la paire de contrôle contre la baseline (comportement historique,
+/// sans plancher de bruit appris).
 ///
 /// Exige la cohérence de direction attendue : le contrôle `r=r` doit rester
 /// baseline-like (`diff_against_baseline` < [`SIMILAR_CONFIDENCE_MAX`]) et le
@@ -106,6 +113,10 @@ pub fn derive_control_pair(
 /// `inverted` est le sens renvoyé par
 /// [`crate::detection::confirmation::confirm_either`] : en mode inversé, le
 /// côté logiquement **faux** est celui qui était baseline-like.
+///
+/// Délègue à [`control_verdict_with_match_ratio`] avec `match_ratio = None` :
+/// sortie bit-à-bit identique à l'implémentation historique, le plancher
+/// empirique P1.2 ne s'active jamais sans ratio appris.
 ///
 /// - [`ControlVerdict::Keep`] : les deux contrôles sont mesurés et cohérents ;
 /// - [`ControlVerdict::Veto`] : mesure clairement contredisante (un contrôle
@@ -123,6 +134,57 @@ pub fn control_verdict(
     ctl_true_ms: f64,
     ctl_false_ms: f64,
     inverted: bool,
+) -> ControlVerdict {
+    control_verdict_with_match_ratio(
+        baseline_body,
+        ctl_true_body,
+        ctl_false_body,
+        baseline_ms,
+        ctl_true_ms,
+        ctl_false_ms,
+        inverted,
+        None,
+    )
+}
+
+/// Évalue la paire de contrôle contre la baseline, avec le plancher de bruit
+/// empirique (P1.2, [`crate::detection::baseline::Baseline::match_ratio`])
+/// pour rescaper le côté baseline-like.
+///
+/// Même sémantique que [`control_verdict`] — `same` = côté qui doit rester
+/// baseline-like (`diff_true` si `!inverted`, `diff_false` sinon), `other` =
+/// côté qui doit s'en écarter — avec une rescousse supplémentaire :
+///
+/// # Rescousse empirique (P1.2)
+///
+/// Sur une page naturellement instable, le contrôle baseline-like peut lire
+/// « différent » par confiance (timing/composition) alors que sa similarité
+/// Jaccard retombe dans la bande de bruit apprise (`match_ratio`, marge
+/// [`crate::detection::response_diff::DIFF_TOLERANCE`]) : un veto serait alors
+/// injustifié et dropperait un vrai positif. Quand
+/// `classify_page_similarity(jaccard(baseline, same), match_ratio)` vaut
+/// [`PageSimilarity::Same`], le côté `same` est traité comme baseline-like
+/// même si sa confiance dépasse [`SIMILAR_CONFIDENCE_MAX`] : un
+/// [`ControlVerdict::Keep`] reste possible et le veto « same s'éloigne » est
+/// levé.
+///
+/// Le côté `other` garde ses barres fixes : le plancher ne peut jamais
+/// transformer un [`ControlVerdict::Keep`] en [`ControlVerdict::Veto`], ni
+/// créer un [`ControlVerdict::Keep`] quand `other < SIMILAR_CONFIDENCE_MAX`.
+/// `match_ratio = None` (ou non fini) restaure exactement le comportement
+/// historique ; les gardes d'entrée (corps vide → [`ControlVerdict::Neutral`])
+/// sont inchangées.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn control_verdict_with_match_ratio(
+    baseline_body: &str,
+    ctl_true_body: &str,
+    ctl_false_body: &str,
+    baseline_ms: f64,
+    ctl_true_ms: f64,
+    ctl_false_ms: f64,
+    inverted: bool,
+    match_ratio: Option<f64>,
 ) -> ControlVerdict {
     // Corps vide = aucune mesure ; baseline vide = pas d'ancre de comparaison.
     // Dans les deux cas : neutre, jamais de veto (le call site, lui, filtre
@@ -152,9 +214,21 @@ pub fn control_verdict(
     } else {
         (diff_true.confidence, diff_false.confidence)
     };
-    if same < SIMILAR_CONFIDENCE_MAX && other > DIFFERENT_CONFIDENCE_MIN {
+    // P1.2 — côté `same` uniquement : le plancher de bruit appris explique une
+    // similarité Jaccard du contrôle baseline-like qui retombe dans la bande
+    // du bruit (`DIFF_TOLERANCE` autour de `match_ratio`) : cohérent.
+    let same_body = if inverted {
+        ctl_false_body
+    } else {
+        ctl_true_body
+    };
+    let floor_same = match_ratio.is_some()
+        && classify_page_similarity(jaccard(baseline_body, same_body), match_ratio)
+            == PageSimilarity::Same;
+    let same_like = same < SIMILAR_CONFIDENCE_MAX || floor_same;
+    if same_like && other > DIFFERENT_CONFIDENCE_MIN {
         ControlVerdict::Keep
-    } else if same > DIFFERENT_CONFIDENCE_MIN || other < SIMILAR_CONFIDENCE_MAX {
+    } else if (same > DIFFERENT_CONFIDENCE_MIN && !floor_same) || other < SIMILAR_CONFIDENCE_MAX {
         ControlVerdict::Veto
     } else {
         ControlVerdict::Neutral
@@ -238,6 +312,11 @@ mod tests {
     /// Corps de référence : page stable vs page sans résultat.
     const BASELINE: &str = "welcome to the shop product listing page id 1 normal";
     const DIFFERENT: &str = "no results found";
+    /// Variante quasi identique de [`BASELINE`] (un token en plus) : Jaccard
+    /// `10/11 ≈ 0.91`, dans la bande apprise (`m = 0.9`) sans franchir
+    /// `UPPER_RATIO_BOUND` — exerce la rescousse par plancher appris, pas par
+    /// la borne haute.
+    const NEAR_BASELINE: &str = "welcome to the shop product listing page id 1 normal extra";
 
     /// Décompose la comparaison repérée d'un payload en
     /// `(préfixe, lhs, rhs, suffixe)`.
@@ -409,6 +488,210 @@ mod tests {
                 ControlVerdict::Neutral
             );
         }
+    }
+
+    #[test]
+    fn none_matches_legacy_control_verdict() {
+        // `match_ratio = None` doit rester bit-à-bit l'ancien verdict sur
+        // plusieurs entrées (directions, zones grises, gardes d'entrée).
+        let cases = [
+            (BASELINE, BASELINE, DIFFERENT, 100.0, 105.0, 102.0, false),
+            (BASELINE, DIFFERENT, DIFFERENT, 100.0, 105.0, 102.0, false),
+            (BASELINE, BASELINE, BASELINE, 100.0, 105.0, 102.0, false),
+            (
+                BASELINE,
+                NEAR_BASELINE,
+                DIFFERENT,
+                100.0,
+                600.0,
+                100.0,
+                false,
+            ),
+            (BASELINE, DIFFERENT, BASELINE, 100.0, 105.0, 102.0, true),
+            (BASELINE, BASELINE, DIFFERENT, 100.0, 105.0, 102.0, true),
+            (BASELINE, DIFFERENT, BASELINE, 100.0, 100.0, 600.0, true),
+            (BASELINE, "", "", 100.0, 0.0, 0.0, false),
+            ("", DIFFERENT, BASELINE, 100.0, 105.0, 102.0, true),
+        ];
+        for (b, t, f, b_ms, t_ms, f_ms, inv) in cases {
+            assert_eq!(
+                control_verdict(b, t, f, b_ms, t_ms, f_ms, inv),
+                control_verdict_with_match_ratio(b, t, f, b_ms, t_ms, f_ms, inv, None),
+                "None doit rester legacy ({b:?}/{t:?}/{f:?}/{inv})"
+            );
+        }
+    }
+
+    #[test]
+    fn match_ratio_floor_rescues_same_side_from_veto() {
+        // Côté `same` : contenu identique à la baseline mais timing très
+        // différent (+500 ms > 2·DIFF_SIGMA_MS) ⇒ confiance 0.65 > 0.6.
+        let same_ms = 600.0;
+        let same_conf =
+            diff_against_baseline(BASELINE, BASELINE, 100.0, same_ms, DIFF_SIGMA_MS).confidence;
+        assert!(
+            same_conf > DIFFERENT_CONFIDENCE_MIN,
+            "le timing seul doit pousser la confiance au-dessus de 0.6, got {same_conf}"
+        );
+        // Sans plancher : veto legacy (le côté same s'éloigne par confiance).
+        assert_eq!(
+            control_verdict_with_match_ratio(
+                BASELINE, BASELINE, DIFFERENT, 100.0, same_ms, 100.0, false, None,
+            ),
+            ControlVerdict::Veto
+        );
+        // Avec plancher appris (m ≈ 0.9, jaccard 1.0 → Same) : rescousse.
+        assert_eq!(
+            control_verdict_with_match_ratio(
+                BASELINE,
+                BASELINE,
+                DIFFERENT,
+                100.0,
+                same_ms,
+                100.0,
+                false,
+                Some(0.9),
+            ),
+            ControlVerdict::Keep
+        );
+        // Bande apprise réellement exercée : contenu quasi identique
+        // (jaccard 10/11 ≈ 0.91, sous UPPER_RATIO_BOUND), c'est bien
+        // `m - DIFF_TOLERANCE` qui classe Same.
+        assert_eq!(
+            classify_page_similarity(jaccard(BASELINE, NEAR_BASELINE), Some(0.9)),
+            PageSimilarity::Same
+        );
+        assert_eq!(
+            control_verdict_with_match_ratio(
+                BASELINE,
+                NEAR_BASELINE,
+                DIFFERENT,
+                100.0,
+                same_ms,
+                100.0,
+                false,
+                Some(0.9),
+            ),
+            ControlVerdict::Keep
+        );
+        assert_eq!(
+            control_verdict_with_match_ratio(
+                BASELINE,
+                NEAR_BASELINE,
+                DIFFERENT,
+                100.0,
+                same_ms,
+                100.0,
+                false,
+                None,
+            ),
+            ControlVerdict::Veto
+        );
+        // Un Keep legacy ne peut jamais être dégradé par le plancher.
+        assert_eq!(
+            control_verdict_with_match_ratio(
+                BASELINE,
+                BASELINE,
+                DIFFERENT,
+                100.0,
+                105.0,
+                102.0,
+                false,
+                Some(0.9),
+            ),
+            ControlVerdict::Keep
+        );
+    }
+
+    #[test]
+    fn match_ratio_floor_never_rescues_other_side() {
+        // Le côté `other` reste sur les barres fixes : un contrôle « faux »
+        // (ou « vrai » en sens inversé) confondu avec la baseline → veto,
+        // avec ET sans plancher.
+        for match_ratio in [None, Some(0.9)] {
+            assert_eq!(
+                control_verdict_with_match_ratio(
+                    BASELINE,
+                    BASELINE,
+                    BASELINE,
+                    100.0,
+                    105.0,
+                    102.0,
+                    false,
+                    match_ratio,
+                ),
+                ControlVerdict::Veto,
+                "other baseline-like → veto ({match_ratio:?})"
+            );
+            assert_eq!(
+                control_verdict_with_match_ratio(
+                    BASELINE,
+                    BASELINE,
+                    DIFFERENT,
+                    100.0,
+                    105.0,
+                    102.0,
+                    true,
+                    match_ratio,
+                ),
+                ControlVerdict::Veto,
+                "other baseline-like en sens inversé → veto ({match_ratio:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn match_ratio_floor_inactive_in_gray_zone() {
+        // Similarité dans la zone grise (10/11 ≈ 0.91 < UPPER_RATIO_BOUND) :
+        // sans plancher exploitable, la classification reste `Undetermined`
+        // → comportement legacy, aucune rescousse.
+        assert_eq!(
+            classify_page_similarity(jaccard(BASELINE, NEAR_BASELINE), Some(f64::NAN)),
+            PageSimilarity::Undetermined
+        );
+        for match_ratio in [None, Some(f64::NAN), Some(f64::INFINITY)] {
+            assert_eq!(
+                control_verdict_with_match_ratio(
+                    BASELINE,
+                    NEAR_BASELINE,
+                    DIFFERENT,
+                    100.0,
+                    600.0,
+                    100.0,
+                    false,
+                    match_ratio,
+                ),
+                ControlVerdict::Veto,
+                "zone grise → legacy ({match_ratio:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn match_ratio_floor_rescues_inverted_same_side() {
+        // Sens inversé : c'est `ctl_false_body` (`r1=r2`) qui est
+        // baseline-like ; même rescousse quand son timing s'éloigne.
+        assert_eq!(
+            control_verdict_with_match_ratio(
+                BASELINE, DIFFERENT, BASELINE, 100.0, 100.0, 600.0, true, None,
+            ),
+            ControlVerdict::Veto,
+            "legacy : côté same inversé à confiance 0.65 → veto"
+        );
+        assert_eq!(
+            control_verdict_with_match_ratio(
+                BASELINE,
+                DIFFERENT,
+                BASELINE,
+                100.0,
+                100.0,
+                600.0,
+                true,
+                Some(0.9),
+            ),
+            ControlVerdict::Keep,
+            "plancher : même rescousse en sens inversé"
+        );
     }
 
     #[test]

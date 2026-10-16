@@ -141,6 +141,50 @@ async fn json_error_channel_finds_injection() {
     assert_eq!(jf.dbms, Some("mysql".to_owned()));
 }
 
+/// Le second pass (`--confirm`) doit re-sonder le canal erreur (`__bad__`),
+/// pas le canal booléen : le finding `channel=error` survit.
+#[tokio::test]
+async fn json_error_channel_survives_confirm_second_pass() {
+    let server = MockServer::start().await;
+    // No boolean differential here (true/false both baseline), only JSON errors.
+    Mock::given(method("GET"))
+        .respond_with(|req: &wiremock::Request| {
+            let url = req.url.to_string().to_ascii_lowercase();
+            if url.contains("__bad__") && url.contains("json_extract") {
+                return ResponseTemplate::new(200).set_body_string(
+                    "SQL error: Invalid JSON text in argument 1 to function json_extract",
+                );
+            }
+            ResponseTemplate::new(200).set_body_string(baseline_body())
+        })
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.budget.threads = 1;
+    cfg.techniques = vec!["json".to_owned()];
+    cfg.net.allow_private = true;
+    cfg.no_redact = true;
+    cfg.confirm = true;
+    cfg.no_mutation = true;
+    let engine = Engine::new(cfg, client, CancellationToken::new());
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    let jf = findings
+        .iter()
+        .find(|f| f.technique == injekt::session::state::TechniqueKind::Json)
+        .expect("json error finding present after --confirm");
+    assert!(
+        jf.evidence.contains("channel=error"),
+        "evidence {}",
+        jf.evidence
+    );
+    assert_eq!(jf.dbms, Some("mysql".to_owned()));
+}
+
 #[tokio::test]
 async fn json_in_all_techniques() {
     let server = MockServer::start().await;
@@ -201,6 +245,51 @@ async fn graphql_variables_envelope_passthrough() {
         .iter()
         .find(|f| f.technique == injekt::session::state::TechniqueKind::Json)
         .expect("graphql envelope finding present, got {findings:?}");
+    assert!(
+        jf.evidence.contains("channel=error"),
+        "evidence {}",
+        jf.evidence
+    );
+    assert_eq!(jf.dbms, Some("mysql".to_owned()));
+}
+
+/// Même backend GraphQL qu'au-dessus, avec `--confirm` : le second pass doit
+/// balayer `json_scan_payloads` (direct + enveloppe `variables`) et
+/// re-confirmer le finding détecté via l'enveloppe.
+#[tokio::test]
+async fn graphql_envelope_survives_confirm_second_pass() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(|req: &wiremock::Request| {
+            let url = req.url.to_string().to_ascii_lowercase();
+            if url.contains("variables") && url.contains("__bad__") {
+                return ResponseTemplate::new(200).set_body_string(
+                    r#"{"errors":[{"message":"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near ''"}]}"#,
+                );
+            }
+            ResponseTemplate::new(200).set_body_string(baseline_body())
+        })
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.budget.threads = 1;
+    cfg.budget.level = 3;
+    cfg.techniques = vec!["json".to_owned()];
+    cfg.net.allow_private = true;
+    cfg.no_redact = true;
+    cfg.confirm = true;
+    cfg.no_mutation = true;
+    let engine = Engine::new(cfg, client, CancellationToken::new());
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    let jf = findings
+        .iter()
+        .find(|f| f.technique == injekt::session::state::TechniqueKind::Json)
+        .expect("graphql envelope finding present after --confirm, got {findings:?}");
     assert!(
         jf.evidence.contains("channel=error"),
         "evidence {}",

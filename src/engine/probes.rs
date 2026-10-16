@@ -363,7 +363,7 @@ pub(crate) async fn test_boolean_bounded(
                         let verdict = if ctl_true_status == 0 || ctl_false_status == 0 {
                             crate::detection::control_pair::ControlVerdict::Neutral
                         } else {
-                            crate::detection::control_pair::control_verdict(
+                            crate::detection::control_pair::control_verdict_with_match_ratio(
                                 &baseline_body,
                                 &matcher
                                     .pre_process(&baseline.strip_dynamic_content(&ctl_true_raw)),
@@ -373,6 +373,7 @@ pub(crate) async fn test_boolean_bounded(
                                 ctl_true_ms,
                                 ctl_false_ms,
                                 inverted,
+                                baseline.match_ratio(),
                             )
                         };
                         match verdict {
@@ -1504,17 +1505,26 @@ pub(crate) async fn test_json_bounded(
                     last_f_status = false_status;
                     continue;
                 }
-                let res = detector.evaluate_boolean(
+                let res = detector.evaluate_boolean_with_match_ratio(
                     &baseline_body,
                     &true_body,
                     &false_body,
                     baseline.mean_ms,
                     true_ms,
                     false_ms,
+                    baseline.match_ratio(),
                 );
+                // P1.2 : plancher de bruit appris et DEUX branches dans la
+                // bande (`noise_vetoed`) → trial neutre (0.5/0.5), comme le
+                // chemin booléen pur : il ne peut jamais confirmer.
+                let (t_conf, f_conf) = if res.noise_vetoed {
+                    (0.5, 0.5)
+                } else {
+                    (res.true_similarity, res.false_similarity)
+                };
                 trials.push(crate::detection::confirmation::Trial {
-                    true_conf: res.true_similarity,
-                    false_conf: res.false_similarity,
+                    true_conf: t_conf,
+                    false_conf: f_conf,
                 });
                 last_true = true_body;
                 last_false = false_body;
@@ -1783,17 +1793,26 @@ pub(crate) async fn test_nosql_bounded(
                     last_f_status = false_status;
                     continue;
                 }
-                let res = detector.evaluate_boolean(
+                let res = detector.evaluate_boolean_with_match_ratio(
                     &baseline_body,
                     &true_body,
                     &false_body,
                     baseline.mean_ms,
                     true_ms,
                     false_ms,
+                    baseline.match_ratio(),
                 );
+                // P1.2 : plancher de bruit appris et DEUX branches dans la
+                // bande (`noise_vetoed`) → trial neutre (0.5/0.5), comme le
+                // chemin booléen pur : il ne peut jamais confirmer.
+                let (t_conf, f_conf) = if res.noise_vetoed {
+                    (0.5, 0.5)
+                } else {
+                    (res.true_similarity, res.false_similarity)
+                };
                 trials.push(crate::detection::confirmation::Trial {
-                    true_conf: res.true_similarity,
-                    false_conf: res.false_similarity,
+                    true_conf: t_conf,
+                    false_conf: f_conf,
                 });
                 last_true = true_body;
                 last_false = false_body;

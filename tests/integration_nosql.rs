@@ -161,6 +161,50 @@ async fn nosql_error_channel_finds_injection() {
     assert_eq!(nf.dbms, Some("mongodb".to_owned()));
 }
 
+/// Le second pass (`--confirm`) doit re-sonder le canal erreur (`$where` /
+/// `$invalidOpInjekt`), pas le canal booléen : le finding `channel=error`
+/// survit.
+#[tokio::test]
+async fn nosql_error_channel_survives_confirm_second_pass() {
+    let server = MockServer::start().await;
+    // No boolean differential here (true/false both baseline), only errors.
+    Mock::given(method("GET"))
+        .respond_with(|req: &wiremock::Request| {
+            let url = req.url.to_string().to_ascii_lowercase();
+            if url.contains("invalidop") {
+                return ResponseTemplate::new(200)
+                    .set_body_string("MongoServerError: unknown operator: $invalidOpInjekt");
+            }
+            ResponseTemplate::new(200).set_body_string(baseline_body())
+        })
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.budget.threads = 1;
+    cfg.techniques = vec!["nosql".to_owned()];
+    cfg.net.allow_private = true;
+    cfg.no_redact = true;
+    cfg.confirm = true;
+    cfg.no_mutation = true;
+    let engine = Engine::new(cfg, client, CancellationToken::new());
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    let nf = findings
+        .iter()
+        .find(|f| f.technique == injekt::session::state::TechniqueKind::Nosql)
+        .expect("nosql error finding present after --confirm");
+    assert!(
+        nf.evidence.contains("channel=error"),
+        "evidence {}",
+        nf.evidence
+    );
+    assert_eq!(nf.dbms, Some("mongodb".to_owned()));
+}
+
 #[tokio::test]
 async fn nosql_json_body_operator_finds_bypass() {
     // End-to-end du bypass REST `{"user": {"$gt": ""}}` : la feuille
@@ -180,6 +224,52 @@ async fn nosql_json_body_operator_finds_bypass() {
         .iter()
         .find(|f| f.technique == injekt::session::state::TechniqueKind::Nosql)
         .expect("nosql json-body finding present");
+    assert!(
+        nf.evidence.contains("channel=boolean"),
+        "evidence {}",
+        nf.evidence
+    );
+    assert!(
+        nf.parameter.ends_with("@body"),
+        "operator injection must target a body param, got {}",
+        nf.parameter
+    );
+}
+
+/// Même bypass `{"user": {"$gt": ""}}`, avec `--confirm` : le second pass doit
+/// rejouer la forme **opérateur JSON-body** (`fetch_nosql_boolean` +
+/// `inject_json_operator`), pas la forme chaîne générique.
+#[tokio::test]
+async fn nosql_json_body_operator_survives_confirm_second_pass() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(nosql_json_body_responder(false))
+        .mount(&server)
+        .await;
+
+    let client = test_client();
+    let mut cfg = EngineConfig::default();
+    cfg.budget.threads = 1;
+    cfg.techniques = vec!["nosql".to_owned()];
+    cfg.net.allow_private = true;
+    cfg.no_redact = true;
+    cfg.confirm = true;
+    cfg.no_mutation = true;
+    cfg.raw_request = Some(
+        RawRequest::parse(
+            "POST / HTTP/1.1\nHost: lab.local\nContent-Type: application/json\n\n{\"user\":\"admin\",\"pass\":\"secret\"}",
+        )
+        .expect("raw request parse"),
+    );
+    let engine = Engine::new(cfg, client, CancellationToken::new());
+    let target = server.uri();
+    let _ = engine.run(&target).await.expect("engine run");
+
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    let nf = findings
+        .iter()
+        .find(|f| f.technique == injekt::session::state::TechniqueKind::Nosql)
+        .expect("nosql json-body finding present after --confirm");
     assert!(
         nf.evidence.contains("channel=boolean"),
         "evidence {}",

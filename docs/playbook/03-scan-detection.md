@@ -133,18 +133,21 @@ Cas d'usage :
 - API JSON → `--code` + `--dbms` + `--techniques json`.
 
 Seconde passe stricte C6 (réelle). Par défaut, les findings **confirmés non-High**
-sur les techniques dont la re-sonde rejoue le même canal qu'en première passe
-(boolean/error/union/stacked) sont **re-validés automatiquement** (payloads frais
-+ seed dérivé `derive_confirm_seed(base, idx)`, coût borné, 0 requête sans
-candidat) ; `time`/`json`/`nosql` restent hors du scope auto (leurs re-sondes
-couvrent une fenêtre de canal/variante plus étroite). `--confirm` étend la
-re-validation à **tous** les findings confirmés (OOB exclu, ~2× requêtes pire
-cas). La passe ne crée **jamais** de finding : seuls les re-validés survivent
-(échec franc = drop car probable FP ; cas douteux — transport, `--ignore-code`,
-cancel = finding conservé). La confirmation in-detection (3 essais) reste active
-avec ou sans le flag. La mini-mutation C5-tardive tourne dans cette passe
-(`--confirm` seul, ≤4 variantes / ≤8 requêtes par finding, tracée
-`mutation:<famille>`, échec silencieux) — `--no-mutation` la coupe (voir chap. 4).
+sont **re-validés automatiquement** sur toutes les techniques non-OOB, avec
+parité de fenêtre première passe : `time` re-sonde la même famille de payloads
+(blind sweep complet quand le finding n'a pas d'attribution DBMS, budget
+`--level` identique), `json` rejoue l'enveloppe GraphQL `variables`, et
+`json`/`nosql` re-sondent le **canal d'origine** du finding (`channel=error` →
+sonde d'erreur ; forme opérateur JSON-body pour `nosql`) (payloads frais +
+seed dérivé `derive_confirm_seed(base, idx)`, coût borné, 0 requête sans
+candidat). `--confirm` étend la re-validation à **tous** les findings confirmés
+(OOB exclu, High inclus, ~2× requêtes pire cas). La passe ne crée **jamais** de
+finding : seuls les re-validés survivent (échec franc = drop car probable FP ;
+cas douteux — transport, `--ignore-code`, cancel = finding conservé). La
+confirmation in-detection (3 essais) reste active avec ou sans le flag. La
+mini-mutation C5-tardive tourne dans cette passe (`--confirm` seul, ≤4 variantes
+/ ≤8 requêtes par finding, tracée `mutation:<famille>`, échec silencieux) —
+`--no-mutation` la coupe (voir chap. 4).
 
 ```bash
 # Verdict 1-ligne, 0 requête (trace RAM + evidence, ex. `TRUE≈baseline 0.91, FALSE≠baseline 0.22, 3/3, …`) :

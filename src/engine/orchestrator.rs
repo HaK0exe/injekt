@@ -139,7 +139,7 @@ enum ConfirmScope {
 }
 
 /// `true` when a finding must be re-validated by the automatic second-pass
-/// (no `--confirm`): confirmed, non-OOB, not calibrated `High`, and on a
+/// (no `--confirm`): confirmed, non-OOB, not calibrated `High`, on any
 /// technique whose second-pass re-probes the same channel/variant window as
 /// first-pass detection.
 ///
@@ -148,24 +148,15 @@ enum ConfirmScope {
 /// findings carry the residual FP risk, so they are re-validated — the pass
 /// never creates findings and inconclusive outcomes keep them (fail-open).
 ///
-/// Techniques are restricted to [`TechniqueKind::Boolean`],
-/// [`TechniqueKind::Error`], [`TechniqueKind::Union`] and
-/// [`TechniqueKind::Stacked`]: for these, `confirm_finding_second_pass`
-/// re-sends the same payload family/channel as first-pass detection, so a
-/// failure is conclusive. `Time` (re-probes only the head of
-/// `time_payloads_for`, missing concat/heavy variants), `Json`/`Nosql`
-/// (error-channel findings are re-probed through the boolean channel only)
-/// have pre-existing second-pass window mismatches: auto-dropping them would
-/// silently lose true positives, so they stay out of the automatic scope
-/// (`--confirm` still re-validates them, historical behaviour).
+/// Every non-OOB technique now has first-pass window parity: `Time` re-sweeps
+/// the same payload family/budget (blind sweep included), `Json` replays the
+/// GraphQL `variables` envelope, `Json`/`Nosql` re-probe the finding's
+/// original channel (`channel=error` → error probe) and `Nosql` keeps the
+/// JSON-body operator shape — so a failed re-confirmation is conclusive and
+/// auto-dropping no longer risks losing true positives.
 fn needs_auto_second_pass(f: &Finding) -> bool {
-    matches!(
-        f.technique,
-        TechniqueKind::Boolean
-            | TechniqueKind::Error
-            | TechniqueKind::Union
-            | TechniqueKind::Stacked
-    ) && is_confirmed_finding(f)
+    f.technique != TechniqueKind::Oob
+        && is_confirmed_finding(f)
         && severity_for(f.confidence, f.false_positive_prob) != Severity::High
 }
 
@@ -438,9 +429,9 @@ impl Engine {
         // C6 strict second-pass (anti-FP P2.4): `--confirm` re-probes every
         // confirmed non-OOB finding with fresh payloads + derived seed
         // (historical behaviour, ~2x req documented); without the flag, the
-        // same pass re-validates only confirmed non-High findings on
-        // full-fidelity techniques (boolean/error/union/stacked, bounded
-        // auto anti-FP — see `needs_auto_second_pass`). Never creates new
+        // same pass re-validates confirmed non-High findings on every
+        // non-OOB technique (bounded auto anti-FP with first-pass window
+        // parity — see `needs_auto_second_pass`). Never creates new
         // findings — only drops those that fail re-validation (0 new FP on
         // N1/N2 by construction).
         let confirm_scope = if self.config.confirm {
@@ -4150,12 +4141,14 @@ mod orchestrator_gating_tests {
     }
 
     #[test]
-    fn auto_second_pass_excludes_second_pass_window_mismatch_techniques() {
-        // P2.4: `Time` re-probes only the head of `time_payloads_for`
-        // (concat/heavy variants are missed), `Json`/`Nosql` error-channel
-        // findings are re-probed through the boolean channel only. Their
-        // second-pass cannot conclude a failure from a non-reconfirmation,
-        // so auto-dropping them would lose true positives.
+    fn auto_second_pass_includes_former_window_mismatch_techniques() {
+        // P2.4b: first-pass window parity fixed the former gaps — `Time`
+        // re-sweeps the same payload family/budget (blind sweep included),
+        // `Json` replays the GraphQL envelope, `Json`/`Nosql` re-probe the
+        // finding's original channel (`channel=error` → error probe) and
+        // `Nosql` keeps the JSON-body operator shape. A failed
+        // re-confirmation is now conclusive, so these techniques join the
+        // automatic scope instead of staying `--confirm`-only.
         let time = finding(TechniqueKind::Time, 0.6, "time delay control=ok")
             .with_false_positive_prob(0.40);
         let json =
@@ -4163,9 +4156,8 @@ mod orchestrator_gating_tests {
         let nosql =
             finding(TechniqueKind::Nosql, 0.75, "channel=error").with_false_positive_prob(0.10);
         for f in [&time, &json, &nosql] {
-            assert!(!needs_auto_second_pass(f), "{f:?}");
-            assert!(!in_confirm_scope(f, ConfirmScope::MediumRisk), "{f:?}");
-            // `--confirm` keeps the historical all-techniques coverage.
+            assert!(needs_auto_second_pass(f), "{f:?}");
+            assert!(in_confirm_scope(f, ConfirmScope::MediumRisk), "{f:?}");
             assert!(in_confirm_scope(f, ConfirmScope::All), "{f:?}");
         }
     }
