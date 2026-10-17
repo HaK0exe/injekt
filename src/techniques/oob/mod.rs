@@ -8,3 +8,4 @@ pub use payloads::{
     is_valid_oob_domain, new_token, oob_exfil_payloads_for, oob_payloads_for, sanitize_dns_label,
 };
 pub use verifier::{HttpPollVerifier, InMemoryVerifier, NoopVerifier, OobVerifier};
+pub(crate) mod scan;

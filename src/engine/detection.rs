@@ -27,14 +27,16 @@ use tracing::{debug, info, warn};
 use super::{
     ai_suggest::run_ai_suggest_for_param,
     config::{BudgetConfig, EngineConfig},
-    probes::{
-        test_boolean_bounded, test_error_bounded, test_json_bounded, test_nosql_bounded,
-        test_oob_bounded, test_stacked_bounded, test_time_bounded, test_union_bounded,
-    },
     schedule::{
         build_scheduler_for_param, detection_order, is_technique_enabled, log_scheduler_state,
         mutation_plan_label, parse_finding_dbms,
     },
+};
+use crate::techniques::{
+    boolean::scan::test_boolean_bounded, error::scan::test_error_bounded,
+    json::scan::test_json_bounded, nosql::scan::test_nosql_bounded, oob::scan::test_oob_bounded,
+    stacked::scan::test_stacked_bounded, time::scan::test_time_bounded,
+    union::scan::test_union_bounded,
 };
 
 fn progress_bar(len: u64) -> ProgressBar {

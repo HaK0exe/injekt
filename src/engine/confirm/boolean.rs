@@ -198,7 +198,7 @@ pub(crate) async fn confirm_boolean_second_pass(
                     }
                 }
                 SecondPassCand::Nosql(p) => {
-                    let (raw_body, ms, status) = crate::engine::probes::fetch_nosql_error(
+                    let (raw_body, ms, status) = crate::techniques::nosql::scan::fetch_nosql_error(
                         client,
                         state,
                         cancel,
@@ -285,7 +285,7 @@ pub(crate) async fn confirm_boolean_second_pass(
             let (true_raw, true_ms, true_status, false_raw, false_ms, false_status) = match cand {
                 SecondPassCand::Nosql(p) => {
                     let (true_raw, true_ms, true_status) =
-                        crate::engine::probes::fetch_nosql_boolean(
+                        crate::techniques::nosql::scan::fetch_nosql_boolean(
                             client,
                             state,
                             cancel,
@@ -304,7 +304,7 @@ pub(crate) async fn confirm_boolean_second_pass(
                         )
                         .await;
                     let (false_raw, false_ms, false_status) =
-                        crate::engine::probes::fetch_nosql_boolean(
+                        crate::techniques::nosql::scan::fetch_nosql_boolean(
                             client,
                             state,
                             cancel,
