@@ -3,6 +3,7 @@ pub mod ai_suggest;
 pub mod baseline;
 pub mod config;
 pub mod confirm;
+pub mod detection;
 pub mod enumerate;
 pub mod extraction;
 pub mod fetch;
