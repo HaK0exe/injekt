@@ -9,6 +9,7 @@ pub mod extraction;
 pub mod fetch;
 pub mod fingerprint;
 pub mod orchestrator;
+pub mod pipeline;
 pub mod probes;
 pub mod schedule;
 pub mod second_order;
