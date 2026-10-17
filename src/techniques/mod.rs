@@ -10,5 +10,6 @@ pub mod request_tamper;
 pub mod scan;
 pub mod stacked;
 pub mod tamper;
+pub(crate) mod technique;
 pub mod time;
 pub mod union;

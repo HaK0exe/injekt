@@ -32,12 +32,7 @@ use super::{
         mutation_plan_label, parse_finding_dbms,
     },
 };
-use crate::techniques::{
-    boolean::scan::test_boolean_bounded, error::scan::test_error_bounded,
-    json::scan::test_json_bounded, nosql::scan::test_nosql_bounded, oob::scan::test_oob_bounded,
-    stacked::scan::test_stacked_bounded, time::scan::test_time_bounded,
-    union::scan::test_union_bounded,
-};
+use crate::techniques::technique::{TechniqueCtx, technique_for};
 
 fn progress_bar(len: u64) -> ProgressBar {
     if !std::io::stderr().is_terminal() {
@@ -392,6 +387,45 @@ async fn run_detection_for_param(
     log_scheduler_state(&scheduler, &param_key, "done");
 }
 
+/// Build the shared [`TechniqueCtx`] for one (param, technique) dispatch.
+fn build_technique_ctx<'a>(
+    client: &'a HttpClient,
+    state: &'a Arc<RwLock<SessionState>>,
+    cancel: &'a CancellationToken,
+    config: &'a EngineConfig,
+    shared: &'a DetectionShared,
+    raw_request: &'a Arc<Option<RawRequest>>,
+    param: &'a TargetParameter,
+) -> TechniqueCtx<'a> {
+    TechniqueCtx {
+        client,
+        state,
+        cancel,
+        target: &shared.target,
+        target_str: &shared.target_str,
+        param,
+        baseline: &shared.baseline,
+        marker_set: &shared.marker_set,
+        raw: raw_request.as_ref().as_ref(),
+        tampers: &shared.tampers,
+        opts: ProbeOpts::new(config.evasion.hpp, config.evasion.chunked),
+        popts: &config.evasion.payload_opts,
+        matcher: &config.matcher,
+        level: config.budget.level,
+        ignore_codes: &config.net.ignore_codes,
+        seed: config.seed,
+        context: &shared.context,
+        dbms_belief: &shared.dbms_belief,
+        deadline: BudgetConfig::detection_deadline(shared.started, config.budget.max_duration_secs),
+        boolean_enabled: is_technique_enabled(&config.techniques, TechniqueKind::Boolean),
+        generative_mode: config.generative.mode,
+        max_generated: config.generative.max_generated,
+        oob_domain: config.oob.oob_domain.as_ref(),
+        oob_poll_url: config.oob.oob_poll_url.as_ref(),
+        oob_wait_secs: config.oob.oob_wait_secs,
+    }
+}
+
 /// Dispatch one technique, snapshot findings/requests, fold the outcome into
 /// `hyp` via `record_probe/record_trial/record_waf_penalty`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -408,34 +442,11 @@ async fn run_one_technique(
     let kind = hyp.technique;
     let before_findings = state.read().await.findings().len();
     let before_requests = state.read().await.request_count();
-    if matches!(
-        kind,
-        TechniqueKind::Boolean | TechniqueKind::Error | TechniqueKind::Time | TechniqueKind::Union
-    ) {
-        dispatch_probe_first_half(
-            client,
-            state,
-            cancel,
-            config,
-            shared,
-            raw_request,
-            param,
-            kind,
-        )
-        .await;
-    } else {
-        dispatch_probe_second_half(
-            client,
-            state,
-            cancel,
-            config,
-            shared,
-            raw_request,
-            param,
-            kind,
-        )
-        .await;
-    }
+    let Some(technique) = technique_for(kind) else {
+        return;
+    };
+    let ctx = build_technique_ctx(client, state, cancel, config, shared, raw_request, param);
+    technique.probe(&ctx).await;
     let snapshot = state.read().await;
     let new_findings: Vec<Finding> = snapshot
         .findings()
@@ -485,242 +496,6 @@ async fn run_one_technique(
             hyp.posterior.clamp(0.0, 1.0),
             cost_f,
         ));
-    }
-}
-
-/// First half of the technique dispatch (boolean/error/time/union).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn dispatch_probe_first_half(
-    client: &HttpClient,
-    state: &Arc<RwLock<SessionState>>,
-    cancel: &CancellationToken,
-    config: &EngineConfig,
-    shared: &DetectionShared,
-    raw_request: &Arc<Option<RawRequest>>,
-    param: &TargetParameter,
-    kind: TechniqueKind,
-) {
-    let opts = ProbeOpts::new(config.evasion.hpp, config.evasion.chunked);
-    let raw = raw_request.as_ref().as_ref();
-    // Shared `--max-duration` deadline for the long per-technique loops
-    // (boolean payloads, ORDER BY enumeration, union matrix): a single
-    // technique must not silently overshoot an explicit user budget.
-    // `None` = unlimited, historical behaviour byte-identical.
-    let deadline =
-        BudgetConfig::detection_deadline(shared.started, config.budget.max_duration_secs);
-    match kind {
-        TechniqueKind::Boolean => {
-            test_boolean_bounded(
-                client,
-                state,
-                cancel,
-                &shared.target,
-                &shared.target_str,
-                param,
-                &shared.baseline,
-                &shared.marker_set,
-                raw,
-                &shared.tampers,
-                opts,
-                &config.evasion.payload_opts,
-                &config.matcher,
-                config.budget.level,
-                &config.net.ignore_codes,
-                config.seed,
-                &shared.context,
-                &shared.dbms_belief,
-                deadline,
-                config.generative.mode,
-                config.generative.max_generated,
-            )
-            .await;
-        }
-        TechniqueKind::Error => {
-            let boolean_enabled = is_technique_enabled(&config.techniques, TechniqueKind::Boolean);
-            test_error_bounded(
-                client,
-                state,
-                cancel,
-                &shared.target,
-                &shared.target_str,
-                param,
-                &shared.baseline,
-                &shared.marker_set,
-                raw,
-                &shared.tampers,
-                opts,
-                &config.evasion.payload_opts,
-                &config.matcher,
-                config.budget.level,
-                &config.net.ignore_codes,
-                boolean_enabled,
-                config.seed,
-                &shared.context,
-                &shared.dbms_belief,
-            )
-            .await;
-        }
-        TechniqueKind::Time => {
-            test_time_bounded(
-                client,
-                state,
-                cancel,
-                &shared.target,
-                &shared.target_str,
-                param,
-                &shared.baseline,
-                &shared.marker_set,
-                raw,
-                &shared.tampers,
-                opts,
-                &config.evasion.payload_opts,
-                &config.matcher,
-                config.budget.level,
-                &config.net.ignore_codes,
-                config.seed,
-                &shared.context,
-                &shared.dbms_belief,
-            )
-            .await;
-        }
-        TechniqueKind::Union => {
-            test_union_bounded(
-                client,
-                state,
-                cancel,
-                &shared.target,
-                &shared.target_str,
-                param,
-                &shared.baseline,
-                &shared.marker_set,
-                raw,
-                &shared.tampers,
-                opts,
-                &config.evasion.payload_opts,
-                &config.matcher,
-                config.budget.level,
-                &config.net.ignore_codes,
-                config.seed,
-                &shared.context,
-                &shared.dbms_belief,
-                deadline,
-            )
-            .await;
-        }
-        _ => {}
-    }
-}
-
-/// Second half of the technique dispatch (stacked/json/nosql/oob).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn dispatch_probe_second_half(
-    client: &HttpClient,
-    state: &Arc<RwLock<SessionState>>,
-    cancel: &CancellationToken,
-    config: &EngineConfig,
-    shared: &DetectionShared,
-    raw_request: &Arc<Option<RawRequest>>,
-    param: &TargetParameter,
-    kind: TechniqueKind,
-) {
-    let opts = ProbeOpts::new(config.evasion.hpp, config.evasion.chunked);
-    let raw = raw_request.as_ref().as_ref();
-    match kind {
-        TechniqueKind::Stacked => {
-            test_stacked_bounded(
-                client,
-                state,
-                cancel,
-                &shared.target,
-                &shared.target_str,
-                param,
-                &shared.baseline,
-                &shared.marker_set,
-                raw,
-                &shared.tampers,
-                opts,
-                &config.evasion.payload_opts,
-                &config.matcher,
-                config.budget.level,
-                &config.net.ignore_codes,
-                config.seed,
-                &shared.context,
-                &shared.dbms_belief,
-            )
-            .await;
-        }
-        TechniqueKind::Json => {
-            test_json_bounded(
-                client,
-                state,
-                cancel,
-                &shared.target,
-                &shared.target_str,
-                param,
-                &shared.baseline,
-                &shared.marker_set,
-                raw,
-                &shared.tampers,
-                opts,
-                &config.evasion.payload_opts,
-                &config.matcher,
-                config.budget.level,
-                &config.net.ignore_codes,
-                config.seed,
-                &shared.context,
-                &shared.dbms_belief,
-            )
-            .await;
-        }
-        TechniqueKind::Nosql => {
-            test_nosql_bounded(
-                client,
-                state,
-                cancel,
-                &shared.target,
-                &shared.target_str,
-                param,
-                &shared.baseline,
-                &shared.marker_set,
-                raw,
-                &shared.tampers,
-                opts,
-                &config.evasion.payload_opts,
-                &config.matcher,
-                config.budget.level,
-                &config.net.ignore_codes,
-                config.seed,
-                &shared.context,
-            )
-            .await;
-        }
-        TechniqueKind::Oob => {
-            test_oob_bounded(
-                client,
-                state,
-                cancel,
-                &shared.target,
-                &shared.target_str,
-                param,
-                &shared.baseline,
-                &shared.marker_set,
-                raw,
-                &shared.tampers,
-                opts,
-                &config.evasion.payload_opts,
-                &config.matcher,
-                config.budget.level,
-                &config.net.ignore_codes,
-                config.oob.oob_domain.clone(),
-                config.oob.oob_poll_url.clone(),
-                config.oob.oob_wait_secs,
-                config.seed,
-                &shared.context,
-                &shared.dbms_belief,
-            )
-            .await;
-        }
-        _ => {}
     }
 }
 
