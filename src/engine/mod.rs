@@ -3,10 +3,12 @@ pub mod ai_suggest;
 pub mod config;
 pub mod confirm;
 pub mod enumerate;
+pub mod extraction;
 pub mod fetch;
 pub mod orchestrator;
 pub mod probes;
 pub mod schedule;
+pub mod second_order;
 pub mod sql;
 pub use config::{
     BudgetConfig, EngineConfig, EnumConfig, EvasionConfig, MAX_DETECTION_DURATION_SECS_CAP,
