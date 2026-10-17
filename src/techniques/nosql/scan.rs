@@ -129,15 +129,7 @@ impl Technique for NosqlTechnique {
                     } else {
                         tamper_sets.get(round).map_or(&[], Vec::as_slice)
                     };
-                    let tamper_label = if trans.is_empty() {
-                        "none".to_owned()
-                    } else {
-                        trans
-                            .iter()
-                            .map(crate::techniques::tamper::Tamper::name)
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    };
+                    let tamper_label = crate::techniques::tamper::tamper_label(trans);
                     // Channel 1 — boolean differential with confirmation (3 trials)
                     let mut trials: Vec<crate::detection::confirmation::Trial> =
                         Vec::with_capacity(3);

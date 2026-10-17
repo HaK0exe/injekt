@@ -1,7 +1,7 @@
 //! OOB detection probe (`test_oob_bounded`).
 //! Moved verbatim from `engine/probes.rs` (P1); no behaviour change.
 
-use crate::engine::{fetch::fetch_for_payload_with_class, schedule::dbms_payload_label};
+use crate::engine::schedule::dbms_payload_label;
 use crate::{
     http::timeouts::RequestClass,
     session::state::TechniqueKind,
@@ -45,15 +45,11 @@ impl Technique for OobTechnique {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn probe<'a>(&'a self, ctx: &'a TechniqueCtx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let client = ctx.client;
             let state = ctx.state;
             let cancel = ctx.cancel;
             let target = ctx.target;
-            let target_str = ctx.target_str;
             let param = ctx.param;
             let baseline = ctx.baseline;
-            let marker_set = ctx.marker_set;
-            let raw = ctx.raw;
             let tampers = ctx.tampers;
             let opts = ctx.opts;
             let popts = ctx.popts;
@@ -137,21 +133,8 @@ impl Technique for OobTechnique {
                             popts,
                             &mut rng,
                         );
-                        let (raw_body, ms, status) = fetch_for_payload_with_class(
-                            client,
-                            state,
-                            cancel,
-                            target,
-                            target_str,
-                            param,
-                            &tampered,
-                            marker_set,
-                            raw,
-                            opts,
-                            popts,
-                            RequestClass::Oob,
-                        )
-                        .await;
+                        let (raw_body, ms, status) =
+                            ctx.fetch_with_class(&tampered, RequestClass::Oob).await;
                         probes_sent += 1;
                         // `--ignore-code`: an ignored probe response is discarded
                         // (kept baseline-neutral). No finding follows in manual mode.
@@ -214,21 +197,8 @@ impl Technique for OobTechnique {
                         popts,
                         &mut rng,
                     );
-                    let (raw_body, ms, status) = fetch_for_payload_with_class(
-                        client,
-                        state,
-                        cancel,
-                        target,
-                        target_str,
-                        param,
-                        &tampered,
-                        marker_set,
-                        raw,
-                        opts,
-                        popts,
-                        RequestClass::Oob,
-                    )
-                    .await;
+                    let (raw_body, ms, status) =
+                        ctx.fetch_with_class(&tampered, RequestClass::Oob).await;
                     probes_sent += 1;
                     // `--ignore-code`: an ignored probe response is discarded
                     // (kept baseline-neutral); a token-verified callback below still

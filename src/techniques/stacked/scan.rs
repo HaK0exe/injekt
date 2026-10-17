@@ -1,7 +1,7 @@
 //! Stacked detection probe (`test_stacked_bounded`).
 //! Moved verbatim from `engine/probes.rs` (P1); no behaviour change.
 
-use crate::engine::{fetch::fetch_for_payload, schedule::dbms_payload_label};
+use crate::engine::schedule::dbms_payload_label;
 use crate::{
     session::state::{Finding, TechniqueKind},
     target::injection::{is_ignored, payload_budget},
@@ -26,15 +26,11 @@ impl Technique for StackedTechnique {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn probe<'a>(&'a self, ctx: &'a TechniqueCtx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let client = ctx.client;
             let state = ctx.state;
             let cancel = ctx.cancel;
             let target = ctx.target;
-            let target_str = ctx.target_str;
             let param = ctx.param;
             let baseline = ctx.baseline;
-            let marker_set = ctx.marker_set;
-            let raw = ctx.raw;
             let tampers = ctx.tampers;
             let opts = ctx.opts;
             let popts = ctx.popts;
@@ -67,11 +63,7 @@ impl Technique for StackedTechnique {
                         break;
                     }
                     let tampered = build_final_payload_with_rng(&p.payload, trans, popts, &mut rng);
-                    let (raw_body, ms, status) = fetch_for_payload(
-                        client, state, cancel, target, target_str, param, &tampered, marker_set,
-                        raw, opts, popts,
-                    )
-                    .await;
+                    let (raw_body, ms, status) = ctx.fetch(&tampered).await;
                     let body = matcher.pre_process(&raw_body);
                     // `--ignore-code`: an ignored status is skipped, never a finding.
                     if is_ignored(status, ignore_codes) {
@@ -106,20 +98,7 @@ impl Technique for StackedTechnique {
                         if cancel.is_cancelled() {
                             break;
                         }
-                        let (raw_body2, ms2, status2) = fetch_for_payload(
-                            client,
-                            state,
-                            cancel,
-                            target,
-                            target_str,
-                            param,
-                            &confirm_tampered,
-                            marker_set,
-                            raw,
-                            opts,
-                            popts,
-                        )
-                        .await;
+                        let (raw_body2, ms2, status2) = ctx.fetch(&confirm_tampered).await;
                         // `--ignore-code`: an ignored status is skipped, never a finding.
                         if is_ignored(status2, ignore_codes) {
                             continue;
@@ -139,15 +118,7 @@ impl Technique for StackedTechnique {
                         if !r2.is_vulnerable {
                             continue;
                         }
-                        let tamper_label = if trans.is_empty() {
-                            "none".to_owned()
-                        } else {
-                            trans
-                                .iter()
-                                .map(crate::techniques::tamper::Tamper::name)
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        };
+                        let tamper_label = crate::techniques::tamper::tamper_label(trans);
                         let mut finding = Finding::new(
                             target.as_str(),
                             param.key(),

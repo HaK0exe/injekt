@@ -1,10 +1,7 @@
 //! JSON-function detection probe (`test_json_bounded`).
 //! Moved verbatim from `engine/probes.rs` (P1); no behaviour change.
 
-use crate::engine::{
-    fetch::{fetch_for_payload, fetch_for_payload_with_class},
-    schedule::{dbms_payload_label, json_scan_payloads},
-};
+use crate::engine::schedule::{dbms_payload_label, json_scan_payloads};
 use crate::{
     http::timeouts::RequestClass,
     session::state::{Finding, TechniqueKind},
@@ -36,15 +33,11 @@ impl Technique for JsonTechnique {
     )]
     fn probe<'a>(&'a self, ctx: &'a TechniqueCtx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let client = ctx.client;
             let state = ctx.state;
             let cancel = ctx.cancel;
             let target = ctx.target;
-            let target_str = ctx.target_str;
             let param = ctx.param;
             let baseline = ctx.baseline;
-            let marker_set = ctx.marker_set;
-            let raw = ctx.raw;
             let tampers = ctx.tampers;
             let opts = ctx.opts;
             let popts = ctx.popts;
@@ -93,15 +86,7 @@ impl Technique for JsonTechnique {
                         build_final_payload_with_rng(&p.false_payload, trans, popts, &mut rng);
                     let error_probe =
                         build_final_payload_with_rng(&p.error_payload, trans, popts, &mut rng);
-                    let tamper_label = if trans.is_empty() {
-                        "none".to_owned()
-                    } else {
-                        trans
-                            .iter()
-                            .map(crate::techniques::tamper::Tamper::name)
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    };
+                    let tamper_label = crate::techniques::tamper::tamper_label(trans);
                     // Channel 1 — boolean differential with confirmation (3 trials)
                     let mut trials: Vec<crate::detection::confirmation::Trial> =
                         Vec::with_capacity(3);
@@ -114,37 +99,13 @@ impl Technique for JsonTechnique {
                         if cancel.is_cancelled() {
                             break;
                         }
-                        let (true_raw, true_ms, true_status) = fetch_for_payload_with_class(
-                            client,
-                            state,
-                            cancel,
-                            target,
-                            target_str,
-                            param,
-                            &true_payload,
-                            marker_set,
-                            raw,
-                            opts,
-                            popts,
-                            RequestClass::Boolean,
-                        )
-                        .await;
+                        let (true_raw, true_ms, true_status) = ctx
+                            .fetch_with_class(&true_payload, RequestClass::Boolean)
+                            .await;
                         let true_body = matcher.pre_process(&true_raw);
-                        let (false_raw, false_ms, false_status) = fetch_for_payload_with_class(
-                            client,
-                            state,
-                            cancel,
-                            target,
-                            target_str,
-                            param,
-                            &false_payload,
-                            marker_set,
-                            raw,
-                            opts,
-                            popts,
-                            RequestClass::Boolean,
-                        )
-                        .await;
+                        let (false_raw, false_ms, false_status) = ctx
+                            .fetch_with_class(&false_payload, RequestClass::Boolean)
+                            .await;
                         let false_body = matcher.pre_process(&false_raw);
                         // Transport failure (`status == 0`) is never scored — neutral
                         // trial, consistent with `test_boolean_bounded`.
@@ -244,20 +205,7 @@ impl Technique for JsonTechnique {
                         break;
                     }
                     // Channel 2 — single-shot JSON error probe
-                    let (raw_body, _ms, status) = fetch_for_payload(
-                        client,
-                        state,
-                        cancel,
-                        target,
-                        target_str,
-                        param,
-                        &error_probe,
-                        marker_set,
-                        raw,
-                        opts,
-                        popts,
-                    )
-                    .await;
+                    let (raw_body, _ms, status) = ctx.fetch(&error_probe).await;
                     let body = matcher.pre_process(&raw_body);
                     // `--ignore-code`: an ignored status is skipped, never a finding.
                     if is_ignored(status, ignore_codes) {

@@ -6,8 +6,9 @@
 use crate::{
     dbms::context::{DbmsBelief, InjectionContext},
     detection::{baseline::Baseline, matcher::MatcherConfig},
+    engine::fetch::{fetch_for_payload, fetch_for_payload_with_class},
     generation::GenerativeMode,
-    http::client::HttpClient,
+    http::{client::HttpClient, timeouts::RequestClass},
     session::state::{SessionState, TechniqueKind},
     target::{
         injection::ProbeOpts, markers::MarkerSet, parameters::TargetParameter,
@@ -54,6 +55,51 @@ pub(crate) struct TechniqueCtx<'a> {
     pub(crate) oob_domain: Option<&'a String>,
     pub(crate) oob_poll_url: Option<&'a String>,
     pub(crate) oob_wait_secs: u64,
+}
+
+impl TechniqueCtx<'_> {
+    /// Send `payload` through the shared injection path (same arguments as
+    /// [`fetch_for_payload`]) and return `(body, ms, status)`.
+    pub(crate) async fn fetch(&self, payload: &str) -> (String, f64, u16) {
+        fetch_for_payload(
+            self.client,
+            self.state,
+            self.cancel,
+            self.target,
+            self.target_str,
+            self.param,
+            payload,
+            self.marker_set,
+            self.raw,
+            self.opts,
+            self.popts,
+        )
+        .await
+    }
+
+    /// Same as [`Self::fetch`] with an explicit [`RequestClass`] (boolean,
+    /// time, OOB probes have their own timeout pools).
+    pub(crate) async fn fetch_with_class(
+        &self,
+        payload: &str,
+        class: RequestClass,
+    ) -> (String, f64, u16) {
+        fetch_for_payload_with_class(
+            self.client,
+            self.state,
+            self.cancel,
+            self.target,
+            self.target_str,
+            self.param,
+            payload,
+            self.marker_set,
+            self.raw,
+            self.opts,
+            self.popts,
+            class,
+        )
+        .await
+    }
 }
 
 /// One detection technique. `probe` sends the bounded payload sweep for a

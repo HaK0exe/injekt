@@ -242,11 +242,7 @@ impl Technique for UnionTechnique {
                         }
                         let tampered =
                             build_final_payload_with_rng(&p.payload, trans, popts, &mut rng);
-                        let (raw_body, ms, status) = fetch_for_payload(
-                            client, state, cancel, target, target_str, param, &tampered,
-                            marker_set, raw, opts, popts,
-                        )
-                        .await;
+                        let (raw_body, ms, status) = ctx.fetch(&tampered).await;
                         // `--ignore-code`: an ignored status is skipped, never a finding.
                         if is_ignored(status, ignore_codes) {
                             continue;
@@ -266,15 +262,7 @@ impl Technique for UnionTechnique {
                             if matcher.matches(&body, status) == Some(false) {
                                 continue;
                             }
-                            let tamper_label = if trans.is_empty() {
-                                "none".to_owned()
-                            } else {
-                                trans
-                                    .iter()
-                                    .map(crate::techniques::tamper::Tamper::name)
-                                    .collect::<Vec<_>>()
-                                    .join(",")
-                            };
+                            let tamper_label = crate::techniques::tamper::tamper_label(trans);
                             let mut finding = Finding::new(
                                 target.as_str(),
                                 param.key(),
@@ -322,11 +310,7 @@ impl Technique for UnionTechnique {
                         }
                         let tampered =
                             build_final_payload_with_rng(&p.payload, trans, popts, &mut rng);
-                        let (raw_body, ms, status) = fetch_for_payload(
-                            client, state, cancel, target, target_str, param, &tampered,
-                            marker_set, raw, opts, popts,
-                        )
-                        .await;
+                        let (raw_body, ms, status) = ctx.fetch(&tampered).await;
                         // `--ignore-code`: an ignored status is skipped, never a finding.
                         if is_ignored(status, ignore_codes) {
                             continue;
@@ -346,15 +330,7 @@ impl Technique for UnionTechnique {
                             if matcher.matches(&body, status) == Some(false) {
                                 continue;
                             }
-                            let tamper_label = if trans.is_empty() {
-                                "none".to_owned()
-                            } else {
-                                trans
-                                    .iter()
-                                    .map(crate::techniques::tamper::Tamper::name)
-                                    .collect::<Vec<_>>()
-                                    .join(",")
-                            };
+                            let tamper_label = crate::techniques::tamper::tamper_label(trans);
                             let mut finding = Finding::new(
                                 target.as_str(),
                                 param.key(),

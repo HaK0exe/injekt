@@ -1,10 +1,7 @@
 //! Boolean detection probe (`test_boolean_bounded`).
 //! Moved verbatim from `engine/probes.rs` (P1); no behaviour change.
 
-use crate::engine::{
-    fetch::fetch_for_payload_with_class,
-    schedule::{check_deadline, dbms_payload_label, order_boolean_by_context},
-};
+use crate::engine::schedule::{check_deadline, dbms_payload_label, order_boolean_by_context};
 use crate::{
     http::timeouts::RequestClass,
     session::state::{Finding, TechniqueKind},
@@ -34,15 +31,11 @@ impl Technique for BooleanTechnique {
     )]
     fn probe<'a>(&'a self, ctx: &'a TechniqueCtx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let client = ctx.client;
             let state = ctx.state;
             let cancel = ctx.cancel;
             let target = ctx.target;
-            let target_str = ctx.target_str;
             let param = ctx.param;
             let baseline = ctx.baseline;
-            let marker_set = ctx.marker_set;
-            let raw = ctx.raw;
             let tampers = ctx.tampers;
             let opts = ctx.opts;
             let popts = ctx.popts;
@@ -149,15 +142,7 @@ impl Technique for BooleanTechnique {
                     // Skip duplicate variants already tried for this base payload
                     // (dedupe via string equality already handled by transformation sets, but
                     // randomcase produces different strings per call — we still try each set once)
-                    let tamper_label = if trans.is_empty() {
-                        "none".to_owned()
-                    } else {
-                        trans
-                            .iter()
-                            .map(crate::techniques::tamper::Tamper::name)
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    };
+                    let tamper_label = crate::techniques::tamper::tamper_label(trans);
                     // 3 trials confirmation
                     let mut trials: Vec<crate::detection::confirmation::Trial> =
                         Vec::with_capacity(3);
@@ -171,38 +156,14 @@ impl Technique for BooleanTechnique {
                         if cancel.is_cancelled() {
                             break;
                         }
-                        let (true_raw, true_ms, true_status) = fetch_for_payload_with_class(
-                            client,
-                            state,
-                            cancel,
-                            target,
-                            target_str,
-                            param,
-                            &true_payload,
-                            marker_set,
-                            raw,
-                            opts,
-                            popts,
-                            RequestClass::Boolean,
-                        )
-                        .await;
+                        let (true_raw, true_ms, true_status) = ctx
+                            .fetch_with_class(&true_payload, RequestClass::Boolean)
+                            .await;
                         let true_body =
                             matcher.pre_process(&baseline.strip_dynamic_content(&true_raw));
-                        let (false_raw, false_ms, false_status) = fetch_for_payload_with_class(
-                            client,
-                            state,
-                            cancel,
-                            target,
-                            target_str,
-                            param,
-                            &false_payload,
-                            marker_set,
-                            raw,
-                            opts,
-                            popts,
-                            RequestClass::Boolean,
-                        )
-                        .await;
+                        let (false_raw, false_ms, false_status) = ctx
+                            .fetch_with_class(&false_payload, RequestClass::Boolean)
+                            .await;
                         let false_body =
                             matcher.pre_process(&baseline.strip_dynamic_content(&false_raw));
                         // Transport/body failure (`status == 0`, body `""`) must never
@@ -316,37 +277,11 @@ impl Technique for BooleanTechnique {
                             ) {
                                 None => "skip",
                                 Some(ctrl) => {
-                                    let (ctl_true_raw, ctl_true_ms, ctl_true_status) =
-                                        fetch_for_payload_with_class(
-                                            client,
-                                            state,
-                                            cancel,
-                                            target,
-                                            target_str,
-                                            param,
-                                            &ctrl.must_true,
-                                            marker_set,
-                                            raw,
-                                            opts,
-                                            popts,
-                                            RequestClass::Boolean,
-                                        )
+                                    let (ctl_true_raw, ctl_true_ms, ctl_true_status) = ctx
+                                        .fetch_with_class(&ctrl.must_true, RequestClass::Boolean)
                                         .await;
-                                    let (ctl_false_raw, ctl_false_ms, ctl_false_status) =
-                                        fetch_for_payload_with_class(
-                                            client,
-                                            state,
-                                            cancel,
-                                            target,
-                                            target_str,
-                                            param,
-                                            &ctrl.must_false,
-                                            marker_set,
-                                            raw,
-                                            opts,
-                                            popts,
-                                            RequestClass::Boolean,
-                                        )
+                                    let (ctl_false_raw, ctl_false_ms, ctl_false_status) = ctx
+                                        .fetch_with_class(&ctrl.must_false, RequestClass::Boolean)
                                         .await;
                                     if cancel.is_cancelled() {
                                         break;

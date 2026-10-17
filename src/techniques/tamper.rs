@@ -931,6 +931,16 @@ fn apply_linecomment(payload: &str, rng: &mut impl rand::Rng) -> String {
     format!("{body}{variant}")
 }
 
+/// Comma-joined tamper names for finding evidence (`none` when the set is
+/// empty) — shared by every technique's `scan.rs`.
+pub(crate) fn tamper_label(trans: &[Tamper]) -> String {
+    if trans.is_empty() {
+        "none".to_owned()
+    } else {
+        trans.iter().map(Tamper::name).collect::<Vec<_>>().join(",")
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

@@ -1,7 +1,7 @@
 //! Time detection probe (`test_time_bounded`).
 //! Moved verbatim from `engine/probes.rs` (P1); no behaviour change.
 
-use crate::engine::{fetch::fetch_for_payload_with_class, schedule::dbms_payload_label};
+use crate::engine::schedule::dbms_payload_label;
 use crate::{
     http::timeouts::RequestClass,
     session::state::{Finding, TechniqueKind},
@@ -27,15 +27,11 @@ impl Technique for TimeTechnique {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn probe<'a>(&'a self, ctx: &'a TechniqueCtx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let client = ctx.client;
             let state = ctx.state;
             let cancel = ctx.cancel;
             let target = ctx.target;
-            let target_str = ctx.target_str;
             let param = ctx.param;
             let baseline = ctx.baseline;
-            let marker_set = ctx.marker_set;
-            let raw = ctx.raw;
             let tampers = ctx.tampers;
             let opts = ctx.opts;
             let popts = ctx.popts;
@@ -93,21 +89,8 @@ impl Technique for TimeTechnique {
                     }
                     let payload_str =
                         build_final_payload_with_rng(&base.payload, trans, popts, &mut rng);
-                    let (raw_body, ms, status) = fetch_for_payload_with_class(
-                        client,
-                        state,
-                        cancel,
-                        target,
-                        target_str,
-                        param,
-                        &payload_str,
-                        marker_set,
-                        raw,
-                        opts,
-                        popts,
-                        RequestClass::Time,
-                    )
-                    .await;
+                    let (raw_body, ms, status) =
+                        ctx.fetch_with_class(&payload_str, RequestClass::Time).await;
                     // `--ignore-code`: an ignored status is skipped, never a finding.
                     if is_ignored(status, ignore_codes) {
                         continue;
@@ -135,21 +118,8 @@ impl Technique for TimeTechnique {
                     // varies its bytes. Seeded RNG keeps `--seed` reproducible.
                     let payload2 =
                         crate::techniques::time::detector::cache_variant(&payload_str, &mut rng);
-                    let (raw_body2, ms2, status2) = fetch_for_payload_with_class(
-                        client,
-                        state,
-                        cancel,
-                        target,
-                        target_str,
-                        param,
-                        &payload2,
-                        marker_set,
-                        raw,
-                        opts,
-                        popts,
-                        RequestClass::Time,
-                    )
-                    .await;
+                    let (raw_body2, ms2, status2) =
+                        ctx.fetch_with_class(&payload2, RequestClass::Time).await;
                     if is_ignored(status2, ignore_codes) {
                         continue;
                     }
@@ -170,21 +140,8 @@ impl Technique for TimeTechnique {
                             break;
                         }
                         let control_payload = param.original_value.clone();
-                        let (_control_body, control_ms, control_status) =
-                            fetch_for_payload_with_class(
-                                client,
-                                state,
-                                cancel,
-                                target,
-                                target_str,
-                                param,
-                                &control_payload,
-                                marker_set,
-                                raw,
-                                opts,
-                                popts,
-                                RequestClass::Time,
-                            )
+                        let (_control_body, control_ms, control_status) = ctx
+                            .fetch_with_class(&control_payload, RequestClass::Time)
                             .await;
                         if control_status == 0 {
                             // Transport error on the control: timing untrustworthy.
@@ -199,15 +156,7 @@ impl Technique for TimeTechnique {
                             );
                             continue;
                         }
-                        let tamper_label = if trans.is_empty() {
-                            "none".to_owned()
-                        } else {
-                            trans
-                                .iter()
-                                .map(crate::techniques::tamper::Tamper::name)
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        };
+                        let tamper_label = crate::techniques::tamper::tamper_label(trans);
                         let mut finding = Finding::new(
                             target.as_str(),
                             param.key(),

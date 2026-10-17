@@ -3,7 +3,6 @@
 
 use crate::engine::{
     confirm::{ErrorBoolConfirm, confirm_error_with_boolean},
-    fetch::fetch_for_payload,
     schedule::dbms_payload_label,
 };
 use crate::{
@@ -83,11 +82,7 @@ impl Technique for ErrorTechnique {
                         break;
                     }
                     let tampered = build_final_payload_with_rng(&p.payload, trans, popts, &mut rng);
-                    let (raw_body, _ms, status) = fetch_for_payload(
-                        client, state, cancel, target, target_str, param, &tampered, marker_set,
-                        raw, opts, popts,
-                    )
-                    .await;
+                    let (raw_body, _ms, status) = ctx.fetch(&tampered).await;
                     // Transport/body errors surface as status 0 + `""`: never scored
                     // (empty body would otherwise be a dissimilar-body FP elsewhere,
                     // and an error pattern can never match it anyway — skip fast).
@@ -136,20 +131,8 @@ impl Technique for ErrorTechnique {
                             let mut control_rng = crate::seeded_rng::make_rng(seed);
                             let token = rand::Rng::random::<u32>(&mut control_rng);
                             let control_payload = format!("z{token:08x}");
-                            let (control_raw, _control_ms, control_status) = fetch_for_payload(
-                                client,
-                                state,
-                                cancel,
-                                target,
-                                target_str,
-                                param,
-                                &control_payload,
-                                marker_set,
-                                raw,
-                                opts,
-                                popts,
-                            )
-                            .await;
+                            let (control_raw, _control_ms, control_status) =
+                                ctx.fetch(&control_payload).await;
                             if control_status != 0 && !is_ignored(control_status, ignore_codes) {
                                 let control_body = matcher.pre_process(&control_raw);
                                 if crate::techniques::error::detector::classify_cast_error(
@@ -163,15 +146,7 @@ impl Technique for ErrorTechnique {
                                 }
                             }
                         }
-                        let tamper_label = if trans.is_empty() {
-                            "none".to_owned()
-                        } else {
-                            trans
-                                .iter()
-                                .map(crate::techniques::tamper::Tamper::name)
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        };
+                        let tamper_label = crate::techniques::tamper::tamper_label(trans);
                         let reflected = is_payload_reflected(&body, &tampered);
                         let extracted_flag = if r.extracted.is_some() { "yes" } else { "no" };
                         // Confirmation policy: a hit WITH an extracted fragment (0.9)
