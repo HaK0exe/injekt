@@ -4,33 +4,30 @@
 //! Extracted verbatim from `orchestrator.rs`; no behaviour change.
 
 use super::config::{BudgetConfig, EngineConfig};
+use super::fetch::fetch_for_payload_with_class;
+use super::schedule::{check_deadline, dbms_payload_label, is_technique_enabled};
 use crate::{
-    ai::{AiProviderKind, AiSuggestConfig},
-    dbms::context::InjectionContext,
-    detection::{baseline, matcher::MatcherConfig},
+    dbms::context::{DbmsBelief, InjectionContext},
+    detection::baseline,
     http::{client::HttpClient, timeouts::RequestClass},
-    reasoning::Hypothesis,
-    session::{
-        scrubber::Scrubber,
-        state::{Finding, SessionState, TechniqueKind},
-    },
+    session::state::{Finding, SessionState, TechniqueKind},
     target::{
-        injection::ProbeOpts,
+        injection::{ProbeOpts, baseline_all_error, is_app_filter_block, is_ignored},
         markers::MarkerSet,
         parameters::TargetParameter,
         raw_request::RawRequest,
         url::TargetUrl,
     },
     techniques::{
-        boolean::{detector::BooleanDetector, payloads::boolean_payloads_for},
-        payload_opts::PayloadOpts,
+        boolean::detector::BooleanDetector,
+        payload_opts::{PayloadOpts, build_final_payload_with_rng},
         tamper::Tamper,
     },
 };
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// `--ai-suggest` second-pass (opt-in post-échec / WAF-block uniquement).
 ///

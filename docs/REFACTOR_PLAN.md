@@ -2,7 +2,8 @@
 
 > Date: 2026-10-15 — État des lieux: ~48k LOC `src/`, god file `src/engine/orchestrator.rs` 9504L (20% du projet).
 > Progrès 2026-10-15: P0 ✅, P1 ✅ (config 292L + injection 724L + fetch 164L + confirm 1395L + schedule 336L + probes 2192L hors orchestrator: 9504→4570L, -4934L), P2-scaffold ✅. Tout vert: fmt/clippy/test lib 718 + 38 tests techniques + doc.
-> Reste: `extract_enum_field` 820L + `run_second_order/enumeration/extraction/ai_suggest` methods → `engine/phases/*`; split `probes.rs` par technique; splits `http/waf/tamper`.
+> Progrès 2026-10-17 (suite P1-fin): `ai_suggest` 391L + `enumerate` (extract_enum_field + run_enumeration) branchés/branchée; helpers `dbms_hint_kind`→`config.rs`, `first_finding_param`→`confirm.rs` (dédupliqué via `param_from_finding`). orchestrator 4735→3807L (-928L), re-exports `pub(crate) use` conservés. fmt/clippy/lib 814 verts.
+> Reste: `run_second_order/extraction/fingerprint/collect_baseline/run_internal/run_detection*` methods → `engine/*.rs`; split `probes.rs` par technique; splits `http/waf/tamper`.
 > Objectif restant: aucun fichier >500L, aucune fn >80L hors glue, suppression du god object, frontières `cli -> app -> domain <- infra`.
 > Contraintes inviolables: voir `AGENTS.md` + skill `injekt-rust-dev` (deny `unsafe/unwrap/expect/dbg/todo`, MSRV 1.88 ed.2024, OPSEC zero-persistence, `secrecy::SecretString`, `HttpClient::builder().timeout().build()` obligatoire, `socks5h://` uniquement, bounded `buffer_unordered` + `CancellationToken`).
 

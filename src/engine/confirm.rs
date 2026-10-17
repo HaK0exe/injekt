@@ -248,6 +248,37 @@ pub(crate) fn param_from_finding(finding: &Finding) -> TargetParameter {
     TargetParameter::new(name, location, "1")
 }
 
+/// Recovers the injection point of the first *confirmed* finding (param
+/// name + location parsed back out of `finding.parameter`), falling back
+/// to the first finding then to a synthetic `id` query param when there
+/// is no finding yet. Shared by fingerprint/extraction/enumeration, which
+/// all reuse the same confirmed injection point.
+pub(crate) async fn first_finding_param(
+    state: &Arc<RwLock<SessionState>>,
+    target: &TargetUrl,
+) -> (TargetParameter, TargetUrl) {
+    let st = state.read().await;
+    let findings = st.findings().to_vec();
+    drop(st);
+    // Prefer a confirmed finding so an `0.55 unconfirmed` error never
+    // dictates the oracle injection point when a confirmed finding exists.
+    let f = findings
+        .iter()
+        .find(|x| is_confirmed_finding(x))
+        .or_else(|| findings.first());
+    if let Some(finding) = f {
+        // `param_from_finding` splits `name@location` at the LAST '@'
+        // (parameter names may contain '@' while locations never do).
+        (param_from_finding(finding), target.clone())
+    } else {
+        // fallback synthetic
+        (
+            TargetParameter::new("id", ParameterLocation::Query, "1"),
+            target.clone(),
+        )
+    }
+}
+
 /// Push one C6 confirm trace record (hashes only, never clear secrets).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn push_confirm_trace(

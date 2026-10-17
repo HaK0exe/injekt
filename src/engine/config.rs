@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 use crate::{reasoning::knowledge::KnowledgeStore, target::raw_request::RawRequest};
+use tracing::warn;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -287,6 +288,25 @@ impl Default for EngineConfig {
             knowledge: None,
             ai: crate::ai::AiSuggestConfig::default(),
             generative: crate::generation::GenerativeConfig::default(),
+        }
+    }
+}
+
+/// Normalized `--dbms` hint as [`crate::dbms::DbmsKind`], if set and
+/// recognized. Moved from `orchestrator.rs` (P1); the engine calls it with
+/// its [`EngineConfig`].
+pub(crate) fn dbms_hint_kind(config: &EngineConfig) -> Option<crate::dbms::DbmsKind> {
+    let hint = config.dbms_hint.as_deref()?;
+    let v = hint.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "mysql" | "mariadb" | "my" => Some(crate::dbms::DbmsKind::MySql),
+        "postgres" | "postgresql" | "pg" | "pgsql" => Some(crate::dbms::DbmsKind::Postgres),
+        "mssql" | "sqlserver" | "sql-server" | "tsql" => Some(crate::dbms::DbmsKind::MsSql),
+        "oracle" | "ora" => Some(crate::dbms::DbmsKind::Oracle),
+        "sqlite" => Some(crate::dbms::DbmsKind::Sqlite),
+        _ => {
+            warn!(dbms=%hint, "unknown --dbms hint, ignoring (auto-fingerprint)");
+            None
         }
     }
 }

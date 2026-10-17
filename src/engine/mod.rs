@@ -1,6 +1,8 @@
 #![deny(unsafe_code)]
+pub mod ai_suggest;
 pub mod config;
 pub mod confirm;
+pub mod enumerate;
 pub mod fetch;
 pub mod orchestrator;
 pub mod probes;
