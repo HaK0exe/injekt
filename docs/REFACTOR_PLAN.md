@@ -3,7 +3,8 @@
 > Date: 2026-10-15 — État des lieux: ~48k LOC `src/`, god file `src/engine/orchestrator.rs` 9504L (20% du projet).
 > Progrès 2026-10-15: P0 ✅, P1 ✅ (config 292L + injection 724L + fetch 164L + confirm 1395L + schedule 336L + probes 2192L hors orchestrator: 9504→4570L, -4934L), P2-scaffold ✅. Tout vert: fmt/clippy/test lib 718 + 38 tests techniques + doc.
 > Progrès 2026-10-17 (suite P1-fin): `ai_suggest` 391L + `enumerate` (extract_enum_field + run_enumeration) branchés/branchée; helpers `dbms_hint_kind`→`config.rs`, `first_finding_param`→`confirm.rs` (dédupliqué via `param_from_finding`). orchestrator 4735→3807L (-928L), re-exports `pub(crate) use` conservés. fmt/clippy/lib 814 verts.
-> Reste: `run_second_order/extraction/fingerprint/collect_baseline/run_internal/run_detection*` methods → `engine/*.rs`; split `probes.rs` par technique; splits `http/waf/tamper`.
+> Progrès 2026-10-17 (P1-fin terminé, orchestrator vidé): phases extraites en modules dédiés — `extraction.rs` (385L), `second_order.rs` (372L), `run_confirm_second_pass`→`confirm.rs`, `baseline.rs` (424L: collect_baseline* + BaselineOutcome + spinner), `fingerprint.rs` (286L: run_fingerprint + active_fingerprint_probe), `detection.rs` (794L: run_detection + DetectionShared + run_detection_for_param + run_one_technique + dispatch_probe_{first,second}_half + apply_outcome_to_hypothesis + infer_signal_and_trials + progress_bar), `pipeline.rs` (717L: run_internal + absorb_detectability + build_raw_request + effective_marker_set + select_params). Tous les re-exports `pub(crate) use` orphelins supprimés; les tests importent directement `crate::engine::<module>::…`. orchestrator 3807→836L (9504L au départ, -91%). Suite complète verte (lib 814 + toutes intégrations + doc).
+> Reste: split `probes.rs` (2373L, 8 `test_*_bounded` 150-374L → `techniques/<t>/scan.rs` move seul puis dédup trait en P2), split `confirm.rs` (2019L → `confirm/*.rs` par technique), splits `http/waf/tamper`, mémoïsation `cli/resolve.rs`.
 > Objectif restant: aucun fichier >500L, aucune fn >80L hors glue, suppression du god object, frontières `cli -> app -> domain <- infra`.
 > Contraintes inviolables: voir `AGENTS.md` + skill `injekt-rust-dev` (deny `unsafe/unwrap/expect/dbg/todo`, MSRV 1.88 ed.2024, OPSEC zero-persistence, `secrecy::SecretString`, `HttpClient::builder().timeout().build()` obligatoire, `socks5h://` uniquement, bounded `buffer_unordered` + `CancellationToken`).
 
@@ -88,13 +89,15 @@ src/target/injection.rs  # ex inject_param*, headers_preserving_*, multipart
 - Done: `cargo fmt --check`, `clippy -- -D warnings`, `cargo test` verts, aucun changement comportemental.
 
 ### P1 — Découpe orchestrator (le gros morceau, moves purs sans logique)
-- [ ] `run_second_order 652L` → `engine/phases/second_order.rs`
-- [ ] `run_enumeration 810L + extract_enum_field 648L` → `engine/phases/enumeration.rs` + `enumeration/columns.rs`
-- [ ] `run_extraction 354L` → `engine/phases/extraction.rs`
-- [ ] `collect_baseline* 351L + run_internal 449L` → `engine/pipeline.rs` + `phases/baseline.rs`
+- [x] `run_second_order 652L` → `engine/second_order.rs` ✅ 2026-10-17
+- [x] `run_enumeration 810L + extract_enum_field 648L` → `engine/enumerate.rs` ✅ 2026-10-17 (fichier unique; split colonnes non fait)
+- [x] `run_extraction 354L` → `engine/extraction.rs` ✅
+- [x] `collect_baseline* 351L + run_internal 449L` → `engine/baseline.rs` + `engine/pipeline.rs` ✅
+- [x] `run_fingerprint* / run_detection*` → `engine/fingerprint.rs` + `engine/detection.rs` ✅
+- [x] orchestrator 836L, plus aucun méthode hors façade `new/with_*/run/run_candidate/state_handle` ✅
 - [ ] `confirm_* 150-220L x6` → `engine/confirm/*.rs`
 - [ ] `test_*_bounded x8` → `techniques/<t>/scan.rs` (move seul, déduplication en P2)
-- Done: `pipeline.rs <250L`, chaque phase <400L, tests wiremock verts à chaque move.
+- État: `pipeline.rs 717L` (glue run_internal+helpers), `detection.rs 794L` (sweep+dispatch) — sous-cible 250/400L, allègement prévu par P2 (trait Technique `ProbeExecutor`). Tests wiremock verts à chaque move.
 
 ### P2 — `trait Technique` + `ProbeExecutor` (supprime ~1500L duplication)
 - [ ] Introduire `pub trait Technique: Send+Sync { fn kind(); fn payloads(ctx); async fn probe(ctx,p); fn confirm(); }`
