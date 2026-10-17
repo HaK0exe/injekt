@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 pub mod ai_suggest;
+pub mod baseline;
 pub mod config;
 pub mod confirm;
 pub mod enumerate;
