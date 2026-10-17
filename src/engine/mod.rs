@@ -6,6 +6,7 @@ pub mod confirm;
 pub mod enumerate;
 pub mod extraction;
 pub mod fetch;
+pub mod fingerprint;
 pub mod orchestrator;
 pub mod probes;
 pub mod schedule;
