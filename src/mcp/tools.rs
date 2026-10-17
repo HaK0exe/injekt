@@ -128,6 +128,7 @@ impl InjektServer {
     #[allow(clippy::too_many_lines)] // test fixture: exhaustive struct literal grows with each new flag
     fn base_cli() -> Cli {
         Cli {
+            file_cache: std::sync::Arc::default(),
             command: None,
             profile: None,
             config: None,

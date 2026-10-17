@@ -163,20 +163,27 @@ impl Cli {
     }
 
     /// Load the config file snapshot for this invocation.
+    /// Memoised per [`Cli`] instance: the first call reads the TOML once, every
+    /// later call clones the cached value (`Arc<OnceLock>` also covers clones
+    /// of the parsed `Cli`).
     /// Explicit `--config` errors are logged and ignored here (the scan
     /// entry points surface them); auto-discovered files never fail.
     fn file_snapshot(&self) -> crate::cli::file_config::FileConfig {
-        match crate::cli::file_config::load(self.config.as_deref()) {
-            Ok(Some((path, cfg))) => {
-                tracing::debug!(path=%path.display(), "config file loaded");
-                cfg
-            }
-            Ok(None) => crate::cli::file_config::FileConfig::default(),
-            Err(e) => {
-                tracing::warn!(error=%e, "invalid --config file, ignoring");
-                crate::cli::file_config::FileConfig::default()
-            }
-        }
+        self.file_cache
+            .get_or_init(
+                || match crate::cli::file_config::load(self.config.as_deref()) {
+                    Ok(Some((path, cfg))) => {
+                        tracing::debug!(path=%path.display(), "config file loaded");
+                        cfg
+                    }
+                    Ok(None) => crate::cli::file_config::FileConfig::default(),
+                    Err(e) => {
+                        tracing::warn!(error=%e, "invalid --config file, ignoring");
+                        crate::cli::file_config::FileConfig::default()
+                    }
+                },
+            )
+            .clone()
     }
 
     /// Active preset: explicit `--profile` (or `INJEKT_PROFILE`) wins over the
@@ -854,6 +861,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // test fixture: exhaustive struct literal grows with each new flag
     fn blank_cli() -> Cli {
         Cli {
+            file_cache: std::sync::Arc::default(),
             command: None,
             profile: None,
             // Point at a path that never exists so auto-discovered files
@@ -1077,6 +1085,26 @@ mod tests {
         assert_eq!(cli.effective_seed(), Some(42));
         cli.detection.seed = Some(7);
         assert_eq!(cli.effective_seed(), Some(7));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn file_snapshot_memoized_within_instance() {
+        use std::io::Write as _;
+        let mut path = std::env::temp_dir();
+        path.push(format!("injekt-test-memo-{}.toml", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "threads = 2\n").unwrap();
+        drop(file);
+        let mut cli = blank_cli();
+        cli.config = Some(path.to_string_lossy().into_owned());
+        assert_eq!(cli.effective_threads(), 2);
+        // Rewrite the file: the memoised per-invocation snapshot keeps the
+        // first read (P3: at most one config-file read per process).
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "threads = 9\n").unwrap();
+        drop(file);
+        assert_eq!(cli.effective_threads(), 2);
         std::fs::remove_file(&path).unwrap();
     }
 

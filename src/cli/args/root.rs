@@ -88,6 +88,12 @@ pub struct Cli {
     /// Suppress the startup banner (written to stderr; stdout stays clean either way)
     #[arg(long, global = true)]
     pub no_banner: bool,
+
+    /// One-shot config-file cache: the first `file_snapshot()` loads the TOML,
+    /// every later call clones it, so the process reads the config at most once.
+    /// Skipped by clap (internal state, never a CLI flag).
+    #[arg(skip)]
+    pub(crate) file_cache: std::sync::Arc<std::sync::OnceLock<crate::cli::file_config::FileConfig>>,
 }
 
 // Manual `Debug` for `Cli`: secrets stay in `SecretString` / scrubbed output
