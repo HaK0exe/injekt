@@ -9,7 +9,7 @@
 
 use crate::{
     http::client::HttpClient,
-    session::{scrubber::Scrubber, state::SessionState},
+    session::state::SessionState,
     target::{
         injection::{baseline_all_error, filter_params, synthetic_raw_from_data},
         markers::MarkerSet,
@@ -20,7 +20,6 @@ use crate::{
 };
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::{
@@ -35,18 +34,31 @@ use super::{
     second_order::run_second_order,
 };
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Bundled handles for a single pipeline run — keeps `run_internal`'s
+/// argument list short (was 9 params, now 3).
+pub(crate) struct PipelineCtx<'a> {
+    pub client: &'a crate::http::client::HttpClient,
+    pub state: &'a std::sync::Arc<tokio::sync::RwLock<crate::session::state::SessionState>>,
+    pub cancel: &'a tokio_util::sync::CancellationToken,
+    pub config: &'a crate::engine::config::EngineConfig,
+    pub scrubber: &'a crate::session::scrubber::Scrubber,
+    pub baseline_cache: Option<&'a std::sync::Arc<crate::recon::BaselineCache>>,
+    pub shared_client: bool,
+}
+
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_internal(
-    client: &HttpClient,
-    state: &Arc<RwLock<SessionState>>,
-    cancel: &CancellationToken,
-    config: &EngineConfig,
-    scrubber: &Scrubber,
-    baseline_cache: Option<&Arc<crate::recon::BaselineCache>>,
-    shared_client: bool,
+    ctx: &PipelineCtx<'_>,
     target_str: &str,
     candidate: Option<&crate::recon::ParameterCandidate>,
 ) -> crate::error::Result<EngineState> {
+    let client = ctx.client;
+    let state = ctx.state;
+    let cancel = ctx.cancel;
+    let config = ctx.config;
+    let scrubber = ctx.scrubber;
+    let baseline_cache = ctx.baseline_cache;
+    let shared_client = ctx.shared_client;
     let mut current = EngineState::Parse;
     let run_started = Instant::now();
     info!(target=%scrubber.scrub(target_str), state=?current, "engine start");

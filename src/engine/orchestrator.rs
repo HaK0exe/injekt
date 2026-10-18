@@ -108,13 +108,15 @@ impl Engine {
     /// phase fails unrecoverably.
     pub async fn run(&self, target_str: &str) -> crate::error::Result<EngineState> {
         run_internal(
-            &self.client,
-            &self.state,
-            &self.cancel,
-            &self.config,
-            &self.scrubber,
-            self.baseline_cache.as_ref(),
-            self.shared_client,
+            &PipelineCtx {
+                client: &self.client,
+                state: &self.state,
+                cancel: &self.cancel,
+                config: &self.config,
+                scrubber: &self.scrubber,
+                baseline_cache: self.baseline_cache.as_ref(),
+                shared_client: self.shared_client,
+            },
             target_str,
             None,
         )
@@ -129,13 +131,15 @@ impl Engine {
         candidate: &crate::recon::ParameterCandidate,
     ) -> crate::error::Result<EngineState> {
         run_internal(
-            &self.client,
-            &self.state,
-            &self.cancel,
-            &self.config,
-            &self.scrubber,
-            self.baseline_cache.as_ref(),
-            self.shared_client,
+            &PipelineCtx {
+                client: &self.client,
+                state: &self.state,
+                cancel: &self.cancel,
+                config: &self.config,
+                scrubber: &self.scrubber,
+                baseline_cache: self.baseline_cache.as_ref(),
+                shared_client: self.shared_client,
+            },
             candidate.url.as_str(),
             Some(candidate),
         )
@@ -144,7 +148,7 @@ impl Engine {
 }
 
 /// Pipeline glue (`run_internal` + helpers) moved to `super::pipeline` (P1-fin).
-pub(crate) use super::pipeline::run_internal;
+pub(crate) use super::pipeline::{PipelineCtx, run_internal};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
