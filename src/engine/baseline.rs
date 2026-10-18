@@ -161,7 +161,7 @@ pub(crate) async fn collect_baseline(
 /// Phase 3: les 3 samples sont émis en concurrent (`join_all` borné à 3,
 /// sans `spawn` unbounded) ; `attempts <= 6` borne les envois, seuls les
 /// ratés sont rejoués. Chaque branche vérifie le `CancellationToken`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn collect_baseline_uncached(
     client: &HttpClient,
     state: &Arc<RwLock<SessionState>>,

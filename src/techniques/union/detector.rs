@@ -33,8 +33,8 @@ impl UnionDetector {
     /// for the reflection veto, since the page may echo it back verbatim, and
     /// stripped from the candidate before the marker/diff checks (same guard
     /// as the STACKED detector).
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn evaluate(
         &self,
         baseline_body: &str,

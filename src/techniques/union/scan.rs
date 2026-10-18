@@ -128,11 +128,12 @@ pub(crate) async fn enumerate_columns_via_order_by(
 pub(crate) struct UnionTechnique;
 
 impl Technique for UnionTechnique {
+    #[allow(clippy::too_many_lines)]
     fn kind(&self) -> TechniqueKind {
         TechniqueKind::Union
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     fn probe<'a>(&'a self, ctx: &'a TechniqueCtx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let client = ctx.client;

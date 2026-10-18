@@ -27,7 +27,7 @@ use crate::{
 /// `score = EVI * 1.0 / cost` via [`Scheduler::pop`] (budget + [`EarlyStop`]
 /// gated). Payload volume per technique stays enveloped by
 /// `payload_budget(level, ..)` inside `test_*_bounded`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 pub(super) async fn run_detection_for_param(
     client: &HttpClient,
     state: &Arc<RwLock<SessionState>>,

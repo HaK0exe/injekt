@@ -57,7 +57,7 @@ fn build_technique_ctx<'a>(
 
 /// Dispatch one technique, snapshot findings/requests, fold the outcome into
 /// `hyp` via `record_probe/record_trial/record_waf_penalty`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_one_technique(
     client: &HttpClient,
     state: &Arc<RwLock<SessionState>>,
