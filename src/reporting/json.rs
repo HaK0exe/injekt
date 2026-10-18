@@ -172,9 +172,9 @@ mod tests {
         assert_eq!(meta.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(meta.seed, None);
         assert_eq!(meta.profile, None);
-        assert!(meta.techniques.is_empty());
+        assert_eq!(meta.techniques, [] as [String; 0]);
         assert_eq!(meta.level, 1);
-        assert!(meta.tampers.is_empty());
+        assert_eq!(meta.tampers, [] as [String; 0]);
     }
 
     #[test]

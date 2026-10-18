@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn strip_outliers_handles_empty_and_single() {
-        assert!(strip_time_outliers_ms(&[], 10.0).is_empty());
+        assert_eq!(strip_time_outliers_ms(&[], 10.0), [] as [f64; 0]);
         assert_eq!(strip_time_outliers_ms(&[1000.0], 10.0), vec![1000.0]);
     }
 

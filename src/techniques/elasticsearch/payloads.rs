@@ -49,7 +49,7 @@ mod tests {
         assert!(!v.is_empty());
         for p in &v {
             assert_ne!(p.true_payload, p.false_payload);
-            assert!(!p.error_payload.is_empty());
+            assert_ne!(p.error_payload, "");
         }
     }
 }

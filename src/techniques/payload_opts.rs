@@ -241,7 +241,7 @@ mod tests {
         };
         assert!(opts.is_active());
         let suffix = opts.evidence_suffix();
-        assert!(!suffix.is_empty());
+        assert_ne!(suffix, "");
         assert!(suffix.contains("prefix="));
     }
 

@@ -296,7 +296,7 @@ fn pre_c7_minimal_finding_json_still_deserializes() {
         serde_json::from_value(legacy).expect("legacy finding deserializes via defaults");
     assert!((finding.false_positive_prob - 1.0).abs() < f64::EPSILON);
     assert!(finding.remediation.is_empty());
-    assert!(finding.evidence_detail.hashes.is_empty());
+    assert_eq!(finding.evidence_detail.hashes, [] as [String; 0]);
     assert!(!finding.waf.blocking);
     // Serialization exposes the C7 schema.
     let value = serde_json::to_value(&finding).expect("finding serializes");

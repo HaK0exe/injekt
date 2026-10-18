@@ -54,9 +54,9 @@ mod tests {
 
     #[test]
     fn parse_empty() {
-        assert!(parse_tamper_list(None).is_empty());
-        assert!(parse_tamper_list(Some("")).is_empty());
-        assert!(parse_tamper_list(Some("none")).is_empty());
+        assert_eq!(parse_tamper_list(None), [] as [Tamper; 0]);
+        assert_eq!(parse_tamper_list(Some("")), [] as [Tamper; 0]);
+        assert_eq!(parse_tamper_list(Some("none")), [] as [Tamper; 0]);
     }
 
     #[test]

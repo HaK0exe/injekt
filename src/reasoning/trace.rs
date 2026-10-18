@@ -445,8 +445,8 @@ mod tests {
         );
         r.zeroize();
         assert_eq!(r.seq, 0);
-        assert!(r.param.is_empty());
-        assert!(r.request_hash.is_empty());
+        assert_eq!(r.param, "");
+        assert_eq!(r.request_hash, "");
         let mut t = ReasoningTrace::new();
         t.push(ProbeRecord::from_clear(
             0, "id@query", "boolean", "none", None, "a", "b", 0.5, 1.0,

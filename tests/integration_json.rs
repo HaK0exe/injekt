@@ -208,7 +208,7 @@ async fn json_in_all_techniques() {
 
 /// GraphQL backend: only `variables`-envelope probes reach the resolver —
 /// direct JSON payloads (no `variables` framing) stay on the baseline.
-/// The backend wraps the driver error in `{"errors":[{"message":...}]};
+/// The backend wraps the driver error in `{"errors":[{"message":...}]}`;
 /// the passthrough channel (P0-2) must attribute it to MySQL at L3
 /// (generic direct sweep grew to 5 with the Team82 WAF-bypass variants,
 /// so L2 `take(4)` no longer reaches the envelope; DBMS-narrowed MySQL

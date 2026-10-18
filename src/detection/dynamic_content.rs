@@ -427,8 +427,14 @@ mod tests {
 
     #[test]
     fn identical_pages_have_no_markings() {
-        assert!(find_dynamic_content(LOREM, LOREM).is_empty());
-        assert!(find_dynamic_content("short", "short").is_empty());
+        assert_eq!(
+            find_dynamic_content(LOREM, LOREM),
+            [] as [DynamicMarking; 0]
+        );
+        assert_eq!(
+            find_dynamic_content("short", "short"),
+            [] as [DynamicMarking; 0]
+        );
     }
 
     #[test]
@@ -436,14 +442,20 @@ mod tests {
         // Pré-filtre `quick_ratio` : aucun caractère commun → rien à marquer.
         let first = "a".repeat(120);
         let second = "b".repeat(120);
-        assert!(find_dynamic_content(&first, &second).is_empty());
+        assert_eq!(
+            find_dynamic_content(&first, &second),
+            [] as [DynamicMarking; 0]
+        );
     }
 
     #[test]
     fn oversized_pages_degrade_silently() {
         let first = "a".repeat(MAX_DYNAMIC_SCAN_CHARS / 2 + 1);
         let second = "b".repeat(MAX_DYNAMIC_SCAN_CHARS / 2 + 1);
-        assert!(find_dynamic_content(&first, &second).is_empty());
+        assert_eq!(
+            find_dynamic_content(&first, &second),
+            [] as [DynamicMarking; 0]
+        );
     }
 
     #[test]
@@ -504,9 +516,9 @@ mod tests {
 
     #[test]
     fn empty_inputs_are_noops() {
-        assert!(find_dynamic_content("", LOREM).is_empty());
-        assert!(find_dynamic_content(LOREM, "").is_empty());
-        assert!(remove_dynamic_content("", &[]).is_empty());
+        assert_eq!(find_dynamic_content("", LOREM), [] as [DynamicMarking; 0]);
+        assert_eq!(find_dynamic_content(LOREM, ""), [] as [DynamicMarking; 0]);
+        assert_eq!(remove_dynamic_content("", &[]), "");
         let marking = DynamicMarking {
             prefix: None,
             suffix: None,

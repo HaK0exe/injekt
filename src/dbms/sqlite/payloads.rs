@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn error_payloads_distinct() {
         let v = sqlite_error_payloads();
-        assert!(!v.is_empty());
+        assert_ne!(v, [] as [String; 0]);
         assert!(v[0].contains("abs(-9223372036854775808)"), "{}", v[0]);
         assert!(v[1].contains("json_extract"), "{}", v[1]);
     }

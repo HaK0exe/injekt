@@ -186,7 +186,7 @@ async fn baseline_waf_detection() {
     ];
     let bl = Baseline::new(&samples);
     assert!(bl.is_waf_blocked());
-    assert!(!bl.representative_body.is_empty());
+    assert_ne!(bl.representative_body, [] as [u8; 0]);
 }
 
 #[tokio::test]

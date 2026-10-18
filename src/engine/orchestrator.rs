@@ -722,7 +722,10 @@ mod orchestrator_gating_tests {
         let user = vec![Tamper::VersionedComment];
         assert_eq!(super::resolve_effective_tampers(true, &user), user);
         // No block => user set unchanged (including empty).
-        assert!(super::resolve_effective_tampers(false, &[]).is_empty());
+        assert_eq!(
+            super::resolve_effective_tampers(false, &[]),
+            [] as [Tamper; 0]
+        );
     }
 
     #[test]

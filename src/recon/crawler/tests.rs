@@ -138,5 +138,5 @@ fn templated_and_internal_js_endpoints_are_dropped() {
             .map(|c| c.url.as_str().to_owned())
             .collect::<Vec<_>>()
     );
-    assert!(doc.links.is_empty());
+    assert_eq!(doc.links, [] as [Url; 0]);
 }

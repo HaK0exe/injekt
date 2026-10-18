@@ -1,6 +1,8 @@
 use super::*;
 use std::time::Duration;
 
+use crate::detection::dynamic_content::DynamicMarking;
+
 fn sample(status: u16, body: &[u8], headers: &[(&str, &str)]) -> Sample {
     Sample {
         status,
@@ -329,7 +331,7 @@ fn markable_noise_page_learns_raw_median() {
         sample(200, body("01234567").as_bytes(), &[]),
     ];
     let bl = Baseline::new(&samples);
-    assert!(!bl.dynamic_markings.is_empty());
+    assert_ne!(bl.dynamic_markings, [] as [DynamicMarking; 0]);
     assert!(bl.is_stable(), "oracle utilisable grâce au marquage P1.1");
     let Some(m) = bl.match_ratio() else {
         panic!("plancher appris attendu sur la zone marquée");

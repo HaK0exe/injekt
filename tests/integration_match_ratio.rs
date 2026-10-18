@@ -32,6 +32,7 @@
 
 use injekt::{
     detection::baseline::{Baseline, Sample},
+    detection::dynamic_content::DynamicMarking,
     techniques::boolean::detector::BooleanDetector,
 };
 use std::time::Duration;
@@ -110,7 +111,7 @@ fn markable_noise_learns_floor_and_vetoes_noise_band_pair() {
         baseline.is_stable(),
         "la page bruitée reste un oracle utilisable grâce au marquage P1.1"
     );
-    assert!(!baseline.dynamic_markings.is_empty());
+    assert_ne!(baseline.dynamic_markings, [] as [DynamicMarking; 0]);
     let Some(floor) = baseline.match_ratio() else {
         panic!("plancher appris attendu sur la zone marquée");
     };

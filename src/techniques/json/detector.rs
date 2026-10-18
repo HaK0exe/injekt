@@ -442,8 +442,11 @@ mod tests {
         );
         assert!(texts.iter().any(|t| t == "boom"), "{texts:?}");
         assert!(texts.iter().any(|t| t == "ORA-1"), "{texts:?}");
-        assert!(extract_json_error_texts("not json {{{").is_empty());
-        assert!(extract_json_error_texts(r#"{"data":{"a":1}}"#).is_empty());
+        assert_eq!(extract_json_error_texts("not json {{{"), [] as [String; 0]);
+        assert_eq!(
+            extract_json_error_texts(r#"{"data":{"a":1}}"#),
+            [] as [String; 0]
+        );
     }
 
     #[test]

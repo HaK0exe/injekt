@@ -23,7 +23,10 @@ fn bound_never_exceeds_four() {
 #[test]
 fn empty_base_yields_no_variant() {
     let m = MiniMutator::all_enabled();
-    assert!(m.generate("", &default_context(), Some(1)).is_empty());
+    assert_eq!(
+        m.generate("", &default_context(), Some(1)),
+        [] as [MutatedVariant; 0]
+    );
 }
 
 #[test]
@@ -67,7 +70,10 @@ fn quote_fence_skipped_on_numeric_bare_context() {
     let mut ctx = InjectionContext::new();
     ctx.quote = QuoteContext::None;
     ctx.numeric = true;
-    assert!(m.generate("' OR 1=1 -- -", &ctx, Some(1)).is_empty());
+    assert_eq!(
+        m.generate("' OR 1=1 -- -", &ctx, Some(1)),
+        [] as [MutatedVariant; 0]
+    );
 }
 
 #[test]
@@ -128,9 +134,9 @@ fn gate_blocks_no_mutation_waf_unconfirmed_oob() {
 #[test]
 fn disabled_families_yield_nothing() {
     let m = MiniMutator::none();
-    assert!(
-        m.generate("' OR 1=1 -- -", &default_context(), Some(1))
-            .is_empty()
+    assert_eq!(
+        m.generate("' OR 1=1 -- -", &default_context(), Some(1)),
+        [] as [MutatedVariant; 0]
     );
 }
 

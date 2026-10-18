@@ -1,5 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use injekt::target::{markers::MarkerSet, raw_request::RawRequest, url::TargetUrl};
+use injekt::target::{
+    markers::{InjectionMarker, MarkerSet},
+    raw_request::RawRequest,
+    url::TargetUrl,
+};
 use proptest::prelude::*;
 
 proptest! {
@@ -126,5 +130,5 @@ fn markers_positions_consistent() {
     let m = MarkerSet::detect(s);
     assert!(m.has_any());
     let pos = m.positions(s);
-    assert!(!pos.is_empty());
+    assert_ne!(pos, [] as [(usize, InjectionMarker); 0]);
 }

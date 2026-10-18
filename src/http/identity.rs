@@ -129,9 +129,9 @@ mod tests {
     fn none_path_produces_known_pool_ua() {
         let mut rng = make_rng(None);
         let id = Identity::random_with_rng(&mut rng);
-        assert!(!id.user_agent.is_empty());
-        assert!(!id.headers().is_empty());
+        assert_ne!(id.user_agent, "");
+        assert_ne!(id.headers(), [] as [(String, String); 0]);
         // OS-random wrapper stays usable.
-        assert!(!Identity::random().user_agent.is_empty());
+        assert_ne!(Identity::random().user_agent, "");
     }
 }

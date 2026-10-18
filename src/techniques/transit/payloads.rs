@@ -96,8 +96,8 @@ mod tests {
         let v = transit_payloads();
         assert!(!v.is_empty());
         for p in &v {
-            assert!(!p.name.is_empty());
-            assert!(!p.body.is_empty());
+            assert_ne!(p.name, "");
+            assert_ne!(p.body, "");
             assert!(p.body.starts_with('['));
         }
         assert_ne!(v[0].body, v[1].body);

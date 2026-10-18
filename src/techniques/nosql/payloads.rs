@@ -145,8 +145,8 @@ mod tests {
         assert_eq!(v.len(), 4);
         for p in &v {
             assert_ne!(p.true_payload, p.false_payload);
-            assert!(!p.error_payload.is_empty());
-            assert!(!p.vector.is_empty());
+            assert_ne!(p.error_payload, "");
+            assert_ne!(p.vector, "");
             assert!(p.true_operator.is_object(), "vector {}", p.vector);
             assert!(p.false_operator.is_object(), "vector {}", p.vector);
         }

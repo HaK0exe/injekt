@@ -79,9 +79,9 @@ fn json_paths_flattens_nested_and_arrays() {
 
 #[test]
 fn json_paths_handles_roots_and_invalid() {
-    assert!(json_paths("{oops").is_empty());
-    assert!(json_paths("").is_empty());
-    assert!(json_paths("{}").is_empty());
+    assert_eq!(json_paths("{oops"), [] as [(String, String); 0]);
+    assert_eq!(json_paths(""), [] as [(String, String); 0]);
+    assert_eq!(json_paths("{}"), [] as [(String, String); 0]);
     assert_eq!(
         json_paths("42"),
         vec![("json:".to_owned(), "42".to_owned())]
@@ -126,9 +126,9 @@ fn xml_tags_flattens_nested_naively_and_rejects_invalid() {
         xml_tags("<a><b>x</b></a>"),
         vec![("xml:b".to_owned(), "x".to_owned())]
     );
-    assert!(xml_tags("not xml at all").is_empty());
-    assert!(xml_tags("<a>unclosed").is_empty());
-    assert!(xml_tags("").is_empty());
+    assert_eq!(xml_tags("not xml at all"), [] as [(String, String); 0]);
+    assert_eq!(xml_tags("<a>unclosed"), [] as [(String, String); 0]);
+    assert_eq!(xml_tags(""), [] as [(String, String); 0]);
 }
 
 #[test]
@@ -240,7 +240,10 @@ fn pairs_truncate_at_cap() {
 #[test]
 fn json_paths_enforces_max_depth() {
     assert_eq!(json_paths(&nested_json_body(8)).len(), 1);
-    assert!(json_paths(&nested_json_body(12)).is_empty());
+    assert_eq!(
+        json_paths(&nested_json_body(12)),
+        [] as [(String, String); 0]
+    );
 }
 
 #[test]
