@@ -94,6 +94,17 @@ pub struct Cli {
     /// Skipped by clap (internal state, never a CLI flag).
     #[arg(skip)]
     pub(crate) file_cache: std::sync::Arc<std::sync::OnceLock<crate::cli::file_config::FileConfig>>,
+
+    /// C14 — argv original capturé dans `main` (nom du binaire exclu),
+    /// remonté par `build_engine_config` dans `EngineConfig::argv`. Matière du
+    /// patch de suggestion `INCONCLUSIVE` ([`crate::engine::diagnostics`]) :
+    /// un flag n'est ajouté que s'il est absent de cet argv. Skippé par clap
+    /// (état interne, jamais un flag) et **non rendu** par le `Debug` manuel
+    /// ci-dessous (l'argv peut porter des secrets : tokens d'URL, `--cookies`)
+    /// — seule la suggestion json/console en sort, au travers du `Scrubber`.
+    /// Vide (MCP, constructions programmatiques) ⇒ suggestion `None`.
+    #[arg(skip)]
+    pub captured_argv: Vec<String>,
 }
 
 // Manual `Debug` for `Cli`: secrets stay in `SecretString` / scrubbed output
@@ -116,6 +127,9 @@ impl core::fmt::Debug for Cli {
             .field("knowledge_path", &self.knowledge_path)
             .field("verbose", &self.verbose)
             .field("no_banner", &self.no_banner)
+            // `captured_argv` volontairement absent du Debug : l'argv brut peut
+            // porter des secrets (tokens d'URL, cookies) — sa longueur seule.
+            .field("captured_argv_len", &self.captured_argv.len())
             .finish_non_exhaustive()
     }
 }

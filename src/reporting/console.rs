@@ -169,12 +169,17 @@ pub fn run_status(state: &str, findings: usize) -> &'static str {
 /// no finding, `INCONCLUSIVE` means the run stopped early or the oracle was
 /// unusable (unstable/all-5xx baseline, budget/duration stop) — never read it
 /// as "not injectable". `CANCELLED` means the operator interrupted the run.
+/// `suggestion` (C14) : commande rejouable **déjà scrubbée** (elle vit dans
+/// un `Diagnostic::scrubbed`), imprimée uniquement quand
+/// `status == "INCONCLUSIVE"` — une run CLEAN/FINDINGS/CANCELLED n'a pas de
+/// conseil de rejeu à recevoir.
 pub fn print_run_summary(
     target: &str,
     state: &str,
     request_count: u64,
     elapsed: Duration,
     findings: usize,
+    suggestion: Option<&str>,
     scrubber: &Scrubber,
 ) {
     let target = scrubber.scrub(target);
@@ -201,7 +206,24 @@ pub fn print_run_summary(
         println!("  Requests: {request_count}");
         println!("  Duration: {elapsed:.1}s");
     }
+    if status == "INCONCLUSIVE"
+        && let Some(sug) = suggestion
+    {
+        println!("{}", suggestion_line(sug, color));
+    }
     println!();
+}
+
+/// C14 — ligne de conseil `→ suggestion: <cmd>` (pure, testable). La
+/// commande est déjà scrubbée en amont (`Diagnostic::scrubbed`) : aucun
+/// token brut ne traverse cette fonction.
+#[must_use]
+pub fn suggestion_line(suggestion: &str, color: bool) -> String {
+    if color {
+        format!("  {} {}", "→ suggestion".cyan().bold(), suggestion)
+    } else {
+        format!("  → suggestion: {suggestion}")
+    }
 }
 
 /// Print extracted DB data (banner, tables, dump rows, …) collected during
@@ -287,5 +309,21 @@ mod tests {
         assert_eq!(run_status("Inconclusive", 0), "INCONCLUSIVE");
         // A hit on a truncated run still surfaces as FINDINGS.
         assert_eq!(run_status("Inconclusive", 1), "FINDINGS");
+    }
+
+    #[test]
+    fn suggestion_line_renders_verbatim_in_both_colorings() {
+        // C14 : pure et fidèle — la commande scrubbée apparaît telle quelle;
+        // la couleur ne doit ni casser ni recomposer le texte affiché.
+        let line = suggestion_line("injekt --tamper space2comment,randomcase", true);
+        assert!(line.contains("→ suggestion"), "{line}");
+        assert!(
+            line.contains("injekt --tamper space2comment,randomcase"),
+            "{line}"
+        );
+        assert_eq!(
+            suggestion_line("injekt --rate-limit 2", false),
+            "  → suggestion: injekt --rate-limit 2"
+        );
     }
 }

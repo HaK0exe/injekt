@@ -110,6 +110,9 @@ impl InjektServer {
     pub(super) fn base_cli() -> Cli {
         Cli {
             file_cache: std::sync::Arc::default(),
+            // C14 : pas d'argv capturé par MCP (les outils construisent le
+            // `Cli` programmatiquement) ⇒ le patch de suggestion rend `None`.
+            captured_argv: Vec::new(),
             command: None,
             profile: None,
             config: None,

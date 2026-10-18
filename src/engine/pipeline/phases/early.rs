@@ -1,12 +1,20 @@
 //! Pre-flight, baseline and context phases of `run_internal` (P2).
 //! Bodies moved verbatim from the inline pipeline; baseline early
 //! exits drain `absorb_detectability` where the inline code did.
+//!
+//! C14 : les deux retours précoces `Inconclusive` (budget pré-baseline,
+//! baseline instable) dérivent leur diagnostic via
+//! [`crate::engine::diagnostics::Diagnostic::derive`] et le posent en
+//! `SessionState::set_inconclusive_cause` (RAM-only) — les compteurs
+//! detectability sont lus **après** `absorb_detectability` (jamais de
+//! double drain client).
 
 use std::{sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::engine::diagnostics::{DiagSignals, Diagnostic};
 use crate::engine::pipeline::helpers::absorb_detectability;
 use crate::{
     detection::baseline,
@@ -83,6 +91,20 @@ pub(crate) async fn run_baseline_phase(
     ) {
         warn!("request-budget spent, skipping baseline");
         absorb_detectability(client, state, shared_client).await;
+        // C14 : le budget est la cause la plus vraisemblable ici, mais un
+        // blocage 403/429 préalable (déjà absorbé) peut la surpasser — table
+        // de priorité figée, voir `Diagnostic::derive`. `derive` renvoie
+        // `None` quand l'opérateur a annulé : un set `None` est sans effet.
+        let detectability = state.read().await.detectability();
+        let diagnostic = Diagnostic::derive(&DiagSignals {
+            count_403: detectability.count_403,
+            count_429: detectability.count_429,
+            over_request_budget: true,
+            cancelled: cancel.is_cancelled(),
+            argv: config.argv.to_vec(),
+            ..DiagSignals::default()
+        });
+        state.write().await.set_inconclusive_cause(diagnostic);
         return Ok(BaselinePhase::Stop(EngineState::Inconclusive));
     }
 
@@ -113,6 +135,19 @@ pub(crate) async fn run_baseline_phase(
             "baseline unstable — skipping injection detection"
         );
         absorb_detectability(client, state, shared_client).await;
+        // C14 : les statuses discordants sont la preuve brute de l'oracle
+        // inutilisable ; la cause `UnstableBaseline` est prioritaire sur les
+        // compteurs detectability (table figée).
+        let detectability = state.read().await.detectability();
+        let diagnostic = Diagnostic::derive(&DiagSignals {
+            unstable_statuses: baseline.status_codes.clone(),
+            count_403: detectability.count_403,
+            count_429: detectability.count_429,
+            cancelled: cancel.is_cancelled(),
+            argv: config.argv.to_vec(),
+            ..DiagSignals::default()
+        });
+        state.write().await.set_inconclusive_cause(diagnostic);
         return Ok(BaselinePhase::Stop(EngineState::Inconclusive));
     }
     // All-5xx baseline: every differential below compares static error

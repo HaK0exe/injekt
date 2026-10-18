@@ -9,6 +9,8 @@ use crate::cli::profile::Profile;
 fn blank_cli() -> Cli {
     Cli {
         file_cache: std::sync::Arc::default(),
+        // C14 : fixture programmatique — argv jamais capturé ⇒ suggestion `None`.
+        captured_argv: Vec::new(),
         command: None,
         profile: None,
         // Point at a path that never exists so auto-discovered files

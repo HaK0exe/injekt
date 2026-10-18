@@ -22,6 +22,38 @@ Roadmap `docs/ROADMAP-v1.0.md` §v1.0-rc : rien de nouveau — geler, durcir, pr
 
 ### Added
 
+- **C14 — diagnostics `INCONCLUSIVE`** (zéro nouveau flag, zéro évolution du
+  moteur de détection) : un run dégradé explique sa cause et propose le rejeu.
+  `src/engine/diagnostics.rs` (types purs, 0 IO) : `InconclusiveCause`
+  (`#[non_exhaustive]` — `UnstableBaseline{statuses}`, `BaselineUnreachable`,
+  `WafBlocked{count_403}`, `RateLimited{count_429}`, `NetworkTimeout`,
+  `BudgetExhausted`, `DurationExpired`), `Diagnostic::derive(&DiagSignals)` pure
+  et déterministe (priorité stricte unstable > unreachable > waf > rate >
+  timeout > budget > durée ; `cancel` ⇒ jamais de diagnostic ; max 1/run),
+  posé par les 3 points de dégradation du pipeline (budget pré-baseline,
+  baseline instable depuis `run_baseline_phase`, tail `finalize_run`) dans la
+  `SessionState` RAM-only (`set_inconclusive_cause`, zeroized). La suggestion
+  est un **patch déterministe de l'argv original** (capturé dans `main` via
+  `Cli::captured_argv`, transporté en `EngineConfig.argv: Zeroizing<Vec<String>>`
+  — Debug masqué, zéro persistance) : `UnstableBaseline`/`BaselineUnreachable`
+  → `--fetch-using direct` (+ `--techniques time` si absent) ;
+  `WafBlocked` → `--tamper space2comment,randomcase` seulement si l'opérateur
+  n'a pas déjà posé `--tamper` ; `RateLimited` → `--ignore-code 429
+  --rate-limit 2` (chaque flag seulement s'il est absent) ; `NetworkTimeout`
+  → « run `injekt doctor` » ; budget/durée → info pure sans suggestion ;
+  argv vide (MCP, code programmatique) ⇒ jamais de commande fabriquée.
+  Sorties : `JsonReport.diagnostic` optionnel (4 clés fixes `cause` plat
+  `code()`/`evidence`/`suggestion`/`why` ; absent quand `None` — rapport
+  pré-C14 byte-identique) scrubbé à la sortie, et une ligne
+  `→ suggestion: <cmd scrubbée>` imprimée sous `INCONCLUSIVE` par le résumé
+  console. Limites figées : `NetworkTimeout` tient la table sans producteur
+  live (le client ne compte pas encore les timeouts — prix pour C15/
+  compteurs transport), compteurs `403/429` drainés une seule fois depuis le
+  client (`absorb_detectability`) et absents si `shared_client` (recon scan).
+  Freeze report : golden `tests/golden/v1-report-schema.json` étendu
+  (entrée `diagnostic` + top-level `diagnostic`) — regen délibérée
+  `UPDATE_GOLDEN=1 cargo test --test integration_freeze_v1`, diff de 8 lignes
+  revu (aucun flag CLI ajouté : `cli-flags.txt` intact).
 - Bannière : `ascii_art.txt` est la source unique de *tous* les arts
   (sections délimitées par des lignes `---- nom`, légende = nom de l'art
   au-dessus). Un art est tiré au sort à chaque run (`--seed` le rend
