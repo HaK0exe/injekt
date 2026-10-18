@@ -39,3 +39,8 @@ bench/reports/
 # Python bytecode (bench runner selftest / tooling)
 __pycache__/
 *.pyc
+
+
+# BaseMyAi memory agent AI
+#
+/basemyai-desktop.bmai

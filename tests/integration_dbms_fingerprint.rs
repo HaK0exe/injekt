@@ -22,11 +22,51 @@ fn baseline_body() -> &'static str {
     "welcome normal page id=1 content baseline 42"
 }
 
-/// Minimal boolean-oracle backend: any injected condition containing `1=1`
-/// (generic boolean payload or the MySQL versioned-comment probe) renders
-/// like baseline, `1=0`/`1=2` renders differently. Good enough to exercise
-/// the plumbing from a generic (dbms-less) boolean finding through the
-/// active fingerprint probe without modelling real per-DBMS SQL semantics.
+/// Évalue la première comparaison entière `(\d+)=(\d+)` d'une valeur déjà
+/// décodée : `Some(true)` = branche logiquement vraie, `Some(false)` = fausse,
+/// `None` = pas de comparaison entière.
+///
+/// P0.2 : les contrôles `r=r`/`r1=r2` tirent des entiers aléatoires ; un mock
+/// qui ne matche que les littéraux historiques (`1=2`) les verrait comme
+/// baseline et serait vété comme faux positif — ce mock évalue donc la
+/// logique comme un vrai oracle.
+fn eval_int_comparison(text: &str) -> Option<bool> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'=' {
+            i += 1;
+            continue;
+        }
+        let mut start = i;
+        while start > 0 && bytes[start - 1].is_ascii_digit() {
+            start -= 1;
+        }
+        let rhs_start = i + 1;
+        let mut end = rhs_start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if start < i
+            && end > rhs_start
+            && let (Ok(lhs), Ok(rhs)) = (
+                text[start..i].parse::<u64>(),
+                text[rhs_start..end].parse::<u64>(),
+            )
+        {
+            return Some(lhs == rhs);
+        }
+        i = rhs_start;
+    }
+    None
+}
+
+/// Minimal boolean-oracle backend: any injected integer condition that is
+/// logically true (generic boolean payload or the MySQL versioned-comment
+/// probe) renders like baseline, a logically false one renders differently.
+/// Good enough to exercise the plumbing from a generic (dbms-less) boolean
+/// finding through the active fingerprint probe without modelling real
+/// per-DBMS SQL semantics.
 fn oracle_responder(req: &wiremock::Request) -> ResponseTemplate {
     let id = req
         .url
@@ -34,7 +74,7 @@ fn oracle_responder(req: &wiremock::Request) -> ResponseTemplate {
         .find(|(k, _)| k == "id")
         .map(|(_, v)| v.into_owned())
         .unwrap_or_default();
-    if id.contains("1=0") || id.contains("1=2") {
+    if eval_int_comparison(&id) == Some(false) {
         return ResponseTemplate::new(200)
             .set_body_string("completely different content unique 987654");
     }

@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 use crate::detection::response_diff::{diff_against_baseline, jaccard};
+use crate::techniques::reflection::is_payload_echo;
 use crate::techniques::stacked::payloads::StackedPayload;
 
 #[derive(Debug, Clone)]
@@ -26,36 +27,13 @@ impl StackedDetector {
     }
 
     /// `true` when the response merely echoes our input instead of executing
-    /// it: the raw, percent-decoded (`%27`), form-decoded (`+` as space) or
-    /// HTML-entity-decoded body contains the exact string we sent. A stacked
-    /// marker only proves execution when it appears *without* its surrounding
-    /// payload syntax (search-results pages reflecting `?q=` input are the
-    /// classic false positive).
+    /// it. Delegates to the shared reflection guard
+    /// ([`crate::techniques::reflection::is_payload_echo`]): a stacked marker
+    /// only proves execution when it appears *without* its surrounding payload
+    /// syntax (search-results pages reflecting `?q=` input are the classic
+    /// false positive).
     fn is_echo(body: &str, sent_payload: &str) -> bool {
-        if sent_payload.is_empty() {
-            return false;
-        }
-        if body.contains(sent_payload) {
-            return true;
-        }
-        // Encoded reflections: the page may echo the URL-encoded, `+`-spaced
-        // or HTML-escaped form of our input instead of the raw payload.
-        if percent_decode(body, false).contains(sent_payload) {
-            return true;
-        }
-        if percent_decode(body, true).contains(sent_payload) {
-            return true;
-        }
-        if html_decode_entities(body).contains(sent_payload) {
-            return true;
-        }
-        // Server-side normalization echo: our encoded payload, decoded once,
-        // appears verbatim in the response.
-        let decoded_sent = percent_decode(sent_payload, true);
-        if decoded_sent != sent_payload && body.contains(&decoded_sent) {
-            return true;
-        }
-        false
+        is_payload_echo(body, sent_payload)
     }
 
     /// Stacked queries: second statement should execute and produce visible side-effect.
@@ -127,48 +105,6 @@ impl StackedDetector {
             },
         }
     }
-}
-
-/// Minimal percent-decoder (`%XX` → byte). With `plus_as_space`, `+` decodes
-/// to a space (query-string echo form). Invalid sequences are kept verbatim;
-/// invalid UTF-8 becomes `U+FFFD` via lossy conversion. Never panics.
-fn percent_decode(input: &str, plus_as_space: bool) -> String {
-    let bytes = input.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let byte = bytes[i];
-        if byte == b'%'
-            && i + 3 <= bytes.len()
-            && let Ok(hex) = core::str::from_utf8(&bytes[i + 1..i + 3])
-            && let Ok(decoded) = u8::from_str_radix(hex, 16)
-        {
-            out.push(decoded);
-            i += 3;
-            continue;
-        }
-        if plus_as_space && byte == b'+' {
-            out.push(b' ');
-        } else {
-            out.push(byte);
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Minimal HTML-entity decoder (same set as `matcher::strip_html` plus
-/// `&#39;`/`&apos;`), `&amp;` last to avoid double-decoding `&amp;lt;`.
-fn html_decode_entities(input: &str) -> String {
-    input
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#x27;", "'")
-        .replace("&#X27;", "'")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
 }
 
 #[cfg(test)]

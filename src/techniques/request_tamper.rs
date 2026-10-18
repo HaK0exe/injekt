@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn chunk_pieces_empty() {
-        assert!(chunk_body_pieces(b"", 5).is_empty());
+        assert_eq!(chunk_body_pieces(b"", 5), [] as [bytes::Bytes; 0]);
     }
 
     #[test]

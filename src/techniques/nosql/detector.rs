@@ -97,13 +97,42 @@ impl NosqlDetector {
         true_ms: f64,
         false_ms: f64,
     ) -> BooleanResult {
-        self.boolean.evaluate(
+        self.evaluate_boolean_with_match_ratio(
             baseline_body,
             true_body,
             false_body,
             baseline_ms,
             true_ms,
             false_ms,
+            None,
+        )
+    }
+
+    /// Canal booléen avec le plancher de bruit appris (P1.2) : même
+    /// différentiel que [`Self::evaluate_boolean`], plus `noise_vetoed` exposé
+    /// pour que les appelants qui décident sur les `Trial`s bruts traduisent
+    /// une paire vetoée en trial neutre. `None` conserve le verdict
+    /// historique à l'identique.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_boolean_with_match_ratio(
+        &self,
+        baseline_body: &str,
+        true_body: &str,
+        false_body: &str,
+        baseline_ms: f64,
+        true_ms: f64,
+        false_ms: f64,
+        match_ratio: Option<f64>,
+    ) -> BooleanResult {
+        self.boolean.evaluate_with_match_ratio(
+            baseline_body,
+            true_body,
+            false_body,
+            baseline_ms,
+            true_ms,
+            false_ms,
+            match_ratio,
         )
     }
 
@@ -202,5 +231,49 @@ mod tests {
         let baseline = "welcome normal page user=admin content baseline 42";
         let r = d.evaluate_boolean(baseline, baseline, baseline, 100.0, 101.0, 102.0);
         assert!(!r.is_vulnerable);
+    }
+
+    /// P1.2 — plancher `Some(m)` avec les deux branches dans la bande de
+    /// bruit : veto exposé (`noise_vetoed`), verdict non vulnérable ; sans
+    /// plancher (`None`), le flag reste faux.
+    #[test]
+    fn boolean_channel_match_ratio_vetoes_noise_band() {
+        let d = NosqlDetector::new();
+        let base = (1..=20)
+            .map(|i| format!("tok{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // TRUE ≈ baseline (+1 token → Jaccard 20/21 ≈ 0.952).
+        let true_body = format!("{base} extra_true_marker");
+        // FALSE dans la bande de bruit de m=0.8 (16 tokens partagés + 1
+        // nouveau → 16/21 ≈ 0.762 ≥ 0.75), gap 0.19 > 0.15.
+        let false_body = format!(
+            "{} extra_false_marker",
+            (1..=16)
+                .map(|i| format!("tok{i:02}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let vetoed = d.evaluate_boolean_with_match_ratio(
+            &base,
+            &true_body,
+            &false_body,
+            100.0,
+            100.0,
+            100.0,
+            Some(0.8),
+        );
+        assert!(vetoed.noise_vetoed, "{vetoed:?}");
+        assert!(!vetoed.is_vulnerable, "{vetoed:?}");
+        let legacy = d.evaluate_boolean_with_match_ratio(
+            &base,
+            &true_body,
+            &false_body,
+            100.0,
+            100.0,
+            100.0,
+            None,
+        );
+        assert!(!legacy.noise_vetoed, "{legacy:?}");
     }
 }

@@ -1,4 +1,5 @@
 #![deny(unsafe_code)]
+pub mod banner;
 pub mod console;
 pub mod file;
 pub mod format;

@@ -476,8 +476,8 @@ mod tests {
         let bytes = serde_json::to_vec(&legacy).unwrap();
         let snapshot: Snapshot = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(snapshot.request_count, 7);
-        assert!(snapshot.extracted.is_empty());
-        assert!(snapshot.trace.is_empty());
+        assert_eq!(snapshot.extracted, [] as [String; 0]);
+        assert_eq!(snapshot.trace, [] as [crate::reasoning::ProbeRecord; 0]);
         assert_eq!(snapshot.seed, None);
     }
 

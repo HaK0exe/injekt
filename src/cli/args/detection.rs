@@ -51,6 +51,10 @@ pub enum TechniqueOpt {
     Oob,
     Json,
     Nosql,
+    Transit,
+    Orm,
+    Graphql,
+    Elasticsearch,
     All,
 }
 
@@ -170,7 +174,13 @@ pub struct DetectionOpts {
     /// finding with fresh payloads + derived seed after detection (OOB
     /// excluded, ~2x requests worst-case, documented). Never creates new
     /// findings — only drops those that fail re-validation. In-detection
-    /// 3-trial confirmation still applies regardless of this flag.
+    /// 3-trial confirmation still applies regardless of this flag. Without
+    /// this flag, confirmed non-High findings are already re-validated
+    /// automatically on every non-OOB technique, with first-pass window
+    /// parity (time sweeps the same payload family/budget; json/nosql
+    /// re-probe the finding's original channel and shape, GraphQL envelope
+    /// included); `--confirm` extends the re-validation to ALL confirmed
+    /// findings (High included) and enables the C5 mini-mutation.
     #[arg(long, global = true, help_heading = "Detection")]
     pub confirm: bool,
 

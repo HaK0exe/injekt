@@ -22,6 +22,14 @@ Roadmap `docs/ROADMAP-v1.0.md` §v1.0-rc : rien de nouveau — geler, durcir, pr
 
 ### Added
 
+- Bannière : `ascii_art.txt` est la source unique de *tous* les arts
+  (sections délimitées par des lignes `---- nom`, légende = nom de l'art
+  au-dessus). Un art est tiré au sort à chaque run (`--seed` le rend
+  déterministe) ; `INJEKT_BANNER_ART=<nom>` l'épingle, `=list` énumère,
+  `=random` force la rotation. Rendu : dégradé vertical cyan → magenta sur
+  les arts clairs, art truecolor imprimé brut sur TTY couleur et strippé
+  proprement sur pipe/`NO_COLOR`/`TERM=dumb`. Aucun nouveau flag CLI : le
+  freeze surface reste intact.
 - Gel surface : `tests/integration_freeze_v1.rs` + goldens
   `tests/golden/cli-flags.txt` (flags `--long` + subcommands) et
   `tests/golden/report-schema.json` (clés JSON triées, valeurs exclues).
@@ -54,6 +62,16 @@ Roadmap `docs/ROADMAP-v1.0.md` §v1.0-rc : rien de nouveau — geler, durcir, pr
 - `src/session/export.rs` : `Snapshot: Zeroize` manuel (findings +
   extracted + trace wiped après sérialisation, `json` déjà `Zeroizing`) ;
   version blob documentée gelée (`v3`, lecteurs v1/v2/v3).
+- Refactor interne P4 (aucun impact CLI/surface) : aucun fichier `src/`
+  ne dépasse 500 lignes sans être découpé en sous-répertoires avec `mod.rs`
+  final en re-exports (`http/client`, `detection/{waf,baseline,response_diff,
+  confirmation,control_pair,scanner/scheduler}`, `session/{state,scrubber}`,
+  `target/{injection,structured}`, `dbms/context`, `techniques/{tamper,
+  detectors}`, `engine/{confirm,detection}`, `mcp/tools`, `recon/crawler`,
+  `reasoning/knowledge`, `ai/provider`, `mutation`, … ; ~24 étapes,
+  move-only vérifié en multiset, arbre + vérifs dans `docs/REFACTOR_PLAN.md`).
+  Résultat : max ~443L par fichier, 1047 tests + 5 doc-tests verts,
+  rustdoc à 19 warnings inchangé à chaque étape.
 
 ### Security
 

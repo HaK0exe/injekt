@@ -506,7 +506,7 @@ mod tests {
     #[test]
     fn openapi_rejects_non_http_servers() {
         let doc = r#"{"servers":[{"url":"ftp://x"}],"paths":{"/a":{"get":{}}}}"#;
-        assert!(parse_openapi_targets(doc).is_empty());
+        assert_eq!(parse_openapi_targets(doc), [] as [String; 0]);
     }
 
     #[test]

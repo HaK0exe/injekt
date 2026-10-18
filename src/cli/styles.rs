@@ -2,8 +2,8 @@
 
 //! Couleurs de l'aide CLI (`--help` / `-h` / erreurs clap).
 //!
-//! Palette calée sur l'identité du banner ([`crate::cli::output::console::banner`] :
-//! wordmark cyan, version magenta) : en-têtes de sections cyan gras, flags et
+//! Palette calée sur l'identité du banner ([`crate::cli::output::banner`] :
+//! wordmark cyan → magenta, version magenta) : en-têtes de sections cyan gras, flags et
 //! sous-commandes vert gras, placeholders (`<TARGET>`, `<PROFILE>`) magenta,
 //! erreurs rouge vif. Propagée aux sous-commandes par clap
 //! (`Command::styles` : "propagated to all child subcommands", donc un seul

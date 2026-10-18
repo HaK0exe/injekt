@@ -213,13 +213,41 @@ impl JsonDetector {
         true_ms: f64,
         false_ms: f64,
     ) -> BooleanResult {
-        self.boolean.evaluate(
+        self.evaluate_boolean_with_match_ratio(
             baseline_body,
             true_body,
             false_body,
             baseline_ms,
             true_ms,
             false_ms,
+            None,
+        )
+    }
+
+    /// Boolean channel with the learned noise floor (P1.2): same differential
+    /// as [`Self::evaluate_boolean`], plus `noise_vetoed` exposure so callers
+    /// deciding on raw `Trial`s can translate a vetoed pair into a neutral
+    /// trial. `None` keeps the historical verdict exactly.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_boolean_with_match_ratio(
+        &self,
+        baseline_body: &str,
+        true_body: &str,
+        false_body: &str,
+        baseline_ms: f64,
+        true_ms: f64,
+        false_ms: f64,
+        match_ratio: Option<f64>,
+    ) -> BooleanResult {
+        self.boolean.evaluate_with_match_ratio(
+            baseline_body,
+            true_body,
+            false_body,
+            baseline_ms,
+            true_ms,
+            false_ms,
+            match_ratio,
         )
     }
 
@@ -414,8 +442,11 @@ mod tests {
         );
         assert!(texts.iter().any(|t| t == "boom"), "{texts:?}");
         assert!(texts.iter().any(|t| t == "ORA-1"), "{texts:?}");
-        assert!(extract_json_error_texts("not json {{{").is_empty());
-        assert!(extract_json_error_texts(r#"{"data":{"a":1}}"#).is_empty());
+        assert_eq!(extract_json_error_texts("not json {{{"), [] as [String; 0]);
+        assert_eq!(
+            extract_json_error_texts(r#"{"data":{"a":1}}"#),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -440,5 +471,49 @@ mod tests {
         let baseline = "welcome normal page id=1 content baseline 42";
         let r = d.evaluate_boolean(baseline, baseline, baseline, 100.0, 101.0, 102.0);
         assert!(!r.is_vulnerable);
+    }
+
+    /// P1.2 — plancher `Some(m)` avec les deux branches dans la bande de
+    /// bruit : veto exposé (`noise_vetoed`), verdict non vulnérable ; sans
+    /// plancher (`None`), le flag reste faux.
+    #[test]
+    fn boolean_channel_match_ratio_vetoes_noise_band() {
+        let d = JsonDetector::new();
+        let base = (1..=20)
+            .map(|i| format!("tok{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // TRUE ≈ baseline (+1 token → Jaccard 20/21 ≈ 0.952).
+        let true_body = format!("{base} extra_true_marker");
+        // FALSE dans la bande de bruit de m=0.8 (16 tokens partagés + 1
+        // nouveau → 16/21 ≈ 0.762 ≥ 0.75), gap 0.19 > 0.15.
+        let false_body = format!(
+            "{} extra_false_marker",
+            (1..=16)
+                .map(|i| format!("tok{i:02}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let vetoed = d.evaluate_boolean_with_match_ratio(
+            &base,
+            &true_body,
+            &false_body,
+            100.0,
+            100.0,
+            100.0,
+            Some(0.8),
+        );
+        assert!(vetoed.noise_vetoed, "{vetoed:?}");
+        assert!(!vetoed.is_vulnerable, "{vetoed:?}");
+        let legacy = d.evaluate_boolean_with_match_ratio(
+            &base,
+            &true_body,
+            &false_body,
+            100.0,
+            100.0,
+            100.0,
+            None,
+        );
+        assert!(!legacy.noise_vetoed, "{legacy:?}");
     }
 }

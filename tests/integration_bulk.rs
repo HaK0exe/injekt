@@ -36,10 +36,56 @@ fn different_body() -> &'static str {
     "completely different content false branch unique marker 99 xyz"
 }
 
-/// Differential boolean responder (vulnerable): `1=2` branch differs.
+/// Évalue la première comparaison entière `(\d+)=(\d+)` d'un payload (URL
+/// `%3D`-encodée ou texte brut) : `Some(true)` = branche logiquement vraie,
+/// `Some(false)` = fausse, `None` = pas de comparaison entière.
+///
+/// P0.2 : les contrôles `r=r`/`r1=r2` utilisent des entiers aléatoires ; un
+/// mock qui ne matche que les littéraux historiques (`1=2`) ne les verrait
+/// pas et serait vété comme faux positif — ce mock évalue donc la logique
+/// comme un vrai oracle.
+fn eval_int_comparison(text: &str) -> Option<bool> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let eq_len = if bytes[i] == b'=' {
+            1
+        } else if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1] == b'3'
+            && matches!(bytes[i + 2], b'D' | b'd')
+        {
+            3
+        } else {
+            i += 1;
+            continue;
+        };
+        let mut start = i;
+        while start > 0 && bytes[start - 1].is_ascii_digit() {
+            start -= 1;
+        }
+        let rhs_start = i + eq_len;
+        let mut end = rhs_start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if start < i
+            && end > rhs_start
+            && let (Ok(lhs), Ok(rhs)) = (
+                text[start..i].parse::<u64>(),
+                text[rhs_start..end].parse::<u64>(),
+            )
+        {
+            return Some(lhs == rhs);
+        }
+        i = rhs_start;
+    }
+    None
+}
+
+/// Differential boolean responder (vulnerable): `1=2`-shaped FALSE branch differs.
 fn vuln_responder(req: &wiremock::Request) -> ResponseTemplate {
-    let url = req.url.to_string().to_ascii_lowercase();
-    if url.contains("1%3d2") || url.contains("1=2") {
+    if eval_int_comparison(req.url.as_str()) == Some(false) {
         return ResponseTemplate::new(200).set_body_string(different_body());
     }
     ResponseTemplate::new(200).set_body_string(baseline_body())

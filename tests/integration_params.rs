@@ -46,7 +46,7 @@ fn filter_by_full_key() {
 fn filter_no_match_returns_empty() {
     let params = vec![qp("id")];
     let out = filter_params(params, &["nope".to_owned()]);
-    assert!(out.is_empty());
+    assert_eq!(out, [] as [TargetParameter; 0]);
 }
 
 #[test]

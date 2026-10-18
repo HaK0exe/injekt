@@ -2,11 +2,20 @@
 
 pub mod bulk;
 pub mod ingest;
+pub mod injection;
 pub mod markers;
 pub mod parameters;
 pub mod raw_request;
 pub mod structured;
 pub mod url;
+
+pub use injection::{
+    APP_FILTER_STATUS, FILTER_STREAK_LIMIT, ProbeOpts, baseline_all_error,
+    build_injection_spec_with_raw, filter_params, headers_preserving_raw,
+    headers_preserving_raw_keep_ct, inject_body_param, inject_multipart_field, inject_param,
+    inject_param_or_marker, inject_with_marker, is_app_filter_block, is_ignored, payload_budget,
+    request_spec_from_raw, resolve_effective_tampers, synthetic_raw_from_data, waf_auto_tampers,
+};
 
 pub use markers::{InjectionMarker, MarkerSet};
 pub use parameters::{ParameterLocation, TargetParameter};

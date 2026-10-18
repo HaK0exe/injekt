@@ -48,7 +48,7 @@ async fn run() -> anyhow::Result<()> {
         )
         .init();
     if !cli.no_banner {
-        injekt::cli::output::console::banner();
+        injekt::cli::output::banner::print(cli.detection.seed);
     }
     let cancel = CancellationToken::new();
     let c = cancel.clone();

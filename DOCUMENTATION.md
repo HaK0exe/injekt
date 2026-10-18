@@ -28,7 +28,7 @@
 - No SQLite, no cache files, no telemetry
 
 ### 2. Anonymisation by Design
-- **Scrubber** (`src/session/scrubber.rs`) automatically redacts:
+- **Scrubber** (`src/session/scrubber/`) automatically redacts:
   - `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key` headers
   - JWT tokens (`eyJ…`)
   - AWS keys (`AKIA[0-9A-Z]{16}`)
@@ -431,7 +431,7 @@ Notes:
 - No files written unless `--export-encrypted` / `--output` / `--import` / `recon import`
 
 ### Automatic Redaction (Scrubber)
-The `Scrubber` (`src/session/scrubber.rs`) processes all output:
+The `Scrubber` (`src/session/scrubber/`) processes all output:
 | Pattern | Replacement |
 |---------|-------------|
 | `Authorization: Bearer <token>` | `Authorization: [REDACTED]` |
@@ -476,72 +476,47 @@ INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
 ```
 src/
 ├── main.rs / lib.rs                 # Entry points, public API + InjektError
-├── cli/
-│   ├── args.rs                      # Clap CLI definition (Cli, Commands, Recon*)
-│   ├── profile.rs                   # --profile presets (quick/balanced/stealth/aggressive)
-│   ├── file_config.rs               # --config TOML + candidate paths + precedence
-│   ├── client_builder.rs            # HTTP client from CLI flags
-│   ├── commands/
-│   │   ├── scan.rs                  # Scan engine + bulk dispatch
-│   │   ├── recon.rs                 # Crawl, scan, import
-│   │   ├── replay.rs                # Encrypted session replay
-│   │   ├── info.rs                  # Capability info (InfoResult)
-│   │   └── bulk.rs                  # Multi-target sequential scan
-│   └── output/                      # console, json, format
+├── cli/                             # args/ + commands/ (scan, recon, replay, info, auto) + output/
+│   ├── plan.rs + plan/              # Planner split: model/render/escalation
+│   ├── resolve.rs + resolve/        # CLI resolution split: snapshot/effective/…
+│   └── client_builder.rs file_config.rs profile.rs knowledge.rs styles.rs engine_cfg.rs
 ├── target/
-│   ├── url.rs                       # Strict URL parsing (TargetUrl)
-│   ├── raw_request.rs               # Burp/ZAP raw request parser
-│   ├── parameters.rs                # ParameterLocation {Query,Body,Header,Cookie}
-│   ├── markers.rs                   # Injection markers *, §, {{}}
-│   ├── structured.rs                # JSON/XML body handling
-│   └── bulk.rs                      # Bulk file loading (MAX_BULK_TARGETS = 1000)
+│   ├── url.rs raw_request.rs parameters.rs markers.rs bulk.rs ingest.rs
+│   ├── injection/                   # injection spec + headers + tampers (P4 split)
+│   └── structured/                  # JSON/XML body handling (P4 split: kind/json/xml)
 ├── http/
-│   ├── client.rs                    # Type-state builder (timeout() mandatory)
-│   ├── identity.rs                  # UA rotation + Sec-CH-UA
-│   ├── proxy.rs                     # ProxyConfig (socks5h:// enforcement)
-│   ├── cookies.rs                   # In-memory CookieJar (zeroize)
-│   ├── redirects.rs                 # Redirect policy
-│   ├── retry.rs                     # Exponential backoff + jitter
-│   ├── jitter.rs                    # Normal distribution jitter (ms)
-│   └── rate_limit.rs                # Token bucket (default 10/s)
+│   ├── client/                      # type-state builder split: builder/sender/body/redirect/throttle
+│   └── cookies.rs identity.rs proxy.rs rate_limit.rs redirects.rs retry.rs jitter.rs timeouts.rs
 ├── detection/
-│   ├── baseline.rs                  # 3-5 baselines, SHA-256, WAF aggregation
-│   ├── waf.rs                       # WAF/CDN header + challenge fingerprinting
-│   ├── response_diff.rs             # Levenshtein + Jaccard DiffResult
-│   ├── confirmation.rs              # TRUE/FALSE inverted, 3 trials min
-│   ├── matcher.rs                   # MatcherConfig (--string/--not-string/--code/--text-only)
-│   └── scanner/                     # engine + scheduler
+│   ├── baseline/ confirmation/ response_diff/ control_pair/ waf/   # P4 splits
+│   ├── scanner/scheduler/           # scoring/budget/early_stop/heap (P4 split)
+│   └── matcher.rs dynamic_content.rs
 ├── techniques/
-│   ├── tamper.rs                    # 19 WAF evasion tampers
-│   ├── request_tamper.rs            # HPP + chunked
-│   ├── payload_opts.rs              # PayloadOpts (prefix/suffix/encoding/fetch-using)
-│   ├── boolean/ time/ error/        # Classic detectors + payloads
-│   ├── union/ stacked/              # ORDER BY enumeration, `; SELECT` marker
-│   ├── oob/                         # DNS/HTTP collaborator (OPT-IN) + verifier
-│   └── json/                        # JSON_EXTRACT/->>/JSON_VALUE/OPENJSON
-├── dbms/                            # common trait + fingerprint
-│   ├── mysql/ postgres/ mssql/ oracle/  # fingerprint, payloads, queries, enumeration
+│   ├── boolean/ time/ error/ union/ stacked/ oob/ json/ nosql/ transit/ orm/ graphql/ elasticsearch/
+│   ├── tamper/                      # registry/pipeline/space/keywords/encoding/numeric/signatures (P4)
+│   └── technique.rs scan.rs reflection.rs request_tamper.rs payload_opts.rs
+├── dbms/
+│   ├── context/                     # model/errors/passive/active (P4 split)
+│   └── common.rs fingerprint.rs mssql/ mysql/ oracle/ postgres/ sqlite/
 ├── extraction/                      # engine, inference, verification
-├── recon/
-│   ├── crawler.rs                   # Static crawler (links, forms, JS)
-│   ├── discovery.rs                 # Candidate scanning
-│   ├── filters.rs                   # Deduplication, same-origin
-│   └── parameter.rs                 # ParameterCandidate
+├── recon/                           # crawler/ (P4 split), discovery, filters, parameter, baseline_cache
 ├── session/
-│   ├── state.rs                     # SessionState (RAM, ZeroizeOnDrop)
-│   ├── scrubber.rs                  # Redaction engine
+│   ├── state/                       # SessionState split: finding/probe/session (P4)
+│   ├── scrubber/                    # Redaction engine (P4 split: redact/headers/secrets/patterns/oob)
 │   └── export.rs                    # Encrypted export/import (XChaCha20 + Argon2id)
-├── reporting/
-│   ├── console.rs json.rs evidence.rs bulk.rs
-│   ├── verdict.rs (C7 calibrated buckets) sarif.rs junit.rs markdown.rs render.rs (`--format`)
-├── mcp/                             # MCP stdio server (server.rs, tools.rs)
+├── reporting/                       # console json evidence verdict sarif junit markdown render bulk
+├── mutation/                        # mutation planner split: types/mutator/gate/apply (P4)
+├── reasoning/                       # knowledge/ (P4 split), hypothesis.rs, trace.rs
+├── ai/                              # prompt.rs, provider/ (P4 split), validator.rs
+├── mcp/                             # stdio server + tools/ (P4 split: server/builder/router/params)
 └── engine/
-    ├── orchestrator.rs              # State machine: parse → baseline → detection → fingerprint → extraction
-    ├── detection_runner.rs          # Detection orchestration
-    └── sql.rs                       # SELECT-only guard for stacked/extraction
+    ├── orchestrator.rs              # Thin `Engine` façade — state machine
+    ├── pipeline.rs baseline.rs config.rs schedule.rs sql.rs fetch.rs
+    ├── detection/ confirm/          # detection loop + confirm 2nd pass (P4 splits)
+    └── ai_suggest.rs enumerate.rs extraction.rs fingerprint.rs second_order.rs
 ```
 
-### Engine State Machine (`src/engine/orchestrator.rs`)
+### Engine State Machine (`src/engine/`)
 ```
 parse → baseline → detection → fingerprint → extraction(opt-in)
 ```
@@ -741,7 +716,10 @@ early or the oracle was unusable (unstable/all-5xx baseline, `--request-budget`
 / `--max-duration` stop) — never read it as "not injectable".
 
 Colors are disabled automatically for `NO_COLOR`, `TERM=dumb`, `CLICOLOR=0`,
-or redirected output. `--no-banner` disables only the startup banner. For
+or redirected output. `--no-banner` disables only the startup banner. The
+banner wordmark rotates across every art bundled in `ascii_art.txt` (one
+random draw per run — deterministic under `--seed`); pin one with
+`INJEKT_BANNER_ART=<name>` or list them with `INJEKT_BANNER_ART=list`. For
 machine-readable output, use `--output` with `--format json|sarif|junit|md`.
 
 ---
@@ -760,6 +738,7 @@ machine-readable output, use `--output` with `--format json|sarif|junit|md`.
 | `INJEKT_SEED` | Deterministic RNG seed (same as `--seed`) |
 | `INJEKT_PROXY`, `INJEKT_DBMS`, `INJEKT_TAMPER`, `INJEKT_TARGET` | Target/evasion |
 | `INJEKT_FORMAT` | Report serialization (same as `--format`) |
+| `INJEKT_BANNER_ART` | Startup banner art: a name from `ascii_art.txt`, `random` or `list` (stderr only, deterministic under `--seed`) |
 | `INJEKT_OOB_DOMAIN`, `INJEKT_OOB_POLL_URL`, `INJEKT_OOB_WAIT_SECS` | OOB collaborator |
 
 ### Presets (`--profile`)

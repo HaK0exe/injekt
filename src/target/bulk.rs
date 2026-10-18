@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn returns_empty_when_no_valid_targets() {
         let targets = parse_targets_text("# only comments\n\n// nothing usable\n", false);
-        assert!(targets.is_empty());
+        assert_eq!(targets, [] as [String; 0]);
     }
 
     #[test]

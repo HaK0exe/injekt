@@ -118,6 +118,33 @@ async fn postgres_concat_time_inline_requires_pipe_variant() {
     );
 }
 
+/// Same `|| pg_sleep` backend as [`postgres_concat_time_inline_requires_pipe_variant`],
+/// but with `--confirm`: the concat variant (3rd of the postgres family) must
+/// be re-probed by the second pass — the old head-of-list window dropped it.
+#[tokio::test]
+async fn postgres_concat_time_survives_confirm_second_pass() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(pg_concat_responder)
+        .mount(&server)
+        .await;
+
+    let mut cfg = time_config();
+    cfg.budget.level = 3;
+    cfg.confirm = true;
+    cfg.no_mutation = true;
+    let engine = Engine::new(cfg, test_client(), CancellationToken::new());
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.technique == injekt::session::state::TechniqueKind::Time),
+        "inline `|| pg_sleep` finding must survive the --confirm second pass, got {findings:?}"
+    );
+}
+
 /// Backend where the sleep family is filtered at the WAF (every
 /// `SLEEP`/`pg_sleep`/`WAITFOR`/`DBMS_PIPE`/`BENCHMARK` probe stays fast)
 /// but heavy-query payloads burn CPU: `generate_series` / `sysobjects` /
@@ -155,6 +182,33 @@ async fn heavy_query_time_detected_when_sleep_filtered() {
             .iter()
             .any(|f| f.technique == injekt::session::state::TechniqueKind::Time),
         "heavy-query backend must be detected via heavy variants, got {findings:?}"
+    );
+}
+
+/// Same heavy-query backend as [`heavy_query_time_detected_when_sleep_filtered`],
+/// but with `--confirm`: the heavy variant (4th of the postgres family) must be
+/// re-probed by the second pass — the old head-of-list window dropped it.
+#[tokio::test]
+async fn heavy_query_time_survives_confirm_second_pass() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(heavy_only_responder)
+        .mount(&server)
+        .await;
+
+    let mut cfg = time_config();
+    cfg.budget.level = 3;
+    cfg.confirm = true;
+    cfg.no_mutation = true;
+    let engine = Engine::new(cfg, test_client(), CancellationToken::new());
+    let target = format!("{}/?id=1", server.uri());
+    let _ = engine.run(&target).await.expect("engine run");
+    let findings = engine.state_handle().read().await.findings().to_vec();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.technique == injekt::session::state::TechniqueKind::Time),
+        "heavy-query finding must survive the --confirm second pass, got {findings:?}"
     );
 }
 

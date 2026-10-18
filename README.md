@@ -30,13 +30,13 @@
 - **Targets**: strict URL parsing (`url` crate), private/loopback anti-SSRF rejection, Burp/ZAP raw-request parser, `ParameterLocation{Query,Body,Header,Cookie}`, markers `*` / `§` / `{{}}`.
 - **HTTP** (`src/http/`): type-state builder (`timeout()` mandatory before `build()`), `Arc<reqwest::Client>` rustls, jitter, `RateLimiter` token-bucket, in-memory `CookieJar` (`zeroize`), `Identity` rotation, `ProxyConfig` Tor `socks5h://`, retry exponential + jitter, redirect policy, gzip/br.
 - **Detection** (`src/detection/`): 3-5 baselines → SHA-256 + mean/σ + WAF/CDN fingerprinting from status, headers, and challenge bodies; Levenshtein + Jaccard diff (`DiffResult{similarity,time_delta,confidence}`); reflected error-payload masking and TRUE/FALSE confirmation.
-- **Techniques** (`src/techniques/`): `boolean` (`OR 1=1` / `AND 1=1`, comment per DBMS), `time` (`SLEEP/pg_sleep/WAITFOR/BENCHMARK`, threshold `baseline+2σ`), `error` (`EXTRACTVALUE/CONVERT/CAST`), `union` (ORDER BY enumeration), `stacked` (`; SELECT` marker), `oob` (OPT-IN DNS/HTTP via `--oob-domain`, collaborator polling), `json` (dual-channel boolean + error over `JSON_EXTRACT`/`->>`/`JSON_VALUE`/`OPENJSON`/`JSON_EXISTS` per DBMS), `tamper` WAF evasion (`--tamper space2comment,randomcase,versionedcomment,versionedmorekeywords,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2plus/tab/newline/randomblank/dash/mssqlblank,betweencomment,randomcomments,equaltolike,space2paren,versionedfuzz,jsonunicodeescape,numericobfuscate,linecomment,base64encode(opt-in)` + presets `cloudflare-generic`/`aggressive` + auto `space2comment,randomcase` only on an active WAF block).
+- **Techniques** (`src/techniques/`): `boolean` (`OR 1=1` / `AND 1=1`, comment per DBMS), `time` (`SLEEP/pg_sleep/WAITFOR/BENCHMARK`, threshold `baseline+2σ`), `error` (`EXTRACTVALUE/CONVERT/CAST`), `union` (ORDER BY enumeration), `stacked` (`; SELECT` marker), `oob` (OPT-IN DNS/HTTP via `--oob-domain`, collaborator polling), `json` (dual-channel boolean + error over `JSON_EXTRACT`/`->>`/`JSON_VALUE`/`OPENJSON`/`JSON_EXISTS` per DBMS), `transit` (request-body Transit JSON / HoneySQL structured query-builder injection, opt-in), `tamper` WAF evasion (`--tamper space2comment,randomcase,versionedcomment,versionedmorekeywords,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2plus/tab/newline/randomblank/dash/mssqlblank,betweencomment,randomcomments,equaltolike,space2paren,versionedfuzz,jsonunicodeescape,numericobfuscate,linecomment,base64encode(opt-in)` + presets `cloudflare-generic`/`aggressive` + auto `space2comment,randomcase` only on an active WAF block).
 - **DBMS** (`src/dbms/`): trait `DbmsDetector` with native `async fn`, fingerprint for MySQL 8.x (`@@version`), Postgres 15+ (`version()`), MSSQL 2022 (`@@version`), Oracle 21c (`v$version`).
 - **Extraction** (`src/extraction/`): binary search ASCII 32-126, `buffer_unordered` bounded, verification (length + checksum), `SecretString` zeroized after report.
 - **Recon** (`src/recon/`): static crawler for links, forms, and basic JS endpoints; same-origin scope control, robots.txt support, candidate deduplication, and rate-limited scan/enumeration handoff.
 - **Session** (`src/session/`): `SessionState` RAM, `Scrubber` (`Authorization/Cookie/JWT/AKIA*/PEM` → `[REDACTED]`), encrypted export `XChaCha20-Poly1305` + `Argon2id` **OPT-IN**.
 - **Reporting** (`src/reporting/`): JSON + console (`owo-colors`, `tabled`, `indicatif`), evidence scrubbed.
-- **Engine** (`src/engine/orchestrator.rs`): state machine `parse → baseline → detection → fingerprint → extraction(opt-in)`, bounded concurrency, progress bars, structured `tracing`.
+- **Engine** (`src/engine/`): thin `Engine` façade `orchestrator.rs` + modular phases (pipeline, `detection/`, `confirm/`, `ai_suggest`, …): state machine `parse → baseline → detection → fingerprint → extraction(opt-in)`, bounded concurrency, progress bars, structured `tracing`.
 
 ---
 
@@ -186,7 +186,10 @@ absolute guarantee that the target is secure. `INCONCLUSIVE` means the run
 stopped early or the oracle was unusable (unstable/all-5xx baseline,
 `--request-budget` / `--max-duration` stop) — never read it as "not
 injectable". `--no-banner` disables only the
-startup banner. Colors are automatically disabled with `NO_COLOR`,
+startup banner. The wordmark rotates across every art bundled in
+`ascii_art.txt` (one random draw per run — deterministic under `--seed`);
+pin one with `INJEKT_BANNER_ART=<name>`, list them with
+`INJEKT_BANNER_ART=list`. Colors are automatically disabled with `NO_COLOR`,
 `TERM=dumb`, `CLICOLOR=0`, or when output is redirected.
 
 For machine-readable output, use `--output` with `--format` (`json`, `sarif`,
@@ -241,7 +244,7 @@ Options:
       --delay <MS>                Base retry delay, exponential backoff [default: 500]
       --rate-limit <RPS>          Token-bucket req/s [default: 10]
       --jitter <MEAN,STD>         Milliseconds, e.g. "750,250" [default: 750,250 — on even without the flag]
-      --techniques <LIST>         boolean,time,error,union,stacked,oob,json,nosql,all [default: all]
+      --techniques <LIST>         boolean,time,error,union,stacked,oob,json,nosql,transit,all [default: all]
       --fetch-using <MODE>        Force oracle: direct, boolean or time (narrows techniques)
       --tamper <LIST>             WAF tampers: space2comment,space2plus,space2tab,space2newline,space2randomblank,space2dash,space2mssqlblank,randomcase,versionedcomment,versionedmorekeywords,betweencomment,randomcomments,equaltolike,charencode,doubleurlencode,hexencode,unicodeencode,overlongutf8,space2paren,versionedfuzz,jsonunicodeescape,numericobfuscate,linecomment,base64encode(opt-in) [default: none, auto space2comment,randomcase on active WAF blocking]
       --hpp                       HTTP Parameter Pollution: duplicate ?id=1&id=PAYLOAD (Query/Body)
@@ -317,7 +320,8 @@ proxy = "socks5h://127.0.0.1:9050"
 
 Env: `INJEKT_PROFILE`, `INJEKT_CONFIG`, `INJEKT_THREADS`, `INJEKT_TIMEOUT`,
 `INJEKT_RETRIES`, `INJEKT_DELAY`, `INJEKT_RATE_LIMIT`, `INJEKT_JITTER`,
-`INJEKT_TECHNIQUES`, `INJEKT_LEVEL`, `INJEKT_PROXY`, `INJEKT_DBMS`, `INJEKT_TAMPER`.
+`INJEKT_TECHNIQUES`, `INJEKT_LEVEL`, `INJEKT_PROXY`, `INJEKT_DBMS`, `INJEKT_TAMPER`,
+`INJEKT_BANNER_ART` (startup art: name, `random` or `list`).
 
 ---
 
@@ -326,7 +330,7 @@ Env: `INJEKT_PROFILE`, `INJEKT_CONFIG`, `INJEKT_THREADS`, `INJEKT_TIMEOUT`,
 See [`docs/OPSEC.md`](docs/OPSEC.md) and [Full Documentation](DOCUMENTATION.md#opsec-features) — summary:
 
 - **No disk writes** unless `--export-encrypted`; `SessionState` is `Arc<RwLock<…>>` and `ZeroizeOnDrop`.
-- **Scrubber** (`src/session/scrubber.rs`): `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, JWT `eyJ…`, `AKIA[0-9A-Z]{16}`, PEM → `[REDACTED]` (tokens exacts `[REDACTED-JWT]`/`[REDACTED-AWS-KEY]`/`[REDACTED-PEM]`, hash 16-hex).
+- **Scrubber** (`src/session/scrubber/`): `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, JWT `eyJ…`, `AKIA[0-9A-Z]{16}`, PEM → `[REDACTED]` (tokens exacts `[REDACTED-JWT]`/`[REDACTED-AWS-KEY]`/`[REDACTED-PEM]`, hash 16-hex).
 - **Identity** (`src/http/identity.rs`): realistic UA pool (Chrome 126 / Firefox 128 / Safari 17.5) with matching `Sec-CH-UA`.
 - **Jitter** (`src/http/jitter.rs`): `rand_distr::Normal` in **milliseconds**, never regular cadence (default 750±250ms, floor 200ms — active even without `--jitter`).
 - **Rate limit**: token bucket, default **10 req/s** unless `--rate-limit` is set.
@@ -343,18 +347,25 @@ See [Full Documentation](DOCUMENTATION.md#architecture) for detailed module stru
 ```
 src/
 ├── main.rs / lib.rs
-├── cli/{args,profile,file_config,commands/{scan,recon,replay,info},output/{console,json,format}}
-├── target/{url,raw_request,parameters,markers}
-├── http/{client,identity,proxy,cookies,redirects,retry,jitter,rate_limit}
-├── detection/{baseline,response_diff,confirmation,scanner/{engine,scheduler}}
-├── techniques/{boolean,time,error,union,stacked,oob,json,nosql}/{detector,payloads} (+oob/verifier) + tamper (WAF evasion) + request_tamper (HPP/chunked)
-├── dbms/{common,mysql,postgres,mssql,oracle}/{fingerprint,payloads,queries}
+├── cli/{args,commands,output,plan,resolve}                    # plan/ + resolve/ = P3 splits
+├── target/{url,raw_request,parameters,markers,bulk,ingest,injection,structured}
+├── http/{client,cookies,identity,proxy,rate_limit,redirects,retry,jitter,timeouts}
+├── detection/{baseline,response_diff,confirmation,control_pair,waf,matcher,dynamic_content,scanner/{engine,scheduler}}
+├── techniques/{boolean,time,error,union,stacked,oob,json,nosql,transit,orm,graphql,elasticsearch}/{detector,payloads} + tamper + technique + request_tamper + payload_opts + reflection
+├── dbms/{common,context,mysql,postgres,mssql,sqlite,oracle}/{fingerprint,payloads,queries}
 ├── extraction/{engine,inference,verification}
-├── recon/{crawler,discovery,filters,parameter}
+├── recon/{crawler,discovery,filters,parameter,baseline_cache}
 ├── session/{state,scrubber,export}
-├── reporting/{console,json,evidence}
-└── engine/orchestrator
+├── mutation/{types,mutator,gate,apply} + generation/{builder,grammar}
+├── reasoning/{knowledge,hypothesis,trace}
+├── ai/{prompt,provider,validator}
+├── mcp/{server,tools}
+├── reporting/{console,json,evidence,verdict,sarif,junit,markdown,render,bulk}
+└── engine/{orchestrator,pipeline,baseline,detection,confirm,ai_suggest,enumerate,extraction,fingerprint,second_order,sql,fetch,schedule,config}
 ```
+
+Every module >500 lines is split into sub-directories with thin `mod.rs`
+re-exports (queue tracked in [`docs/REFACTOR_PLAN.md`](docs/REFACTOR_PLAN.md)).
 
 Key patterns: newtypes (`TargetUrl`, `Payload`), type-state builder, `#[non_exhaustive]`, `Cow`, `Arc` only when shared, exhaustive `match`, `const fn`, manual `Debug` for secrets, `#[deny(unsafe_code)]`.
 

@@ -50,6 +50,43 @@ fn length_guess(query: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
+/// Évalue la première comparaison entière `(\d+)=(\d+)` du query décodé.
+///
+/// P0.2 : les contrôles `r=r`/`r1=r2` tirent des entiers aléatoires ; un mock
+/// qui ne matche que les littéraux historiques (`1=2`) les verrait comme
+/// baseline et serait vété comme faux positif — ce mock évalue donc la
+/// logique comme un vrai oracle.
+fn eval_int_comparison(text: &str) -> Option<bool> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'=' {
+            i += 1;
+            continue;
+        }
+        let mut start = i;
+        while start > 0 && bytes[start - 1].is_ascii_digit() {
+            start -= 1;
+        }
+        let rhs_start = i + 1;
+        let mut end = rhs_start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if start < i
+            && end > rhs_start
+            && let (Ok(lhs), Ok(rhs)) = (
+                text[start..i].parse::<u64>(),
+                text[rhs_start..end].parse::<u64>(),
+            )
+        {
+            return Some(lhs == rhs);
+        }
+        i = rhs_start;
+    }
+    None
+}
+
 /// Backend with a working boolean differential but a dead extraction oracle:
 /// - `1=2` (false branch) renders a clearly different page,
 /// - `LENGTH(...)>=N` is stable with true length 5,
@@ -60,7 +97,10 @@ fn enum_responder(req: &wiremock::Request) -> ResponseTemplate {
     const BASE: &str = "welcome page id=1 normal content";
     const ALT: &str = "welcome page id=1 normal content EXTRA DIFFERENT SECONDARY PAGE VARIANT WITH LOTS OF EXTRA WORDS FOR DISSIMILARITY";
     let query = decoded_query(req);
-    let body = if query.contains("1=2") || query.contains("'1'='2'") || query.contains("ASCII(") {
+    let body = if eval_int_comparison(&query) == Some(false)
+        || query.contains("'1'='2'")
+        || query.contains("ASCII(")
+    {
         ALT
     } else if query.contains("LENGTH(") {
         if length_guess(&query).is_some_and(|n| n > 5) {

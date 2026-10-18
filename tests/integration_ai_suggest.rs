@@ -222,12 +222,35 @@ async fn ai_suggest_finds_via_anthropic() {
     assert_eq!(target_ai_probes(&target).await, 2);
 }
 
-/// Mock "flaky" : différentiel booléen sur les 6 premières sondes
-/// `1=1`/`1=2` (la détection L1 confirme via la 2e paire — le polyglotte ne
-/// matche pas ces motifs), puis page plate (le re-sondage `--confirm`
+/// Mock "flaky" : oracle booléen fidèle (la comparaison entière du payload
+/// est ÉVALUÉE — indispensable pour que les contrôles `r=r`/`r1=r2` de P0.2
+/// voient les deux branches, un matching textuel serait vété) sur les 8
+/// premières sondes arithmétiques, soit 6 de détection (`1=1`/`1=2` × 3
+/// essais) + 2 du contrôle P0.2 ; puis page plate (le re-sondage `--confirm`
 /// échoue → finding droppé → trigger `confirm_dropped`).
 fn flaky_counter() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
     std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0))
+}
+
+/// Première comparaison entière `(\d+)=(\d+)` du payload encodé dans l'URL :
+/// les chiffres ne sont jamais percent-encodés, il suffit de scanner de part
+/// et d'autre du premier `%3D` (aucun payload de ce test n'a d'espace autour
+/// du `=`).
+fn first_int_comparison(url: &str) -> Option<(u64, u64)> {
+    let (before, after) = url.split_once("%3D")?;
+    let lhs: String = before
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let rhs: String = after.chars().take_while(char::is_ascii_digit).collect();
+    if lhs.is_empty() || rhs.is_empty() {
+        return None;
+    }
+    Some((lhs.parse().ok()?, rhs.parse().ok()?))
 }
 
 #[tokio::test]
@@ -238,17 +261,16 @@ async fn ai_suggest_fires_after_confirm_drop() {
     let responder_counter = counter.clone();
     Mock::given(method("GET"))
         .respond_with(move |req: &wiremock::Request| {
-            let url = req.url.to_string();
-            let is_true = url.contains("1%3D1") || url.contains("%271%27%3D%271");
-            let is_false = url.contains("1%3D2") || url.contains("%271%27%3D%272");
-            if is_true || is_false {
-                let n = responder_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                if n <= 6 {
-                    if is_false {
-                        return ResponseTemplate::new(200).set_body_string(ALT_BODY);
-                    }
-                    return ResponseTemplate::new(200).set_body_string(BASELINE_BODY);
-                }
+            let Some((lhs, rhs)) = first_int_comparison(req.url.as_str()) else {
+                // Payload sans arithmétique entière (polyglotte, `'a'='b`) :
+                // pas de différentiel, sans consommer la fenêtre flaky.
+                return ResponseTemplate::new(200).set_body_string(BASELINE_BODY);
+            };
+            let n = responder_counter.fetch_add(1, Ordering::SeqCst) + 1;
+            // 8 = 6 sondes de détection + 2 du contrôle P0.2 ; au-delà, page
+            // plate.
+            if n <= 8 && lhs != rhs {
+                return ResponseTemplate::new(200).set_body_string(ALT_BODY);
             }
             ResponseTemplate::new(200).set_body_string(BASELINE_BODY)
         })
