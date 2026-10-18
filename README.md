@@ -36,7 +36,7 @@
 - **Recon** (`src/recon/`): static crawler for links, forms, and basic JS endpoints; same-origin scope control, robots.txt support, candidate deduplication, and rate-limited scan/enumeration handoff.
 - **Session** (`src/session/`): `SessionState` RAM, `Scrubber` (`Authorization/Cookie/JWT/AKIA*/PEM` → `[REDACTED]`), encrypted export `XChaCha20-Poly1305` + `Argon2id` **OPT-IN**.
 - **Reporting** (`src/reporting/`): JSON + console (`owo-colors`, `tabled`, `indicatif`), evidence scrubbed.
-- **Engine** (`src/engine/orchestrator.rs`): state machine `parse → baseline → detection → fingerprint → extraction(opt-in)`, bounded concurrency, progress bars, structured `tracing`.
+- **Engine** (`src/engine/`): thin `Engine` façade `orchestrator.rs` + modular phases (pipeline, `detection/`, `confirm/`, `ai_suggest`, …): state machine `parse → baseline → detection → fingerprint → extraction(opt-in)`, bounded concurrency, progress bars, structured `tracing`.
 
 ---
 
@@ -330,7 +330,7 @@ Env: `INJEKT_PROFILE`, `INJEKT_CONFIG`, `INJEKT_THREADS`, `INJEKT_TIMEOUT`,
 See [`docs/OPSEC.md`](docs/OPSEC.md) and [Full Documentation](DOCUMENTATION.md#opsec-features) — summary:
 
 - **No disk writes** unless `--export-encrypted`; `SessionState` is `Arc<RwLock<…>>` and `ZeroizeOnDrop`.
-- **Scrubber** (`src/session/scrubber.rs`): `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, JWT `eyJ…`, `AKIA[0-9A-Z]{16}`, PEM → `[REDACTED]` (tokens exacts `[REDACTED-JWT]`/`[REDACTED-AWS-KEY]`/`[REDACTED-PEM]`, hash 16-hex).
+- **Scrubber** (`src/session/scrubber/`): `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, JWT `eyJ…`, `AKIA[0-9A-Z]{16}`, PEM → `[REDACTED]` (tokens exacts `[REDACTED-JWT]`/`[REDACTED-AWS-KEY]`/`[REDACTED-PEM]`, hash 16-hex).
 - **Identity** (`src/http/identity.rs`): realistic UA pool (Chrome 126 / Firefox 128 / Safari 17.5) with matching `Sec-CH-UA`.
 - **Jitter** (`src/http/jitter.rs`): `rand_distr::Normal` in **milliseconds**, never regular cadence (default 750±250ms, floor 200ms — active even without `--jitter`).
 - **Rate limit**: token bucket, default **10 req/s** unless `--rate-limit` is set.
@@ -347,18 +347,25 @@ See [Full Documentation](DOCUMENTATION.md#architecture) for detailed module stru
 ```
 src/
 ├── main.rs / lib.rs
-├── cli/{args,profile,file_config,commands/{scan,recon,replay,info},output/{console,json,format}}
-├── target/{url,raw_request,parameters,markers}
-├── http/{client,identity,proxy,cookies,redirects,retry,jitter,rate_limit}
-├── detection/{baseline,response_diff,confirmation,scanner/{engine,scheduler}}
-├── techniques/{boolean,time,error,union,stacked,oob,json,nosql}/{detector,payloads} (+oob/verifier) + tamper (WAF evasion) + request_tamper (HPP/chunked)
-├── dbms/{common,mysql,postgres,mssql,oracle}/{fingerprint,payloads,queries}
+├── cli/{args,commands,output,plan,resolve}                    # plan/ + resolve/ = P3 splits
+├── target/{url,raw_request,parameters,markers,bulk,ingest,injection,structured}
+├── http/{client,cookies,identity,proxy,rate_limit,redirects,retry,jitter,timeouts}
+├── detection/{baseline,response_diff,confirmation,control_pair,waf,matcher,dynamic_content,scanner/{engine,scheduler}}
+├── techniques/{boolean,time,error,union,stacked,oob,json,nosql,transit,orm,graphql,elasticsearch}/{detector,payloads} + tamper + technique + request_tamper + payload_opts + reflection
+├── dbms/{common,context,mysql,postgres,mssql,sqlite,oracle}/{fingerprint,payloads,queries}
 ├── extraction/{engine,inference,verification}
-├── recon/{crawler,discovery,filters,parameter}
+├── recon/{crawler,discovery,filters,parameter,baseline_cache}
 ├── session/{state,scrubber,export}
-├── reporting/{console,json,evidence}
-└── engine/orchestrator
+├── mutation/{types,mutator,gate,apply} + generation/{builder,grammar}
+├── reasoning/{knowledge,hypothesis,trace}
+├── ai/{prompt,provider,validator}
+├── mcp/{server,tools}
+├── reporting/{console,json,evidence,verdict,sarif,junit,markdown,render,bulk}
+└── engine/{orchestrator,pipeline,baseline,detection,confirm,ai_suggest,enumerate,extraction,fingerprint,second_order,sql,fetch,schedule,config}
 ```
+
+Every module >500 lines is split into sub-directories with thin `mod.rs`
+re-exports (queue tracked in [`docs/REFACTOR_PLAN.md`](docs/REFACTOR_PLAN.md)).
 
 Key patterns: newtypes (`TargetUrl`, `Payload`), type-state builder, `#[non_exhaustive]`, `Cow`, `Arc` only when shared, exhaustive `match`, `const fn`, manual `Debug` for secrets, `#[deny(unsafe_code)]`.
 

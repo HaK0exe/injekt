@@ -292,7 +292,7 @@ proxy = "socks5h://127.0.0.1:9050"
 Voir [`docs/OPSEC.md`](docs/OPSEC.md) — résumé :
 
 - **Aucune écriture disque** sans `--export-encrypted` ; `SessionState` est `Arc<RwLock<…>>` et `ZeroizeOnDrop`.
-- **Scrubber** (`src/session/scrubber.rs`) : `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, JWT `eyJ…`, `AKIA[0-9A-Z]{16}`, PEM → `[REDACTED]` ou hash 16-hex.
+- **Scrubber** (`src/session/scrubber/`) : `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, JWT `eyJ…`, `AKIA[0-9A-Z]{16}`, PEM → `[REDACTED]` ou hash 16-hex.
 - **Identité** (`src/http/identity.rs`) : pool UA réaliste (Chrome 126 / Firefox 128 / Safari 17.5) avec `Sec-CH-UA` cohérent.
 - **Jitter** (`src/http/jitter.rs`) : `rand_distr::Normal` en **millisecondes**, jamais de cadence fixe (défaut 750±250ms, plancher 200ms — actif même sans `--jitter`).
 - **Rate limit** : token bucket, défaut **10 req/s** sauf `--rate-limit` explicite.
@@ -307,18 +307,25 @@ Voir [`docs/OPSEC.md`](docs/OPSEC.md) — résumé :
 ```
 src/
 ├── main.rs / lib.rs
-├── cli/{args,profile,file_config,commands/{scan,recon,replay,info},output/{console,json,format}}
-├── target/{url,raw_request,parameters,markers}
-├── http/{client,identity,proxy,cookies,redirects,retry,jitter,rate_limit}
-├── detection/{baseline,response_diff,confirmation,scanner/{engine,scheduler}}
-├── techniques/{boolean,time,error,union,stacked,oob,json,nosql}/{detector,payloads} (+oob/verifier) + tamper (évasion WAF) + request_tamper (HPP/chunked)
-├── dbms/{common,mysql,postgres,mssql,oracle}/{fingerprint,payloads,queries}
+├── cli/{args,commands,output,plan,resolve}                    # plan/ + resolve/ = splits P3
+├── target/{url,raw_request,parameters,markers,bulk,ingest,injection,structured}
+├── http/{client,cookies,identity,proxy,rate_limit,redirects,retry,jitter,timeouts}
+├── detection/{baseline,response_diff,confirmation,control_pair,waf,matcher,dynamic_content,scanner/{engine,scheduler}}
+├── techniques/{boolean,time,error,union,stacked,oob,json,nosql,transit,orm,graphql,elasticsearch}/{detector,payloads} + tamper (évasion WAF) + technique + request_tamper + payload_opts + reflection
+├── dbms/{common,context,mysql,postgres,mssql,sqlite,oracle}/{fingerprint,payloads,queries}
 ├── extraction/{engine,inference,verification}
-├── recon/{crawler,discovery,filters,parameter}
+├── recon/{crawler,discovery,filters,parameter,baseline_cache}
 ├── session/{state,scrubber,export}
-├── reporting/{console,json,evidence}
-└── engine/orchestrator
+├── mutation/{types,mutator,gate,apply} + generation/{builder,grammar}
+├── reasoning/{knowledge,hypothesis,trace}
+├── ai/{prompt,provider,validator}
+├── mcp/{server,tools}
+├── reporting/{console,json,evidence,verdict,sarif,junit,markdown,render,bulk}
+└── engine/{orchestrator,pipeline,baseline,detection,confirm,ai_suggest,enumerate,extraction,fingerprint,second_order,sql,fetch,schedule,config}
 ```
+
+Tout module >500 lignes est découpé en sous-répertoires avec un `mod.rs`
+fin en re-exports (queue suivie dans [`docs/REFACTOR_PLAN.md`](docs/REFACTOR_PLAN.md)).
 
 Patterns clés : newtypes (`TargetUrl`, `Payload`), builder type-state, `#[non_exhaustive]`, `Cow`, `Arc` uniquement si partagé, `match` exhaustif, `const fn`, `Debug` manuel pour secrets, `#[deny(unsafe_code)]`.
 

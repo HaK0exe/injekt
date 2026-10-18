@@ -3,7 +3,7 @@
 ## Principes
 
 - **Zéro persistance** : `SessionState` en `Arc<RwLock<_>>` RAM, `ZeroizeOnDrop`, aucun fichier sauf `--export-encrypted` opt-in.
-- **Anonymisation** : `scrubber.rs` masque `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, JWT `eyJ...`, `AKIA*`, PEM. `[REDACTED]` ou hash 8 hex.
+- **Anonymisation** : `src/session/scrubber/` masque `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, JWT `eyJ...`, `AKIA*`, PEM. `[REDACTED]` ou hash 8 hex.
 
 ## Réseau
 
