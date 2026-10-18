@@ -132,3 +132,24 @@ fn markers_positions_consistent() {
     let pos = m.positions(s);
     assert_ne!(pos, [] as [(usize, InjectionMarker); 0]);
 }
+
+proptest! {
+    #[test]
+    fn anti_ssrf_noncanonical_private_forms_rejected(idx in 0usize..6) {
+        let forms = ["2130706433", "0x7f.0.0.1", "0177.0.0.1", "127.1", "0.0.0.0", "10.0.0.1"];
+        let input = forms[idx % forms.len()];
+        let res = TargetUrl::parse(input, false);
+        prop_assert!(res.is_err(), "expected rejection for {input}: {res:?}");
+    }
+
+    #[test]
+    fn anti_ssrf_ipv6_mapped_or_loopback_rejected(idx in 0usize..4) {
+        let forms = ["[::ffff:127.0.0.1]", "[::1]", "::1", "::ffff:10.0.0.1"];
+        let input = forms[idx % forms.len()];
+        // bare IPv6 without brackets may not parse as URL; accept either parse-error or rejection.
+        let res = TargetUrl::parse(input, false);
+        if res.is_ok() {
+            prop_assert!(false, "expected rejection for {input}");
+        }
+    }
+}
