@@ -3,6 +3,12 @@
     "count_403",
     "count_429"
   ],
+  "diagnostic": [
+    "cause",
+    "evidence",
+    "suggestion",
+    "why"
+  ],
   "evidence": [
     "confidence",
     "parameter",
@@ -39,6 +45,7 @@
   ],
   "report_top_level": [
     "detectability",
+    "diagnostic",
     "evidences",
     "extracted",
     "findings",

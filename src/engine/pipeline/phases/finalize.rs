@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::engine::diagnostics::{DiagSignals, Diagnostic};
 use crate::engine::pipeline::helpers::absorb_detectability;
 use crate::{
     engine::{
@@ -59,6 +60,33 @@ pub(crate) async fn finalize_run(
         }
     } else if cancel.is_cancelled() {
         current = EngineState::Cancelled;
+    }
+    // C14 : le tail est le troisième point de dégradation (`run_baseline_phase`
+    // court-circuite `finalize_run` sur ses retours précoces, donc un seul
+    // diagnostic est posé par run). Dérivation uniquement sur une
+    // dégradation `INCONCLUSIVE` : un run Done/CLEAN n'est jamais
+    // "inconclusive" même avec des sauts 403/429 isolés comptés en route.
+    if current == EngineState::Inconclusive {
+        let diagnostic = Diagnostic::derive(&DiagSignals {
+            // `baseline_unreachable` (all-5xx baseline) est exactement le
+            // signal `baseline_all_error` de la table pure — même provenance
+            // (`baseline_all_error(&statuses)`) que le nom local du pipeline.
+            baseline_all_error: baseline_unreachable,
+            count_403: detectability.count_403,
+            count_429: detectability.count_429,
+            over_request_budget: BudgetConfig::is_over_request_budget(
+                requests,
+                config.budget.request_budget,
+            ),
+            duration_expired: BudgetConfig::is_over_max_duration(
+                detection_started,
+                config.budget.max_duration_secs,
+            ),
+            cancelled: cancel.is_cancelled(),
+            argv: config.argv.to_vec(),
+            ..DiagSignals::default()
+        });
+        state.write().await.set_inconclusive_cause(diagnostic);
     }
     let total_elapsed = run_started.elapsed().as_secs_f64();
     // Findings per technique for the one-line summary (e.g. `boolean×1,

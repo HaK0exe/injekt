@@ -22,6 +22,7 @@
 use clap::{CommandFactory, Parser};
 use injekt::{
     cli::args::{Cli, ReportFormat},
+    engine::diagnostics::{DiagSignals, Diagnostic},
     reporting::{
         evidence::Evidence,
         json::{JsonReport, ReportMeta},
@@ -191,6 +192,15 @@ fn report_schema_value() -> serde_json::Value {
     .with_false_positive_prob(0.02)
     .with_timestamp(fixed_timestamp());
     let evidence = Evidence::new("req", "resp", "boolean", "id@query", 0.95);
+    // C14 : un rapport SCHÉMA-COMPLET (diagnostic `INCONCLUSIVE` attaché —
+    // clé absente quand `None`, voir `skip_serializing_if`) ; la variation
+    // porte sur la forme des 4 clés fixes, pas sur les valeurs (`argv` test
+    // sans cible réelle). `DiagSignals` est `#[non_exhaustive]` :
+    // `Default::default()` + mutation de champs pub (pas de struct-update).
+    let mut signals = DiagSignals::default();
+    signals.unstable_statuses = vec![200, 403, 500];
+    signals.argv = vec!["--target".to_owned(), "https://example.com/".to_owned()];
+    let diagnostic = Diagnostic::derive(&signals).expect("unstable baseline derives");
     let report = JsonReport::new(
         "https://example.com/?id=1",
         vec![finding],
@@ -198,12 +208,20 @@ fn report_schema_value() -> serde_json::Value {
         vec![],
         42,
         ReportMeta::default(),
-    );
+    )
+    .with_diagnostic(Some(diagnostic));
     let value = serde_json::to_value(&report).expect("report serializes");
     let finding_value =
         serde_json::to_value(report.findings[0].clone()).expect("finding serializes");
     let evidence_value =
         serde_json::to_value(report.evidences[0].clone()).expect("evidence serializes");
+    let diagnostic_value = serde_json::to_value(
+        report
+            .diagnostic
+            .as_ref()
+            .expect("freeze carries the C14 diagnostic"),
+    )
+    .expect("diagnostic serializes");
     serde_json::json!({
         "report_top_level": sorted_keys(&value),
         "finding": sorted_keys(&finding_value),
@@ -212,6 +230,7 @@ fn report_schema_value() -> serde_json::Value {
         "finding_waf": sorted_keys(&finding_value["waf"]),
         "evidence": sorted_keys(&evidence_value),
         "detectability": sorted_keys(&value["detectability"]),
+        "diagnostic": sorted_keys(&diagnostic_value),
     })
 }
 #[test]

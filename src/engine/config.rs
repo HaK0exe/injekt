@@ -2,6 +2,7 @@
 
 use crate::{reasoning::knowledge::KnowledgeStore, target::raw_request::RawRequest};
 use tracing::warn;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -244,6 +245,14 @@ pub struct EngineConfig {
     /// `mode == Off` (défaut) = listes historiques, chemin byte-identical.
     /// Config RAM-only, aucun secret.
     pub generative: crate::generation::GenerativeConfig,
+    /// C14 — argv original capturé dans `main` (nom du binaire exclu), matière
+    /// du patch de suggestion `INCONCLUSIVE` ([`crate::engine::diagnostics`]).
+    /// RAM-only : `Zeroizing` remet les tokens à zéro au drop ; `Debug` de
+    /// `Zeroizing` ne rend **jamais** les tokens (l'argv peut porter des
+    /// secrets : tokens d'URL, `--cookies`, `--api-key`), l'affichage passe
+    /// exclusivement par `Scrubber::scrub`. Vide (MCP, tests, constructions
+    /// programmatiques) ⇒ la dérivation propose `suggestion: None`.
+    pub argv: Zeroizing<Vec<String>>,
 }
 
 impl EngineConfig {
@@ -288,6 +297,7 @@ impl Default for EngineConfig {
             knowledge: None,
             ai: crate::ai::AiSuggestConfig::default(),
             generative: crate::generation::GenerativeConfig::default(),
+            argv: Zeroizing::new(Vec::new()),
         }
     }
 }

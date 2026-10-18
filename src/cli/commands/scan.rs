@@ -69,6 +69,10 @@ pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult
     let extracted = s.extracted_exposed();
     let count = s.request_count();
     let detectability = s.detectability();
+    // C14 : diagnostic `INCONCLUSIVE` posé par le pipeline (max 1/run) —
+    // cloné avant `drop`, encore **non scrubbé** en mémoire ; le scrub
+    // n'arrive qu'à la sérialisation (`scrubbed()` ci-dessous).
+    let diagnostic = s.inconclusive_cause().cloned();
     drop(s);
 
     let scrubber = Scrubber::new(cfg.no_redact);
@@ -86,6 +90,7 @@ pub async fn run_scan(cli: &Cli, cancel: CancellationToken) -> Result<ScanResult
     );
     let report = JsonReport::new(target.clone(), findings, vec![], extracted, count, meta)
         .with_detectability(detectability)
+        .with_diagnostic(diagnostic)
         .scrubbed(&scrubber);
 
     // C13 post-run (opt-in uniquement) : fusion des compteurs anonymes puis
@@ -315,12 +320,23 @@ pub async fn run(cli: &Cli, args: &ScanArgs, cancel: CancellationToken) -> Resul
         "scan finished"
     );
 
+    // C14 : suggestion `INCONCLUSIVE` éventuelle — le report est déjà
+    // scrubbé (`run_scan`), donc la suggestion ici est sûre pour stdout.
+    // `None` pour CLEAN/FINDINGS/CANCELLED (et run sans diagnostic) : la
+    // ligne n'est jamais imprimée hors `INCONCLUSIVE`.
+    let suggestion = result
+        .report
+        .diagnostic
+        .as_ref()
+        .and_then(|d| d.suggestion.as_deref());
+
     console::print_run_summary(
         &result.target,
         &state,
         result.report.request_count,
         started.elapsed(),
         result.report.findings.len(),
+        suggestion,
         &scrubber,
     );
     console::print_findings(&result.report.findings, &scrubber);

@@ -35,7 +35,16 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // C14 : capture de l'argv original (nom du binaire exclu) pour le patch
+    // de suggestion `INCONCLUSIVE`. `args_os` + `to_string_lossy` (aucun
+    // panique possible : un argv non-UTF8 échoue déjà dans `Cli::parse`) ;
+    // RAM-only — remonté dans `EngineConfig::argv` (`Zeroizing`, Debug
+    // masqué), aucune persistance.
+    cli.captured_argv = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     if matches!(cli.command, Some(Commands::Mcp(_))) {
         return injekt::mcp::server::run_mcp().await;
     }

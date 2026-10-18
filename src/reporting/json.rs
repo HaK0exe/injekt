@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 use crate::{
+    engine::diagnostics::Diagnostic,
     reporting::evidence::Evidence,
     session::{
         scrubber::Scrubber,
@@ -32,6 +33,13 @@ pub struct JsonReport {
     /// additive — existing readers (`request_count`, `findings`) are unaffected.
     #[serde(flatten)]
     pub meta: ReportMeta,
+    /// C14 — diagnostic `INCONCLUSIVE` éventuel (cause figée + preuve +
+    /// suggestion argv déjà scrubbée + why). `None` = run complet/clean :
+    /// `skip_serializing_if` conserve **byte-identique** la forme historique
+    /// du rapport (aucun consommateur pré-C14 ne voit une clé nouvelle),
+    /// `#[serde(default)]` garde la désérialisation tolérante.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<Diagnostic>,
 }
 
 /// Provenance + effective run configuration attached to every [`JsonReport`].
@@ -124,6 +132,7 @@ impl JsonReport {
             request_count,
             detectability: Detectability::default(),
             meta,
+            diagnostic: None,
         }
     }
 
@@ -131,6 +140,14 @@ impl JsonReport {
     #[must_use]
     pub fn with_detectability(mut self, detectability: Detectability) -> Self {
         self.detectability = detectability;
+        self
+    }
+
+    /// Attach the run's `INCONCLUSIVE` diagnostic (C14). `None` (run
+    /// complet/clean) est un no-op explicite.
+    #[must_use]
+    pub fn with_diagnostic(mut self, diagnostic: Option<Diagnostic>) -> Self {
+        self.diagnostic = diagnostic;
         self
     }
 
@@ -151,6 +168,9 @@ impl JsonReport {
             request_count: self.request_count,
             detectability: self.detectability,
             meta: self.meta.clone(),
+            // C14 : la suggestion porte l'argv original (tokens possiblement
+            // secrets) — scrub au moment de la sortie, jamais en interne.
+            diagnostic: self.diagnostic.as_ref().map(|d| d.scrubbed(scrubber)),
         }
     }
 
@@ -225,5 +245,89 @@ mod tests {
             serde_json::from_str(&report.to_json(&Scrubber::new(false))).expect("valid json");
         assert_eq!(value["detectability"]["count_403"], 2);
         assert_eq!(value["detectability"]["count_429"], 3);
+    }
+
+    #[test]
+    fn report_without_diagnostic_stays_byte_identical() {
+        // C14 : aucun diagnostic ⇒ aucune clé nouvelle (consommateurs
+        // pré-C14 byte-identiques).
+        let report = JsonReport::new(
+            "https://example.com/?id=1",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            1,
+            ReportMeta::default(),
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&report.to_json(&Scrubber::new(false))).expect("valid json");
+        assert!(value.get("diagnostic").is_none(), "{}", value);
+    }
+
+    #[test]
+    fn report_scrubs_the_attached_diagnostic() {
+        let diag = Diagnostic::derive(&crate::engine::diagnostics::DiagSignals {
+            count_429: 9,
+            argv: vec![
+                "--target".to_owned(),
+                "https://lab.tld/?id=1&token=abcd".to_owned(),
+            ],
+            ..crate::engine::diagnostics::DiagSignals::default()
+        })
+        .expect("rate limited derives");
+        let report = JsonReport::new(
+            "https://example.com/?id=1",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            1,
+            ReportMeta::default(),
+        )
+        .with_diagnostic(Some(diag));
+        let scrubbed = report.scrubbed(&Scrubber::new(false));
+        let suggestion = scrubbed
+            .diagnostic
+            .as_ref()
+            .and_then(|d| d.suggestion.clone())
+            .expect("suggestion present");
+        assert!(
+            !suggestion.contains("abcd"),
+            "raw token in scrubbed report: {suggestion}"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&scrubbed.to_json(&Scrubber::new(false))).expect("valid json");
+        assert_eq!(value["diagnostic"]["cause"], "RateLimited");
+        assert!(
+            !value["diagnostic"]["suggestion"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("abcd"),
+            "raw token serialized: {}",
+            value["diagnostic"]
+        );
+    }
+
+    #[test]
+    fn report_serializes_diagnostic_with_default_key_order() {
+        let diag = Diagnostic::derive(&crate::engine::diagnostics::DiagSignals {
+            over_request_budget: true,
+            argv: vec!["--target".to_owned(), "https://lab.tld/".to_owned()],
+            ..crate::engine::diagnostics::DiagSignals::default()
+        })
+        .expect("budget derives");
+        let report = JsonReport::new(
+            "https://example.com/?id=1",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            1,
+            ReportMeta::default(),
+        )
+        .with_diagnostic(Some(diag));
+        let value: serde_json::Value =
+            serde_json::from_str(&report.to_json(&Scrubber::new(false))).expect("valid json");
+        assert_eq!(value["diagnostic"]["cause"], "BudgetExhausted");
+        assert!(value["diagnostic"]["suggestion"].is_null());
+        assert!(value.get("diagnostic").is_some());
     }
 }

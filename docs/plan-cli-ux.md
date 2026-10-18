@@ -96,35 +96,44 @@ corrective rejouable : la documentation exécutable du tool.
 
 **Design**
 
-- [ ] `InconclusiveCause` (`#[non_exhaustive]`, match exhaustifs) :
+- [x] `InconclusiveCause` (`#[non_exhaustive]`, match exhaustifs) :
   `UnstableBaseline{statuses}` · `BaselineUnreachable` · `WafBlocked{count_403}` ·
   `RateLimited{count_429}` · `NetworkTimeout` · `BudgetExhausted` · `DurationExpired`
   (les deux derniers = info pure, sans suggestion).
-- [ ] `Diagnostic::derive(sig) -> Option<Diagnostic>` **pure et déterministe**, priorité
+- [x] `Diagnostic::derive(sig) -> Option<Diagnostic>` **pure et déterministe**, priorité
   stricte : unstable > unreachable > waf > rate > timeout > budget. Max 1/run.
-- [ ] Sources de la dérivation = ce que le tail de `run_internal` agrège déjà :
+- [x] Sources de la dérivation = ce que le tail de `run_internal` agrège déjà :
   `!baseline.is_stable()`, `baseline_all_error`, `BudgetConfig::is_over_request_budget
-  / is_over_max_duration`, `HttpClient::take_detectability_counts` (403/429),
+  / is_over_max_duration`, compteurs `403/429` drainés du client via
+  `SessionState::add_detectability`/`absorb_detectability` (limité : absent si
+  `shared_client` — recon scan) non `take_detectability_counts`,
   `cancel.is_cancelled()`.
-- [ ] Suggestion = patch appliqué à l'argv original puis `Scrubber::scrub`.
-  Mapping figé :
+- [x] Suggestion = patch appliqué à l'argv original puis `Scrubber::scrub`
+  (un flag n'est ajouté que s'il est absent de l'argv ; argv empty ⇒ `None`,
+  jamais de commande fabriquée sans cible). Mapping figé :
   - `UnstableBaseline` / `BaselineUnreachable` → `--fetch-using direct`
     (+ `--techniques time` si l'oracle booléen est indiscernable) ;
-  - `WafBlocked` → `--tamper space2comment,randomcase` (chaîne complète si blocage
-    persiste malgré les auto-tampers) ;
-  - `RateLimited` → `--ignore-code 429` + `--rate-limit 2` + jitter doublé ;
+  - `WafBlocked` → `--tamper space2comment,randomcase` (chaîne complète ; absent si
+    l'opérateur a déjà posé `--tamper` explicitement) ;
+  - `RateLimited` → `--ignore-code 429 --rate-limit 2` seulement si un des deux
+    flag est absent (doubler le jitter abandonné : le pacing vit déjà dans le
+    client, une suggestion ici ajouterait une seconde source de vérité sur le débit) ;
   - `NetworkTimeout` → « run `injekt doctor` » ;
   - `BudgetExhausted` / `DurationExpired` → pas de suggestion (info pure).
-- [ ] Affichage : une ligne `→ suggestion : <cmd scrubbée>` sous `INCONCLUSIVE`
-  dans `print_run_summary` ; champ `diagnostic: Option<{cause, evidence, suggestion, why}>`
-  dans `JsonReport` (bump `schema_version` + regen golden documentée).
+- [x] Affichage : une ligne `→ suggestion: <cmd scrubbée>` sous `INCONCLUSIVE`
+  dans `print_run_summary` (helper pur `suggestion_line`, testé) ; champ
+  `diagnostic: Option<{cause, evidence, suggestion, why}>` dans `JsonReport`
+  (pas de champ `schema_version` dans le crate : freeze = extension
+  `tests/golden/v1-report-schema.json` + regen délibérée documentée).
 
 **Tests**
 
-- [ ] 1 test unitaire **par variante** (suggestion == exactement la commande attendue).
-- [ ] Wiremock : baseline instable (5 / 5 diff → `UnstableBaseline`) et 429 répétés
-  (`RateLimited`) — la cause remonte bien au rapport.
-- [ ] Snapshot console ; regen `integration_freeze_v1` commentée dans le commit.
+- [x] 1 test unitaire **par variante** (suggestion == exactement la commande attendue).
+- [x] Wiremock : baseline instable (200/500/200 → `UnstableBaseline`) et 429 répétés
+  (`RateLimited`) — la cause remonte au rapport (intégration via `run_scan`) et au
+  chemin programme (`Engine::run`, suggestion `None` sans argv).
+- [x] Console : helper pur `suggestion_line` (exact) + smoke `print_run_summary` ;
+  regen `integration_freeze_v1` commentée dans le commit.
 
 **Acceptation** : démo wiremock `INCONCLUSIVE → suggestion` complète ; fmt/clippy/test
 verts ; aucune évolution du moteur de détection.
@@ -258,4 +267,20 @@ Exemple de diagnostic (JSON, champ optionnel — retro-compatible) :
 > Format : `> Progrès AAAA-MM-JJ (chantier étape): …` — mêmes conventions que
 > `docs/REFACTOR_PLAN.md`.
 
+- > Progrès 2026-10-19 (C14 done): moteur diagnostics `INCONCLUSIVE` câblé —
+  `src/engine/diagnostics.rs` (types purs : `InconclusiveCause`/`Diagnostic`/`DiagSignals`,
+  priorité figée, patch argv déterministe + `shell_quote`), dérivation aux 3 points de
+  dégradation du pipeline (`early.rs` budget pré-baseline + baseline instable /
+  `finalize.rs` tail), `SessionState::set_inconclusive_cause` (RAM-only, zeroized),
+  `EngineConfig.argv: Zeroizing<Vec<String>>` capturé dans `main` (`Cli::captured_argv`,
+  MCP ⇒ `None`), `JsonReport.diagnostic` optionnel (`skip_serializing_if` — rapport
+  sans diagnostic byte-identique), console `→ suggestion:` sous INCONCLUSIVE via
+  `print_run_summary`. Tests : 1/variante + priorités + scrub (unit), intégration
+  wiremock `integration_diagnostics.rs` (unstable via `run_scan` + scrub token,
+  429 répétés → `RateLimited`, engine sans argv ⇒ suggestion `None`), SessionState
+  tests. Limites documentées : `NetworkTimeout` tient la table sans producteur live
+  (client ne compte pas les timeouts), compteurs detectability absents si
+  `shared_client`, `cancel` ⇒ jamais de diagnostic. Gates fmt/clippy/test/doc/deny
+  verts ; regen golden `v1-report-schema.json` délibérée (clé `diagnostic`, revue
+  du diff : 4 clés fixes + top-level `diagnostic` quand attaché).
 - [aucun encore] Période : doc créé, C14 non démarré.

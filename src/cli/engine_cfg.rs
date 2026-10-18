@@ -164,5 +164,9 @@ pub fn build_engine_config(cli: &Cli, enum_gate: EnumGate) -> EngineConfig {
             cli.effective_generative_mode(),
             cli.effective_max_generated(),
         ),
+        // C14 : argv original (binaire exclu) capturé dans `main`, matière du
+        // patch de suggestion `INCONCLUSIVE`. `Zeroizing` = zéro persistance
+        // (remis à zéro au drop, Debug masqué).
+        argv: zeroize::Zeroizing::new(cli.captured_argv.clone()),
     }
 }

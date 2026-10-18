@@ -48,6 +48,11 @@ pub struct SessionState {
     /// Effective run seed (`--seed`), recorded for `--explain` / replay.
     /// `None` = historical OS-random behaviour.
     seed: Option<u64>,
+    /// C14 — diagnostic `INCONCLUSIVE` du run (max 1 : posé une seule fois au
+    /// point de dégradation du pipeline ; un set ultérieur écrase — moteur
+    /// réutilisé sur plusieurs candidates). RAM-only, zeroized on drop comme
+    /// le reste de la session ; la suggestion vit scrubbée en sortie.
+    inconclusive: Option<crate::engine::diagnostics::Diagnostic>,
 }
 
 impl Zeroize for SessionState {
@@ -98,6 +103,8 @@ impl Zeroize for SessionState {
         }
         self.ai_attempted.clear();
         self.seed = None;
+        self.inconclusive.zeroize();
+        self.inconclusive = None;
     }
 }
 
@@ -121,6 +128,10 @@ impl core::fmt::Debug for SessionState {
             .field("request_count", &self.request_count)
             .field("detectability", &self.detectability)
             .field("seed", &self.seed)
+            .field(
+                "inconclusive_cause",
+                &self.inconclusive.as_ref().map(|d| d.cause.code()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -140,12 +151,31 @@ impl SessionState {
             waf_hits: Vec::new(),
             ai_attempted: Vec::new(),
             seed: None,
+            inconclusive: None,
         }
     }
 
     /// Set the effective run seed (`--seed`) for `--explain` / replay.
     pub fn set_seed(&mut self, seed: Option<u64>) {
         self.seed = seed;
+    }
+
+    /// C14 : pose le diagnostic `INCONCLUSIVE` du run (RAM-only, diamant au
+    /// point de dégradation du pipeline — un seul set par run ; un appel
+    /// ultérieur remplace, moteur réutilisé sur plusieurs candidates).
+    /// Jamais écrit sur disque : la seule surface est le champ `diagnostic`
+    /// du `JsonReport`/résumé console au moment du résumé.
+    pub fn set_inconclusive_cause(
+        &mut self,
+        diagnostic: Option<crate::engine::diagnostics::Diagnostic>,
+    ) {
+        self.inconclusive = diagnostic;
+    }
+
+    /// Diagnostic `INCONCLUSIVE` du run (`None` = run complet/clean).
+    #[must_use]
+    pub fn inconclusive_cause(&self) -> Option<&crate::engine::diagnostics::Diagnostic> {
+        self.inconclusive.as_ref()
     }
 
     #[must_use]
@@ -385,6 +415,8 @@ impl SessionState {
         }
         self.ai_attempted.clear();
         self.seed = None;
+        self.inconclusive.zeroize();
+        self.inconclusive = None;
     }
 }
 
@@ -417,6 +449,7 @@ impl Clone for SessionState {
             waf_hits: self.waf_hits.clone(),
             ai_attempted: self.ai_attempted.clone(),
             seed: self.seed,
+            inconclusive: self.inconclusive.clone(),
         }
     }
 }
