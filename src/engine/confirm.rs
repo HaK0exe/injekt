@@ -623,7 +623,10 @@ pub(crate) async fn confirm_finding_second_pass(
     level: u8,
 ) -> bool {
     match finding.technique {
-        TechniqueKind::Boolean | TechniqueKind::Json | TechniqueKind::Nosql => {
+        TechniqueKind::Boolean
+        | TechniqueKind::Json
+        | TechniqueKind::Nosql
+        | TechniqueKind::Transit => {
             confirm_boolean_second_pass(
                 client,
                 state,

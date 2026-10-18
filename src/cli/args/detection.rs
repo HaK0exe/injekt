@@ -51,6 +51,7 @@ pub enum TechniqueOpt {
     Oob,
     Json,
     Nosql,
+    Transit,
     All,
 }
 

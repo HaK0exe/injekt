@@ -184,7 +184,8 @@ pub fn compute_calibrated_prior(
         TechniqueKind::Union
         | TechniqueKind::Stacked
         | TechniqueKind::Json
-        | TechniqueKind::Nosql => 0.05,
+        | TechniqueKind::Nosql
+        | TechniqueKind::Transit => 0.05,
         TechniqueKind::Oob => 0.02,
     };
 
@@ -196,6 +197,9 @@ pub fn compute_calibrated_prior(
             prior = 0.45;
         } else if technique == TechniqueKind::Nosql {
             // REST JSON bodies → MongoDB operators : second prioritaire.
+            prior = 0.30;
+        } else if technique == TechniqueKind::Transit {
+            // Transit/typed JSON bodies → HoneySQL shape injection.
             prior = 0.30;
         } else if technique == TechniqueKind::Stacked {
             prior *= 0.5;

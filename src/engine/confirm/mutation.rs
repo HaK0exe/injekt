@@ -47,6 +47,9 @@ pub(crate) fn mutation_base_payload(finding: &Finding) -> Option<String> {
         TechniqueKind::Nosql => crate::techniques::nosql::payloads::nosql_payloads()
             .first()
             .map(|p| p.true_payload.clone()),
+        TechniqueKind::Transit => crate::techniques::transit::payloads::transit_payloads()
+            .first()
+            .map(|p| p.body.clone()),
         TechniqueKind::Error => crate::techniques::error::payloads::error_payloads_for(label)
             .first()
             .map(|p| p.payload.clone()),
@@ -170,13 +173,17 @@ pub(crate) async fn mutate_and_trace(
         .cloned()
         .collect();
     let tampers_for_variant: &[Tamper] = match finding.technique {
-        TechniqueKind::Boolean | TechniqueKind::Json | TechniqueKind::Nosql => &boolean_safe,
+        TechniqueKind::Boolean
+        | TechniqueKind::Json
+        | TechniqueKind::Nosql
+        | TechniqueKind::Transit => &boolean_safe,
         _ => effective_tampers,
     };
     let class = match finding.technique {
-        TechniqueKind::Boolean | TechniqueKind::Json | TechniqueKind::Nosql => {
-            RequestClass::Boolean
-        }
+        TechniqueKind::Boolean
+        | TechniqueKind::Json
+        | TechniqueKind::Nosql
+        | TechniqueKind::Transit => RequestClass::Boolean,
         TechniqueKind::Time => RequestClass::Time,
         _ => RequestClass::Default,
     };
@@ -271,7 +278,10 @@ pub(crate) fn mutation_diff_signal(
     sent_payload: &str,
 ) -> f64 {
     match finding.technique {
-        TechniqueKind::Boolean | TechniqueKind::Json | TechniqueKind::Nosql => {
+        TechniqueKind::Boolean
+        | TechniqueKind::Json
+        | TechniqueKind::Nosql
+        | TechniqueKind::Transit => {
             crate::detection::response_diff::adaptive_similarity(baseline_body, body)
                 .clamp(0.0, 1.0)
         }

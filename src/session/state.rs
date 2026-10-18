@@ -17,6 +17,7 @@ pub enum TechniqueKind {
     Oob,
     Json,
     Nosql,
+    Transit,
 }
 
 impl core::fmt::Display for TechniqueKind {
@@ -30,6 +31,7 @@ impl core::fmt::Display for TechniqueKind {
             Self::Oob => write!(f, "oob"),
             Self::Json => write!(f, "json"),
             Self::Nosql => write!(f, "nosql"),
+            Self::Transit => write!(f, "transit"),
         }
     }
 }
@@ -95,6 +97,13 @@ impl Remediation {
                 "Reject MongoDB operators ($gt/$ne/$where/...) in client input; enforce a \
                  strict allow-list schema (deny unknown keys starting with `$`), never pass \
                  raw JSON bodies to the driver."
+                    .to_owned()
+            }
+            TechniqueKind::Transit => {
+                "Do not pass decoded client-controlled Transit/Clojure maps directly to \
+                 HoneySQL or another query builder. Coerce expected scalar inputs before \
+                 query construction, validate allow-listed keys/types, and reject unexpected \
+                 serialized structures."
                     .to_owned()
             }
             TechniqueKind::Oob => {

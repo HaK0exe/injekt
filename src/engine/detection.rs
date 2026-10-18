@@ -560,7 +560,7 @@ pub(crate) fn infer_signal_and_trials(
         TechniqueKind::Boolean | TechniqueKind::Error => (0.9, 1),
         TechniqueKind::Time | TechniqueKind::Stacked => (0.8, 1),
         TechniqueKind::Union => (0.85, 1),
-        TechniqueKind::Json | TechniqueKind::Nosql => {
+        TechniqueKind::Json | TechniqueKind::Nosql | TechniqueKind::Transit => {
             let boolean_channel = new_findings
                 .iter()
                 .any(|f| f.evidence.contains("channel=boolean"));
