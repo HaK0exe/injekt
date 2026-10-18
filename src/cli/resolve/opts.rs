@@ -3,7 +3,7 @@
 use crate::cli::args::Cli;
 
 impl Cli {
-    /// Assemble [`PayloadOpts`] from CLI flags. Unknown `--fetch-using`
+    /// Assemble [`crate::techniques::payload_opts::PayloadOpts`] from CLI flags. Unknown `--fetch-using`
     /// values warn + fall back to `Direct` (clap constrains choices anyway;
     /// manual/MCP constructions hit this path).
     #[must_use]

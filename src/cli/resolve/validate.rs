@@ -4,7 +4,7 @@ use crate::cli::args::Cli;
 
 impl Cli {
     /// Fail fast on an explicit `--config` path that cannot be read or parsed.
-    /// Auto-discovered files never fail (they warn in [`Self::file_snapshot`]).
+    /// Auto-discovered files never fail (they warn in `Self::file_snapshot`).
     ///
     /// # Errors
     /// Returns an error describing the invalid explicit config file.

@@ -163,7 +163,7 @@ pub struct DetectionOpts {
     /// When set, detection stops cooperatively once the shared
     /// `SessionState::request_count` reaches it: current technique finishes,
     /// no new technique starts (warn + clean `Done`, never an error, never
-    /// a new finding). Per-parameter [`RequestBudget`] is seeded with the
+    /// a new finding). Per-parameter [`crate::detection::scanner::scheduler::RequestBudget`] is seeded with the
     /// same value for scheduler visibility (`budget_total`), so the
     /// authoritative global check lives in the orchestrator (concurrent
     /// params may overshoot by one technique each).

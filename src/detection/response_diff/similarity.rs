@@ -9,7 +9,7 @@ const EARLY_EXIT_SIM: f64 = 0.5;
 
 /// Normalized Levenshtein similarity 0..1. Truncates inputs to 1024 chars
 /// and skips the O(n·m) DP when the length difference alone guarantees a
-/// similarity below [`EARLY_EXIT_SIM`].
+/// similarity below `EARLY_EXIT_SIM`.
 /// Bench noise (`request_id`/`generated_at`) is normalized first so direct
 /// callers get the same anti-noise behaviour as [`adaptive_similarity`].
 #[must_use]

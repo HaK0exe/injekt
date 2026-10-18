@@ -54,7 +54,7 @@ impl InferenceExtractor {
         Ok(Some(low as char))
     }
 
-    /// Infer string of known length via oracle per position. Oracle: (pos, guess) -> actual[pos] >= guess
+    /// Infer string of known length via oracle per position. Oracle: (pos, guess) -> `actual[pos]` >= guess
     ///
     /// # Errors
     /// Propagates any error returned by `oracle`.

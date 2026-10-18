@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 /// Build a synthetic raw request from `--data` so body params are preserved
 /// through baseline + injection (same path as `--raw-file`).
-/// Uses [`sniff_kind`] from `target::structured` for robust content-type
+/// Uses [`crate::target::structured::sniff_kind`] from `target::structured` for robust content-type
 /// detection: checks `Content-Type` first, then falls back to body shape
 /// (`{` → JSON, `<` → XML, else → urlencoded).
 #[must_use]

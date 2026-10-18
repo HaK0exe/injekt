@@ -5,7 +5,7 @@
 //! La liste historique (`boolean_payloads_for`, 22 paires) couvre déjà tous
 //! les prédicats en fence single-quote + `OR` : la valeur du générateur est
 //! le cross-produit **fences × logiques × commentaires**, ordonné par
-//! contexte inféré ([`InjectionContext`]) et dédupliqué contre l'historique
+//! contexte inféré ([`crate::dbms::context::InjectionContext`]) et dédupliqué contre l'historique
 //! par l'appelant (zéro requête redondante).
 //!
 //! Tout est pur et déterministe : aucun réseau, aucune aléa non seedée.

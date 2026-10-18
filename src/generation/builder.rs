@@ -85,7 +85,7 @@ pub fn candidate_label(
 /// - `mode` : `Conservative` = prédicats noyau, `Aggressive` = tous.
 /// - `max` : plafond (déjà clampé par l'appelant, `0..=MAX_GENERATED`).
 /// - `seed` : décalage de départ déterministe (`None` = OS-random).
-/// - `comment` : terminateur (voir [`comment_for`]).
+/// - `comment` : terminateur (voir [`crate::generation::grammar::comment_for`]).
 #[must_use]
 pub fn enumerate_candidates(
     context: &InjectionContext,

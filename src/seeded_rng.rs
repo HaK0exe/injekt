@@ -4,7 +4,7 @@
 //!
 //! [`make_rng`] is the single entry point for all *non-cryptographic*
 //! randomness (tampers, jitter, UA rotation, retry backoff): `Some(seed)` yields
-//! a deterministic [`StdRng`] via [`SeedableRng::seed_from_u64`], `None`
+//! a deterministic [`StdRng`] via [`rand::SeedableRng::seed_from_u64`], `None`
 //! preserves the historical nondeterministic behaviour via
 //! [`StdRng::from_os_rng`].
 //!
