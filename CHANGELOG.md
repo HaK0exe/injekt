@@ -22,6 +22,45 @@ Roadmap `docs/ROADMAP-v1.0.md` §v1.0-rc : rien de nouveau — geler, durcir, pr
 
 ### Added
 
+- **C15 — `injekt doctor`** (0 socket TCP, 0 fetch — vérifie la config
+  LOCALE, jamais la cible, jamais le réseau) : nouvelle sous-commande
+  `cli::commands::doctor`, early-branchée dans `main` comme le serveur MCP
+  (AVANT l'init tracing et le banner : stdout pur). Quatre checks purs
+  `fn check_*(…) -> CheckResult {level: Ok/Warn/Fail, line}` testés sans
+  réseau : (1) **config** — même boucle de candidats que `file_config::load`
+  (`--config` > `./injekt.toml` > `~/.config/injekt/config.toml`), résumé
+  une ligne (preset effectif + provenance, threads) ; fichier absent ⇒
+  `Warn` « défauts intégrés » et TOML cassé ⇒ `Fail` avec l'erreur
+  ligne/colonne du crate `toml` (écart volontaire vs runtime : le fichier
+  cassé y est ignoré en silence — le doctor tue la classe d'erreurs
+  silencieuse ; preset fichier inconnu ⇒ `Warn`) ; (2) **proxy** — valeur
+  via la résolution CLI>env>config existante, `ProxyConfig::parse` en
+  validation de schéma UNIQUEMENT (aucune connexion) : `socks5://` ⇒ `Fail`
+  avec le message `DnsLeak` existant («socks5 without remote DNS (socks5://)
+  leaks DNS — use socks5h://», jamais réécrit), `socks5h://`/http(s) ⇒ `Ok`,
+  absent ⇒ `Warn` opt-in ; userinfo `user:pass@` toujours redirigé (via
+  `redact_userinfo` passé `pub(crate)` puis le `Scrubber` standard) ; (3)
+  **cadence** — règle figée `1000/rate_limit ≥ jitter_mean − 2·jitter_std`
+  ⇒ cohérent, sinon `Warn` chiffré «cadence plus rapide que le jitter →
+  pattern détectable» + correction `--rate-limit ≤ 1000/floor` (Σ replié
+  ≥ 1.0 comme au runtime, lenience `jitter_from_str` conservée) ;
+  neutralité déterministe : rien d'explicite côté rate **et** pas de profil
+  ⇒ check neutre (le doctor ne redit pas les défauts) ; rate ≤ 0 ⇒ `Warn`
+  (clamp runtime `RateLimiter` 0.1 rps) ; (4) **ingestion** — stat lexical
+  `fs::metadata` des 5 sources (`--bulk-file/--raw-file/--raw-dir/
+  --openapi-file/--sitemap-file`, `--bulk-file -` = alias stdin) :
+  absent/illisible ⇒ `Fail` (le run échouerait à l'ingestion), type inversé
+  fichier↔dossier ⇒ `Warn`. Sortie : `✓ / ! / ✗` une ligne par check
+  (couleurs via la gate `stdout_colors_enabled` du repo ; `--no-redact`
+  respecté), exit `0` sans `✗`, `1` avec (mapping `main` — `run` de `main.rs`
+  retourne désormais `Result<ExitCode>` ; `NoTarget` → 2
+  inchangé ; `DoctorArgs` sans aucun flag, bras défensif `dispatch`).
+  Tests : 26 unitaires sans réseau + `tests/integration_doctor.rs` (7
+  tests, **aucun serveur wiremock**), dont un tripwire OPSEC end-to-end :
+  binaire réel + `TcpListener` OS jamais accepté — toute tentative de
+  connexion du doctor ferait échouer l'`accept → WouldBlock`. Freeze
+  surface : regen délibérée du golden `cli-flags.txt` (revue du diff :
+  exactement 1 entrée subcommand `doctor`, 0 flag nouveau).
 - **C14 — diagnostics `INCONCLUSIVE`** (zéro nouveau flag, zéro évolution du
   moteur de détection) : un run dégradé explique sa cause et propose le rejeu.
   `src/engine/diagnostics.rs` (types purs, 0 IO) : `InconclusiveCause`

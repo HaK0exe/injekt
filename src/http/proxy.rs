@@ -37,7 +37,9 @@ impl core::fmt::Debug for ProxyConfig {
 }
 
 /// `scheme://user:pass@host…` → `scheme://[REDACTED]@host…`. No `@` → as-is.
-fn redact_userinfo(url: &str) -> String {
+/// `pub(crate)` : réutilisé par `cli::commands::doctor` (C15) pour écho la
+/// valeur proxy sans jamais exposer les credentials.
+pub(crate) fn redact_userinfo(url: &str) -> String {
     let Some(at_idx) = url.find('@') else {
         return url.to_owned();
     };

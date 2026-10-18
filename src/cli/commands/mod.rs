@@ -2,6 +2,7 @@
 pub mod auto;
 pub mod bulk;
 pub mod common;
+pub mod doctor;
 pub mod info;
 pub mod recon;
 pub mod replay;
@@ -9,6 +10,7 @@ pub mod scaffold;
 pub mod scan;
 
 use crate::cli::args::{Cli, Commands};
+use std::process::ExitCode;
 use tokio_util::sync::CancellationToken;
 
 /// Unified command dispatch (P3): exhaustive match, no `dyn`.
@@ -38,6 +40,20 @@ pub async fn dispatch(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()>
         Some(Commands::Info(_)) => {
             info::run();
             Ok(())
+        }
+        Some(Commands::Doctor(_)) => {
+            // Early-branchée dans `main` avant l'init tracing (stdout pur +
+            // exit code) ; bras défensif pour les appelants programmatiques :
+            // le verdict exit devient une `Err`, le verdict `Fail` reste
+            // dans la sortie stdout.
+            match doctor::run(&cli).await {
+                Ok(ExitCode::SUCCESS) => Ok(()),
+                Ok(other) => Err(anyhow::anyhow!(
+                    "doctor: au moins une vérification est en échec (exit {other:?}, \
+                     voir la sortie stdout)"
+                )),
+                Err(e) => Err(e.context("doctor: vérifications locales")),
+            }
         }
         Some(Commands::Mcp(_)) => crate::mcp::server::run_mcp().await,
         None => fallback_bare_or_auto(&cli, cancel).await,

@@ -14,7 +14,7 @@ pub use evasion::EvasionOpts;
 pub use http::HttpOpts;
 pub use output::{OutputOpts, ReportFormat};
 pub use root::{
-    AutoArgs, Cli, Commands, CompletionsArgs, InfoArgs, InitArgs, ManArgs, McpArgs, ReconArgs,
-    ReconCommands, ReconCrawlArgs, ReconImportArgs, ReconScanArgs, ReplayArgs, ScanArgs,
+    AutoArgs, Cli, Commands, CompletionsArgs, DoctorArgs, InfoArgs, InitArgs, ManArgs, McpArgs,
+    ReconArgs, ReconCommands, ReconCrawlArgs, ReconImportArgs, ReconScanArgs, ReplayArgs, ScanArgs,
 };
 pub use target::TargetOpts;

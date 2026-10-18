@@ -16,7 +16,9 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
-        Ok(()) => ExitCode::SUCCESS,
+        // Un chemin peut désormais porter un code d'exit dédié (C15 :
+        // `doctor` → 0 sans `✗`, 1 avec `✗`) ; les autres restent `()`.
+        Ok(code) => code,
         Err(e) => {
             let usage = e.chain().any(|c| {
                 matches!(
@@ -34,7 +36,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<ExitCode> {
     let mut cli = Cli::parse();
     // C14 : capture de l'argv original (nom du binaire exclu) pour le patch
     // de suggestion `INCONCLUSIVE`. `args_os` + `to_string_lossy` (aucun
@@ -45,8 +47,15 @@ async fn run() -> anyhow::Result<()> {
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    if matches!(cli.command, Some(Commands::Doctor(_))) {
+        // C15 : `doctor` = stdout pur (aucune ligne tracing, pas de banner)
+        // — early-branch avant l'init tracing, comme le serveur MCP.
+        return injekt::cli::commands::doctor::run(&cli).await;
+    }
     if matches!(cli.command, Some(Commands::Mcp(_))) {
-        return injekt::mcp::server::run_mcp().await;
+        return injekt::mcp::server::run_mcp()
+            .await
+            .map(|()| ExitCode::SUCCESS);
     }
     let filter = if cli.verbose { "debug" } else { "info" };
     fmt()
@@ -67,5 +76,5 @@ async fn run() -> anyhow::Result<()> {
             c.cancel();
         }
     });
-    dispatch(cli, cancel).await
+    dispatch(cli, cancel).await.map(|()| ExitCode::SUCCESS)
 }
