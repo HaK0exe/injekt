@@ -36,9 +36,25 @@ jobs:
       - name: cargo check (locked)
         run: cargo check --all-targets --locked
 
+  deny:
+    name: cargo deny (licenses + advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  audit:
+    name: cargo audit (supply-chain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   test:
     name: build + test
-    needs: [lint, msrv]
+    needs: [lint, msrv, audit, deny]
     strategy:
       fail-fast: false
       matrix:
@@ -54,6 +70,8 @@ jobs:
         run: cargo build --all-targets
       - name: cargo test
         run: cargo test --all-targets -- --test-threads=4
+      - name: cargo test --doc
+        run: cargo test --doc
       - name: smoke test — binary runs, info command works
         shell: bash
         run: |

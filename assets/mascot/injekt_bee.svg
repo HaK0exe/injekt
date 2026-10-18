@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="760" viewBox="0 0 1000 760">
+ <defs>
+  <radialGradient id="gold"><stop stop-color="#fee4a1"/><stop offset=".43" stop-color="#cd9d40"/><stop offset=".8" stop-color="#825020"/><stop offset="1" stop-color="#201a15"/></radialGradient>
+  <radialGradient id="thorax"><stop stop-color="#f2d08b"/><stop offset=".4" stop-color="#b89460"/><stop offset=".78" stop-color="#4a443c"/><stop offset="1" stop-color="#101315"/></radialGradient>
+  <radialGradient id="face"><stop stop-color="#eed3a0"/><stop offset=".5" stop-color="#9f7d50"/><stop offset=".85" stop-color="#4c3b32"/><stop offset="1" stop-color="#17191c"/></radialGradient>
+  <linearGradient id="wing" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#e6f9ff" stop-opacity=".88"/><stop offset=".65" stop-color="#9db6c2" stop-opacity=".42"/><stop offset="1" stop-color="#f3fcff" stop-opacity=".55"/></linearGradient>
+  <clipPath id="belly"><ellipse cx="332" cy="415" rx="196" ry="105" transform="rotate(13 332 415)"/></clipPath>
+ </defs>
+ <rect width="1000" height="760" fill="#000000"/>
+ <!-- far-side wings -->
+ <path d="M534 326 Q418 228 340 113 Q315 61 342 50 Q444 56 522 175 L590 301Z" fill="url(#wing)" stroke="#e1eaf1" stroke-width="9"/>
+ <path d="M551 287 Q569 172 673 76 Q737 32 785 48 Q778 99 728 178 Q652 256 590 319Z" fill="url(#wing)" stroke="#edf3f5" stroke-width="8"/>
+ <g fill="none" stroke="#a5aeb5" stroke-width="4" opacity=".86">
+  <path d="M546 299 Q411 159 350 64 M524 224 Q418 163 348 125 M524 222 Q468 152 430 84"/>
+  <path d="M581 285 Q670 134 767 64 M642 190 Q684 158 750 129 M618 233 Q662 116 696 68"/>
+ </g>
+ <!-- rear stinger -->
+ <path d="M166 413 Q106 432 37 451 Q100 459 163 445Z" fill="#c1c2bc" stroke="#f1efdc" stroke-width="5"/>
+ <path d="M50 452 155 432" stroke="#363a3a" stroke-width="3"/>
+ <!-- rear abdomen -->
+ <ellipse cx="332" cy="415" rx="196" ry="105" transform="rotate(13 332 415)" fill="url(#gold)" stroke="#f2cf86" stroke-width="8"/>
+ <g clip-path="url(#belly)" transform="rotate(13 332 415)">
+  <path d="M180 300 220 298 247 542 198 540Z M277 296 326 297 343 536 293 535Z M382 297 436 297 430 544 380 544Z" fill="#101416" opacity=".93"/>
+  <path d="M177 322 206 313 221 523 190 521Z M279 320 299 317 309 513 288 508Z M384 322 408 319 405 515 382 517Z" fill="#24201a" opacity=".7"/>
+  <path d="M157 383 Q320 308 506 374" fill="none" stroke="#fff1bb" stroke-opacity=".48" stroke-width="12"/>
+  <path d="M143 418 Q332 374 511 444" fill="none" stroke="#342b21" stroke-opacity=".5" stroke-width="12"/>
+ </g>
+ <path d="M178 389 Q321 303 472 390" fill="none" stroke="#fff5d0" stroke-width="6" opacity=".5"/>
+ <!-- far legs -->
+ <g fill="none" stroke="#b3a58e" stroke-width="12" stroke-linejoin="round" stroke-linecap="round">
+  <path d="M457 431 409 516 357 601 327 619"/>
+  <path d="M501 443 491 536 467 632 426 652"/>
+ </g>
+ <g fill="none" stroke="#333b3b" stroke-width="5"><path d="M454 442 413 518 356 596 M498 447 490 536 464 628"/></g>
+ <!-- central thorax -->
+ <ellipse cx="554" cy="347" rx="126" ry="126" transform="rotate(-12 554 347)" fill="url(#thorax)" stroke="#f4e3bb" stroke-width="11"/>
+ <path d="M447 350 Q513 273 626 275 M456 387 Q559 443 659 344" fill="none" stroke="#161b1d" stroke-width="21" opacity=".75"/>
+ <path d="M459 310 Q515 229 606 254" fill="none" stroke="#f5e9c6" stroke-width="12" opacity=".7"/>
+ <g stroke="#dfd1af" opacity=".6" stroke-width="5">
+ <path d="M460 258 430 227 M470 246 461 207 M483 240 491 215 M611 249 645 219 M631 268 666 249 M442 409 408 440 M637 415 676 448"/>
+ </g>
+ <!-- near legs -->
+ <g fill="none" stroke="#d9c39d" stroke-width="14" stroke-linejoin="round" stroke-linecap="round">
+  <path d="M540 435 560 543 606 621 645 642"/>
+  <path d="M603 418 654 507 751 566 797 579"/>
+  <path d="M624 384 706 457 800 495 836 498"/>
+ </g>
+ <g fill="none" stroke="#262b2a" stroke-width="5"><path d="M540 442 561 538 607 617 M600 423 656 502 749 564 M626 391 706 459 802 492"/></g>
+ <!-- head connection -->
+ <path d="M646 323 Q680 291 699 300 Q702 360 671 397 L636 374Z" fill="#181b20" stroke="#c8b890" stroke-width="7"/>
+ <!-- head -->
+ <path d="M688 256 Q749 198 829 253 Q869 286 855 349 Q837 399 781 421 Q714 415 677 366 Q655 309 688 256Z" fill="url(#face)" stroke="#eee1c6" stroke-width="10"/>
+ <path d="M705 246 Q750 214 804 248" fill="none" stroke="#fff3ce" stroke-width="10" opacity=".72"/>
+ <!-- dark angular eye -->
+ <path d="M740 278 Q787 264 845 280 L813 320 Q778 326 749 313Z" fill="#090b0d" stroke="#ebe4d4" stroke-width="7"/>
+ <path d="M774 280 830 280 804 291 780 299Z" fill="#f6f8f1"/>
+ <path d="M817 312 837 304" stroke="#c9dce4" stroke-width="5"/>
+ <!-- mouth and mandible -->
+ <path d="M825 351 Q855 353 878 378 L855 385 Q833 383 822 364" fill="#17171b" stroke="#f1d5a2" stroke-width="6"/>
+ <path d="M786 386 Q823 431 855 414 Q847 443 809 451 Q778 438 769 407" fill="#292c2c" stroke="#e6ce9f" stroke-width="6"/>
+ <!-- antennae -->
+ <path d="M729 242 Q713 164 748 120 L802 91 M786 239 Q801 157 849 125 L904 113" fill="none" stroke="#e4dcc6" stroke-width="9" stroke-linecap="square"/>
+ <path d="M802 91 814 92 M904 113 916 115" fill="none" stroke="#faf0da" stroke-width="6"/>
+ <!-- small highlights -->
+ <g fill="#fff5d8" opacity=".74"><circle cx="692" cy="269" r="5"/><circle cx="662" cy="319" r="4"/><circle cx="596" cy="263" r="5"/><circle cx="518" cy="260" r="6"/></g>
+</svg>
