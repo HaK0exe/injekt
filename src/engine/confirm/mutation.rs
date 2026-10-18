@@ -50,6 +50,12 @@ pub(crate) fn mutation_base_payload(finding: &Finding) -> Option<String> {
         TechniqueKind::Transit => crate::techniques::transit::payloads::transit_payloads()
             .first()
             .map(|p| p.body.clone()),
+        TechniqueKind::Orm => crate::techniques::orm::payloads::orm_payloads(None)
+            .first()
+            .map(|p| p.true_payload.clone()),
+        TechniqueKind::Graphql => crate::techniques::json::payloads::graphql_probes_for(None)
+            .first()
+            .map(|p| p.true_payload.clone()),
         TechniqueKind::Error => crate::techniques::error::payloads::error_payloads_for(label)
             .first()
             .map(|p| p.payload.clone()),
@@ -176,14 +182,17 @@ pub(crate) async fn mutate_and_trace(
         TechniqueKind::Boolean
         | TechniqueKind::Json
         | TechniqueKind::Nosql
-        | TechniqueKind::Transit => &boolean_safe,
+        | TechniqueKind::Transit
+        | TechniqueKind::Orm
+        | TechniqueKind::Graphql => &boolean_safe,
         _ => effective_tampers,
     };
     let class = match finding.technique {
         TechniqueKind::Boolean
         | TechniqueKind::Json
         | TechniqueKind::Nosql
-        | TechniqueKind::Transit => RequestClass::Boolean,
+        | TechniqueKind::Transit
+        | TechniqueKind::Orm => RequestClass::Boolean,
         TechniqueKind::Time => RequestClass::Time,
         _ => RequestClass::Default,
     };
@@ -281,7 +290,9 @@ pub(crate) fn mutation_diff_signal(
         TechniqueKind::Boolean
         | TechniqueKind::Json
         | TechniqueKind::Nosql
-        | TechniqueKind::Transit => {
+        | TechniqueKind::Transit
+        | TechniqueKind::Orm
+        | TechniqueKind::Graphql => {
             crate::detection::response_diff::adaptive_similarity(baseline_body, body)
                 .clamp(0.0, 1.0)
         }

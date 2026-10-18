@@ -114,7 +114,7 @@ pub(crate) trait Technique: Send + Sync {
 /// [`Technique::kind`]. Adding a technique = new `scan.rs` module + one entry
 /// here.
 pub(crate) fn technique_for(kind: TechniqueKind) -> Option<&'static dyn Technique> {
-    const ALL: [&dyn Technique; 9] = [
+    const ALL: [&dyn Technique; 11] = [
         &crate::techniques::boolean::scan::BooleanTechnique,
         &crate::techniques::error::scan::ErrorTechnique,
         &crate::techniques::time::scan::TimeTechnique,
@@ -123,6 +123,8 @@ pub(crate) fn technique_for(kind: TechniqueKind) -> Option<&'static dyn Techniqu
         &crate::techniques::json::scan::JsonTechnique,
         &crate::techniques::nosql::scan::NosqlTechnique,
         &crate::techniques::transit::scan::TransitTechnique,
+        &crate::techniques::orm::scan::OrmTechnique,
+        &crate::techniques::graphql::scan::GraphqlTechnique,
         &crate::techniques::oob::scan::OobTechnique,
     ];
     ALL.iter().copied().find(|t| t.kind() == kind)

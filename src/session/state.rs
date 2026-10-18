@@ -18,6 +18,8 @@ pub enum TechniqueKind {
     Json,
     Nosql,
     Transit,
+    Orm,
+    Graphql,
 }
 
 impl core::fmt::Display for TechniqueKind {
@@ -32,6 +34,8 @@ impl core::fmt::Display for TechniqueKind {
             Self::Json => write!(f, "json"),
             Self::Nosql => write!(f, "nosql"),
             Self::Transit => write!(f, "transit"),
+            Self::Orm => write!(f, "orm"),
+            Self::Graphql => write!(f, "graphql"),
         }
     }
 }
@@ -104,6 +108,16 @@ impl Remediation {
                  HoneySQL or another query builder. Coerce expected scalar inputs before \
                  query construction, validate allow-listed keys/types, and reject unexpected \
                  serialized structures."
+                    .to_owned()
+            }
+            TechniqueKind::Orm => {
+                "Avoid raw query escape hatches in ORMs. Use parameterized APIs, validate \
+                 and coerce identifiers, and never interpolate user input into ORM raw SQL."
+                    .to_owned()
+            }
+            TechniqueKind::Graphql => {
+                "Parameterize all GraphQL resolver database calls. Never interpolate \
+                 arguments into raw SQL, and validate/sanitize GraphQL inputs server-side."
                     .to_owned()
             }
             TechniqueKind::Oob => {

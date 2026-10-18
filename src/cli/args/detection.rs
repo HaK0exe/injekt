@@ -52,6 +52,8 @@ pub enum TechniqueOpt {
     Json,
     Nosql,
     Transit,
+    Orm,
+    Graphql,
     All,
 }
 

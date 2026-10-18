@@ -185,7 +185,9 @@ pub fn compute_calibrated_prior(
         | TechniqueKind::Stacked
         | TechniqueKind::Json
         | TechniqueKind::Nosql
-        | TechniqueKind::Transit => 0.05,
+        | TechniqueKind::Transit
+        | TechniqueKind::Orm
+        | TechniqueKind::Graphql => 0.05,
         TechniqueKind::Oob => 0.02,
     };
 
@@ -201,6 +203,12 @@ pub fn compute_calibrated_prior(
         } else if technique == TechniqueKind::Transit {
             // Transit/typed JSON bodies → HoneySQL shape injection.
             prior = 0.30;
+        } else if technique == TechniqueKind::Orm {
+            // ORM raw escape hatches often ride JSON bodies.
+            prior = 0.25;
+        } else if technique == TechniqueKind::Graphql {
+            // GraphQL APIs are JSON bodies by construction.
+            prior = 0.35;
         } else if technique == TechniqueKind::Stacked {
             prior *= 0.5;
         }

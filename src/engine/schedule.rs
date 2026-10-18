@@ -32,6 +32,8 @@ pub(crate) const fn technique_config_name(kind: TechniqueKind) -> &'static str {
         TechniqueKind::Json => "json",
         TechniqueKind::Nosql => "nosql",
         TechniqueKind::Transit => "transit",
+        TechniqueKind::Orm => "orm",
+        TechniqueKind::Graphql => "graphql",
         TechniqueKind::Oob => "oob",
     }
 }
@@ -59,7 +61,7 @@ pub(crate) fn mutation_plan_label(tampers: &[Tamper]) -> String {
 /// then `nosql` first, ORDER BY context seeds `union` early. This only shapes
 /// priors via `compute_calibrated_prior` (EVI input); execution order is
 /// decided by the scheduler score afterwards, never by this fixed order.
-pub(crate) fn detection_order(context: &InjectionContext) -> [TechniqueKind; 9] {
+pub(crate) fn detection_order(context: &InjectionContext) -> [TechniqueKind; 11] {
     use TechniqueKind as K;
     if context.json {
         [
@@ -71,6 +73,8 @@ pub(crate) fn detection_order(context: &InjectionContext) -> [TechniqueKind; 9] 
             K::Union,
             K::Stacked,
             K::Transit,
+            K::Orm,
+            K::Graphql,
             K::Oob,
         ]
     } else if context.order_by {
@@ -83,6 +87,8 @@ pub(crate) fn detection_order(context: &InjectionContext) -> [TechniqueKind; 9] 
             K::Json,
             K::Nosql,
             K::Transit,
+            K::Orm,
+            K::Graphql,
             K::Oob,
         ]
     } else {
@@ -95,6 +101,8 @@ pub(crate) fn detection_order(context: &InjectionContext) -> [TechniqueKind; 9] 
             K::Json,
             K::Nosql,
             K::Transit,
+            K::Orm,
+            K::Graphql,
             K::Oob,
         ]
     }
