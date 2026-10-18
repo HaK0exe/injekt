@@ -148,14 +148,14 @@ stdout propre).
 
 **Checks** (fn pures, `fn check_x(&Cfg) -> CheckResult`)
 
-- [ ] config : `./injekt.toml` puis `~/.config/injekt/config.toml`, parse TOML,
+- [x] config : `./injekt.toml` puis `~/.config/injekt/config.toml`, parse TOML,
   résumé (profile, threads) — réutilise `file_config.rs` tel quel ;
-- [ ] proxy : ré-exécute `http::proxy::ProxyConfig::parse` (`socks5://` → l'erreur
+- [x] proxy : ré-exécute `http::proxy::ProxyConfig::parse` (`socks5://` → l'erreur
   `DnsLeak` **existante**, ne pas dupliquer) ;
-- [ ] cohérence jitter/rate : `1/rate_limit` ≥ jitter_mean − 2σ ; sinon warning
+- [x] cohérence jitter/rate : `1/rate_limit` ≥ jitter_mean − 2σ ; sinon warning
   chiffré « cadence plus rapide que le jitter → pattern détectable » (parse la
   string `"mean,std"` des valeurs `cli::profile::Profile`) ;
-- [ ] ingestion : paths des sources ingestion existent et lisibles (lexical).
+- [x] ingestion : paths des sources ingestion existent et lisibles (lexical).
 
 Sortie : `✓ / ! / ✗` une ligne chacun, exit 0 sans `✗`, 1 avec. Test sans réseau
 (mocker le TCP si nécessaire) ; toute IO réseau hors flag explicite est une
@@ -266,6 +266,37 @@ Exemple de diagnostic (JSON, champ optionnel — retro-compatible) :
 
 > Format : `> Progrès AAAA-MM-JJ (chantier étape): …` — mêmes conventions que
 > `docs/REFACTOR_PLAN.md`.
+
+- > Progrès 2026-10-19 (C15 done): `injekt doctor` câblé —
+  `cli::commands::doctor.rs` (4 checks purs `fn check_*(…) -> CheckResult
+  {level,line}` : **config** via `file_config.rs` tel quel (`candidate_paths`
+  + `FileConfig::parse`, résumé profil effectif/threads, absent ⇒ Warn
+  « défauts intégrés », TOML cassé ⇒ Fail avec l'erreur ligne/colonne du
+  `toml` ; écart volontaire vs `load` : le doctor remonte le fichier cassé
+  warné-silencieusement par le runtime), **proxy** = `ProxyConfig::parse`
+  existant + `redact_userinfo` rendu `pub(crate)` (`socks5://` ⇒ Fail avec
+  le message `DnsLeak` exact, jamais réécrit ; userinfo redirigé sur tous
+  les chemins), **cadence** = règle figée `1000/rate ≥ mean−2σ` (skip
+  déterministe si rien d'explicite rate**et** profil ; rate ≤ 0 ⇒ Warn
+  clamp runtime 0.1 rps ; jitter non parseable ⇒ Warn fallback `"750,250"`
+  ; correction `--rate-limit ≤1000/floor`), **ingestion** = stat lexical
+  `fs::metadata` des 5 sources (absent/illisible ⇒ Fail, type inversé ⇒
+  Warn, `--bulk-file -` = stdin) ; sortie `✓/!/✗` une ligne par check
+  (couleurs `stdout_colors_enabled` — `NO_COLOR`/`TERM=dumb`/`CLICOLOR=0`
+  /pipe, pas d'`INJEKT_NO_COLOR` inventé), lignes scrubées
+  (`--no-redact` respecté), exit 0 sans `✗` / 1 avec (`main` retourne
+  `Result<ExitCode>` ; `run()` early-branch doctor comme MCP AVANT l'init
+  tracing/banner, stdout pur ; `DoctorArgs` sans flag ; bras défensif
+  `dispatch` doctor). Valeurs via `resolve_snapshot` + `effective_*_with`
+  (precedence jamais dupliquée). Tests : 26 unit (1/check + cas limites,
+  sans réseau) + `integration_doctor.rs` 7 tests **zéro wiremock** dont le
+  tripwire OPSEC 0-socket end-to-end (binaire réel + `TcpListener` jamais
+  accepté : toute tentative de connexion ferait échouer l'`accept →
+  WouldBlock`) et les exit codes 0/1. Gates fmt/clippy/test/doc/deny
+  verts ; regen délibérée du golden `cli-flags.txt` (freeze surface :
+  exactement 1 entrée subcommand `doctor`, aucun flag nouveau, revue du
+  diff). Non fait : C16/C17/C18 (tâches suivantes, cochées vide).
+- > Progrès 2026-10-19 (C14 done): moteur diagnostics `INCONCLUSIVE` câblé —
 
 - > Progrès 2026-10-19 (C14 done): moteur diagnostics `INCONCLUSIVE` câblé —
   `src/engine/diagnostics.rs` (types purs : `InconclusiveCause`/`Diagnostic`/`DiagSignals`,

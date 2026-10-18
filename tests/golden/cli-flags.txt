@@ -1,6 +1,7 @@
 # subcommands (v1.0-rc freeze: any addition breaks this test)
 auto
 completions
+doctor
 info
 init
 man

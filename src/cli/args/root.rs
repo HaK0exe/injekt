@@ -143,6 +143,10 @@ pub enum Commands {
     Info(InfoArgs),
     /// One-command pipeline: ingestion -> scan -> escalation -> enumeration.
     Auto(AutoArgs),
+    /// Health-check the local config (config file, proxy, cadence, ingestion
+    /// paths). Reads local files only — no target, no network (0 socket,
+    /// OPSEC), pure and stdout-clean.
+    Doctor(DoctorArgs),
     /// Scaffold helpers: generate a starter `injekt.toml`.
     #[command(hide = true)]
     Init(InitArgs),
@@ -250,6 +254,13 @@ pub struct ReplayArgs {
 #[derive(Parser, Debug, Clone)]
 #[non_exhaustive]
 pub struct InfoArgs {}
+
+/// C15 — aucun flag, par design : le doctor inspecte la config résolue de
+/// l'invocation courante (CLI/env/TOML, même precedent qu'un run) ; des
+/// overrides locaux créeraient un second chemin de diagnostic divergent.
+#[derive(Parser, Debug, Clone)]
+#[non_exhaustive]
+pub struct DoctorArgs {}
 
 #[derive(Parser, Debug, Clone)]
 #[non_exhaustive]
