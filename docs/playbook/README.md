@@ -22,6 +22,7 @@ detection → fingerprint → extraction (opt-in)`.
 | 7 | Automatisation : `auto` (escalade L1/L2/L3), bulk, `completions`/`man`, MCP | `07-automatisation.md` |
 | 8 | Reporting : `--output`, schéma JSON, bulk report, preuves, troubleshooting | `08-reporting.md` |
 | 9 | Cheatsheet : arbre de décision, one-liners, codes de sortie, limites | `09-cheatsheet.md` |
+| 10 | Science de l'injection SQLi : théorie basique → complexe 2026 + cartographie des capacités | `10-science-sqli.md` |
 
 ## Méthodologie (workflow recommandé)
 
@@ -132,4 +133,6 @@ L1 budget historique, L2 double, L3+ tout + `ORDER BY` élargi.
 - [ ] Proxy Tor (`socks5h://`) prêt si réseau hostile, collaborateur OOB auto-hébergé si besoin.
 - [ ] Dossier d'affaires hors repo (jamais de `*.enc` / `report.json` / raw Burp committé).
 
-Suite : `01-installation-configuration.md`.
+Suite : `01-installation-configuration.md`. Doc théorique complémentaire :
+`10-science-sqli.md` (la science derrière les 8 familles, la cartographie
+exacte des capacités `injekt` 2026-10 et les priorités de recherche).
