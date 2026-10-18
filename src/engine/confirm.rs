@@ -628,7 +628,8 @@ pub(crate) async fn confirm_finding_second_pass(
         | TechniqueKind::Nosql
         | TechniqueKind::Transit
         | TechniqueKind::Orm
-        | TechniqueKind::Graphql => {
+        | TechniqueKind::Graphql
+        | TechniqueKind::Elasticsearch => {
             confirm_boolean_second_pass(
                 client,
                 state,

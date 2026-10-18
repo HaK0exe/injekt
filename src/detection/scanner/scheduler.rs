@@ -29,7 +29,8 @@ pub const fn base_evi_for(kind: TechniqueKind) -> f64 {
         | TechniqueKind::Nosql
         | TechniqueKind::Transit
         | TechniqueKind::Orm
-        | TechniqueKind::Graphql => 0.8,
+        | TechniqueKind::Graphql
+        | TechniqueKind::Elasticsearch => 0.8,
         TechniqueKind::Time => 0.7,
         TechniqueKind::Stacked => 0.5,
         TechniqueKind::Oob => 0.4,
@@ -47,7 +48,8 @@ pub const fn latency_secs_for(kind: TechniqueKind) -> f64 {
         | TechniqueKind::Nosql
         | TechniqueKind::Transit
         | TechniqueKind::Orm
-        | TechniqueKind::Graphql => 0.3,
+        | TechniqueKind::Graphql
+        | TechniqueKind::Elasticsearch => 0.3,
         TechniqueKind::Stacked | TechniqueKind::Oob => 0.5,
         TechniqueKind::Time => 1.5,
     }
@@ -63,7 +65,8 @@ pub const fn waf_risk_for(kind: TechniqueKind) -> f64 {
         | TechniqueKind::Nosql
         | TechniqueKind::Transit
         | TechniqueKind::Orm
-        | TechniqueKind::Graphql => 0.2,
+        | TechniqueKind::Graphql
+        | TechniqueKind::Elasticsearch => 0.2,
         TechniqueKind::Stacked | TechniqueKind::Time | TechniqueKind::Oob => 0.5,
     }
 }

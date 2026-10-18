@@ -187,7 +187,8 @@ pub fn compute_calibrated_prior(
         | TechniqueKind::Nosql
         | TechniqueKind::Transit
         | TechniqueKind::Orm
-        | TechniqueKind::Graphql => 0.05,
+        | TechniqueKind::Graphql
+        | TechniqueKind::Elasticsearch => 0.05,
         TechniqueKind::Oob => 0.02,
     };
 
@@ -209,6 +210,9 @@ pub fn compute_calibrated_prior(
         } else if technique == TechniqueKind::Graphql {
             // GraphQL APIs are JSON bodies by construction.
             prior = 0.35;
+        } else if technique == TechniqueKind::Elasticsearch {
+            // Elasticsearch APIs are JSON bodies by construction.
+            prior = 0.30;
         } else if technique == TechniqueKind::Stacked {
             prior *= 0.5;
         }

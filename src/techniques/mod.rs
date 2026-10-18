@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 pub mod boolean;
+pub mod elasticsearch;
 pub mod error;
 pub mod graphql;
 pub mod json;

@@ -54,6 +54,7 @@ pub enum TechniqueOpt {
     Transit,
     Orm,
     Graphql,
+    Elasticsearch,
     All,
 }
 

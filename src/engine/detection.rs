@@ -564,7 +564,8 @@ pub(crate) fn infer_signal_and_trials(
         | TechniqueKind::Nosql
         | TechniqueKind::Transit
         | TechniqueKind::Orm
-        | TechniqueKind::Graphql => {
+        | TechniqueKind::Graphql
+        | TechniqueKind::Elasticsearch => {
             let boolean_channel = new_findings
                 .iter()
                 .any(|f| f.evidence.contains("channel=boolean"));

@@ -489,6 +489,7 @@ pub fn parse_technique(raw: &str) -> Option<TechniqueKind> {
         "transit" => Some(TechniqueKind::Transit),
         "orm" => Some(TechniqueKind::Orm),
         "graphql" => Some(TechniqueKind::Graphql),
+        "elasticsearch" => Some(TechniqueKind::Elasticsearch),
         _ => None,
     }
 }
@@ -508,6 +509,7 @@ pub fn all_techniques() -> Vec<TechniqueKind> {
         TechniqueKind::Transit,
         TechniqueKind::Orm,
         TechniqueKind::Graphql,
+        TechniqueKind::Elasticsearch,
     ]
 }
 
@@ -807,8 +809,8 @@ mod tests {
             "evidence Authorization: Bearer SECRET",
         )];
         learn_from_run(&mut ks, &findings, &["all".to_owned()], Some("mysql"), 70);
-        // 11 techniques => 11 clés, la gagnante en succès.
-        assert_eq!(ks.len(), 11);
+        // 12 techniques => 12 clés, la gagnante en succès.
+        assert_eq!(ks.len(), 12);
         let win = KnowledgeKey::new(TechniqueKind::Boolean, "mysql", "generic");
         assert_eq!(ks.entries.get(&win).map(|e| e.success), Some(1));
         let lose = KnowledgeKey::new(TechniqueKind::Time, "mysql", "generic");

@@ -20,6 +20,7 @@ pub enum TechniqueKind {
     Transit,
     Orm,
     Graphql,
+    Elasticsearch,
 }
 
 impl core::fmt::Display for TechniqueKind {
@@ -36,6 +37,7 @@ impl core::fmt::Display for TechniqueKind {
             Self::Transit => write!(f, "transit"),
             Self::Orm => write!(f, "orm"),
             Self::Graphql => write!(f, "graphql"),
+            Self::Elasticsearch => write!(f, "elasticsearch"),
         }
     }
 }
@@ -118,6 +120,11 @@ impl Remediation {
             TechniqueKind::Graphql => {
                 "Parameterize all GraphQL resolver database calls. Never interpolate \
                  arguments into raw SQL, and validate/sanitize GraphQL inputs server-side."
+                    .to_owned()
+            }
+            TechniqueKind::Elasticsearch => {
+                "Do not accept full Elasticsearch Query DSL from clients. Use fixed \
+                 server-side queries, strict allow-lists, and validate all filters."
                     .to_owned()
             }
             TechniqueKind::Oob => {
