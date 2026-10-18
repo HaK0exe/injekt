@@ -4,16 +4,13 @@
 use crate::{
     dbms::context::InjectionContext,
     detection::baseline,
-    engine::{
-        fetch::{fetch_for_payload, fetch_for_payload_with_class},
-        schedule::order_boolean_by_context,
-    },
+    engine::fetch::{fetch_for_payload, fetch_for_payload_with_class},
     http::{client::HttpClient, timeouts::RequestClass},
     session::state::{Finding, SessionState, TechniqueKind},
     target::{
-        injection::{ProbeOpts, is_ignored, payload_budget},
+        injection::{ProbeOpts, is_ignored},
         markers::MarkerSet,
-        parameters::{ParameterLocation, TargetParameter},
+        parameters::TargetParameter,
         raw_request::RawRequest,
         url::TargetUrl,
     },
@@ -26,20 +23,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use super::{dbms_label_from_finding, push_confirm_trace};
+use self::setup::{BooleanSecondPassSetup, SecondPassCand, build_second_pass_setup};
+use super::push_confirm_trace;
 
-/// Second-pass candidate: the historical boolean TRUE/FALSE base pair
-/// (quote-aware) or the full JSON/NoSQL payload — error probe included — so a
-/// finding confirmed through either channel re-probes the SAME channel with
-/// first-pass parity.
-pub(crate) enum SecondPassCand {
-    Boolean {
-        true_base: String,
-        false_base: String,
-    },
-    Json(crate::techniques::json::payloads::JsonPayload),
-    Nosql(crate::techniques::nosql::payloads::NosqlPayload),
-}
+mod setup;
 
 /// Boolean/Json/NoSQL second-pass: fresh TRUE/FALSE pairs (derived seed),
 /// same 3-trial `confirm_either` majority bar as the first pass (identical
@@ -79,77 +66,32 @@ pub(crate) async fn confirm_boolean_second_pass(
     level: u8,
 ) -> bool {
     let mut rng = crate::seeded_rng::make_rng(seed);
-    let label = dbms_label_from_finding(finding);
-    // Candidates in first-pass order: boolean keeps its quote-aware pairs
-    // (unchanged behaviour); JSON mirrors `test_json_bounded`
-    // (`json_scan_payloads`: direct sweep + GraphQL `variables` envelope);
-    // NoSQL mirrors `test_nosql_bounded` (full catalogue, same budget).
-    let candidates: Vec<SecondPassCand> = if finding.technique == TechniqueKind::Json {
-        let payloads = crate::engine::schedule::json_scan_payloads(label);
-        let take = payload_budget(level, 2, payloads.len());
-        payloads
-            .into_iter()
-            .take(take)
-            .map(SecondPassCand::Json)
-            .collect()
-    } else if finding.technique == TechniqueKind::Nosql {
-        let payloads = crate::techniques::nosql::payloads::nosql_payloads();
-        let take = payload_budget(level, 2, payloads.len());
-        payloads
-            .into_iter()
-            .take(take)
-            .map(SecondPassCand::Nosql)
-            .collect()
-    } else {
-        let mut payloads = crate::techniques::boolean::payloads::boolean_payloads_for(label);
-        order_boolean_by_context(&mut payloads, context);
-        let take = payload_budget(level, 2, payloads.len()).clamp(1, 3);
-        payloads
-            .iter()
-            .take(take)
-            .map(|p| SecondPassCand::Boolean {
-                true_base: p.true_payload.clone(),
-                false_base: p.false_payload.clone(),
-            })
-            .collect()
-    };
+    let setup = build_second_pass_setup(
+        finding,
+        param,
+        raw,
+        baseline,
+        matcher,
+        effective_tampers,
+        context,
+        level,
+    );
+    let BooleanSecondPassSetup {
+        candidates,
+        safe,
+        json_operator_path,
+        error_channel,
+        baseline_body,
+    } = setup;
     if candidates.is_empty() {
         return true;
     }
-    // Boolean-safe only: opaque tampers would collapse the differential.
-    let safe: Vec<Tamper> = effective_tampers
-        .iter()
-        .filter(|t| t.is_boolean_safe())
-        .cloned()
-        .collect();
-    // NoSQL JSON-body operator path: same detection as `test_nosql_bounded`
-    // (`param` body + JSON sniff) — the injected shape is an operator object,
-    // not the generic string form, and string tampers don't apply there.
-    let json_operator_path: Option<String> = match &param.location {
-        ParameterLocation::Body => {
-            let body_opt = raw.and_then(|r| r.body.as_deref());
-            let ct = raw.and_then(|r| r.content_type());
-            body_opt
-                .filter(|body| {
-                    crate::target::structured::sniff_kind(ct, body)
-                        == crate::target::structured::StructuredKind::Json
-                })
-                .map(str::to_owned)
-        }
-        _ => None,
-    };
+
     let trans: &[Tamper] = if json_operator_path.is_some() {
         &[]
     } else {
         &safe
     };
-    // Error-channel findings (JSON `__bad__` / NoSQL `$where`) carry their
-    // differential in the error probe, not the boolean pair: re-probe the
-    // error payload (1 request/candidate), mirroring the first pass.
-    let error_channel = finding.evidence.contains("channel=error");
-    // P1.1 — purge des zones dynamiques marquées avant comparaison.
-    let baseline_body =
-        matcher.pre_process(&baseline.strip_dynamic_content(&baseline.representative_body_str()));
     // Fail-open ledger: if NO candidate manages a single measured probe (every
     // probe transport-neutral), the finding could not actually be re-probed —
     // keep it instead of dropping on network flakes.
