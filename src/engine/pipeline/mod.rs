@@ -7,26 +7,22 @@
 //! Behavior-neutral move: bodies are verbatim `Engine::run_internal` and
 //! friends; `self.*` became explicit params.
 
-use crate::target::{injection::baseline_all_error, url::TargetUrl};
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 use tracing::{info, warn};
 
 use super::{
     EngineState,
-    baseline::collect_baseline,
-    config::BudgetConfig,
-    confirm::{ConfirmScope, is_extraction_eligible, run_confirm_second_pass},
-    detection::run_detection,
-    enumerate::run_enumeration,
-    extraction::run_extraction,
-    fingerprint::run_fingerprint,
+    confirm::{ConfirmScope, run_confirm_second_pass},
     second_order::run_second_order,
 };
 
 pub(crate) use self::helpers::PipelineCtx;
-use self::helpers::{absorb_detectability, build_raw_request, select_params};
+use self::helpers::{build_raw_request, select_params};
 
 mod helpers;
+mod phases;
+
+use self::phases::BaselinePhase;
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_internal(
@@ -51,21 +47,7 @@ pub(crate) async fn run_internal(
     if config.confirm {
         info!("--confirm second-pass enabled (fresh payloads, derived seed, OOB excluded)");
     }
-
-    // Parse (lexical) + DNS-time SSRF check (anti DNS-rebinding).
-    // Skipped when the proxy does remote DNS (`socks5h://`): a local
-    // `lookup_host` would leak the hostname and fail `.onion` names the
-    // proxy could resolve. Lexical + IP-literal checks in `parse` still apply.
-    let target = TargetUrl::parse(target_str, config.net.allow_private)
-        .map_err(|e| crate::error::InjektError::Other(Box::new(e)))?;
-    if !config.net.allow_private
-        && !config.net.remote_dns
-        && let Some(host) = target.inner().host_str()
-    {
-        TargetUrl::resolve_and_check(host, false)
-            .await
-            .map_err(|e| crate::error::InjektError::Other(Box::new(e)))?;
-    }
+    let target = phases::preflight_target(config, target_str).await?;
     current = EngineState::Baseline;
     info!(
         target=%scrubber.scrub(target_str),
@@ -73,67 +55,32 @@ pub(crate) async fn run_internal(
         "phase baseline"
     );
 
-    if cancel.is_cancelled() {
-        absorb_detectability(client, state, shared_client).await;
-        return Ok(EngineState::Cancelled);
-    }
-    // Budget spent before baseline: skip the 3-sample sequence entirely
-    // (cooperative plafond, same as fingerprint/extraction guards below).
-    // Mid-baseline overshoot (≤3 concurrent samples) stays within the
-    // documented one-technique tolerance.
-    if BudgetConfig::is_over_request_budget(
-        state.read().await.request_count(),
-        config.budget.request_budget,
-    ) {
-        warn!("request-budget spent, skipping baseline");
-        absorb_detectability(client, state, shared_client).await;
-        return Ok(EngineState::Inconclusive);
-    }
-
     let candidate_param = candidate.map(crate::recon::ParameterCandidate::target_parameter);
     let raw_request = build_raw_request(config, candidate);
 
-    let Some((baseline, effective_tampers, effective_opts)) = collect_baseline(
-        client,
-        state,
-        cancel,
-        config,
-        scrubber,
-        baseline_cache,
-        &target,
-        raw_request.as_ref(),
-    )
-    .await?
-    else {
-        absorb_detectability(client, state, shared_client).await;
-        return Ok(EngineState::Cancelled);
-    };
-
-    // A changing baseline is not a usable oracle: any later TRUE/FALSE
-    // differential could simply be application noise.  Stop before
-    // context and detection probes so an unstable endpoint is reported as
-    // inconclusive instead of producing misleading findings.
-    if !baseline.is_stable() {
-        warn!(
-            target=%scrubber.scrub(target_str),
-            statuses=?baseline.status_codes,
-            "baseline unstable — skipping injection detection"
-        );
-        absorb_detectability(client, state, shared_client).await;
-        return Ok(EngineState::Inconclusive);
-    }
-    // All-5xx baseline: every differential below compares static error
-    // pages, so the run is void by construction. Remember it for the
-    // final verdict (INCONCLUSIVE, never CLEAN) while still letting
-    // detection run for transient-blip tolerance.
-    let baseline_unreachable = baseline_all_error(&baseline.status_codes);
-    if baseline_unreachable {
-        warn!(
-            target=%scrubber.scrub(target_str),
-            statuses=?baseline.status_codes,
-            "baseline: all samples server-error (5xx) — origin unreachable, detection differentials will be meaningless"
-        );
-    }
+    let (baseline, effective_tampers, effective_opts, baseline_unreachable) =
+        match phases::run_baseline_phase(
+            client,
+            state,
+            cancel,
+            config,
+            scrubber,
+            baseline_cache,
+            shared_client,
+            &target,
+            target_str,
+            raw_request.as_ref(),
+        )
+        .await?
+        {
+            BaselinePhase::Proceed {
+                baseline,
+                effective_tampers,
+                opts,
+                baseline_unreachable,
+            } => (baseline, effective_tampers, opts, baseline_unreachable),
+            BaselinePhase::Stop(stop) => return Ok(stop),
+        };
 
     current = EngineState::Context;
     info!(
@@ -150,56 +97,20 @@ pub(crate) async fn run_internal(
         candidate_param.as_ref(),
     );
     let raw_request = Arc::new(raw_request);
-
-    // Run adaptive context analysis (<=8 requests bound, 0 DBMS probes if --dbms)
-    let context_started = Instant::now();
-    let context_req_before = state.read().await.request_count();
     let primary_param = to_test.first();
-    let context_result = if let Some(param) = primary_param {
-        crate::dbms::context::analyze_context(
-            client,
-            state,
-            cancel,
-            &target,
-            param,
-            raw_request.as_ref().as_ref(),
-            &baseline,
-            config.dbms_hint.as_deref(),
-        )
-        .await
-    } else {
-        crate::dbms::context::ContextProbeResult {
-            context: crate::dbms::context::InjectionContext::new(),
-            dbms_belief: config.dbms_hint.as_deref().map_or_else(
-                crate::dbms::context::DbmsBelief::uniform,
-                crate::dbms::context::DbmsBelief::from_hint,
-            ),
-            probes_sent: 0,
-            error_evidence: None,
-        }
-    };
-
-    let context_elapsed = context_started.elapsed().as_secs_f64();
-    let context_req_delta = state
-        .read()
-        .await
-        .request_count()
-        .saturating_sub(context_req_before);
-    info!(
-        target=%scrubber.scrub(target_str),
-        context=%context_result.context.summary(),
-        probes=context_result.probes_sent,
-        elapsed_s=context_elapsed,
-        requests=context_req_delta,
-        "context done in {context_elapsed:.1}s ({context_req_delta} req) — {}",
-        context_result.context.summary(),
-    );
-
-    let (top_dbms, prob) = context_result.dbms_belief.top_candidate();
-    if prob >= 0.85 && top_dbms != crate::dbms::common::DbmsKind::Unknown {
-        state.write().await.fill_missing_dbms(top_dbms);
-        info!(%top_dbms, confidence=%prob, "DBMS identified early during context analysis");
-    }
+    let context_result = phases::run_context_phase(
+        client,
+        state,
+        cancel,
+        config,
+        &target,
+        target_str,
+        scrubber,
+        raw_request.as_ref().as_ref(),
+        &baseline,
+        primary_param,
+    )
+    .await;
 
     current = EngineState::Detection;
     info!(
@@ -208,13 +119,7 @@ pub(crate) async fn run_internal(
         "phase detection"
     );
 
-    let detection_started = Instant::now();
-    let detection_req_before = state.read().await.request_count();
-    // Clone borné pour Option B second-order (Body/Query, ≤max_stores) :
-    // `run_detection` consomme `to_test`, le clone préserve la liste
-    // filtrée `-p` pour `run_second_order` sans refaire `select_params`.
-    let to_test_for_second_order = to_test.clone();
-    run_detection(
+    let (detection_started, to_test_for_second_order) = phases::run_detection_phase(
         client,
         state,
         cancel,
@@ -225,36 +130,11 @@ pub(crate) async fn run_internal(
         &raw_request,
         &baseline,
         &effective_tampers,
-        &context_result.context,
-        &context_result.dbms_belief,
-        context_result.probes_sent,
+        &context_result,
         to_test,
     )
     .await;
-    {
-        let detection_elapsed = detection_started.elapsed().as_secs_f64();
-        let detection_req_delta = state
-            .read()
-            .await
-            .request_count()
-            .saturating_sub(detection_req_before);
-        let detection_findings = state.read().await.findings().len();
-        info!(
-            elapsed_s = detection_elapsed,
-            requests = detection_req_delta,
-            findings = detection_findings,
-            "detection done in {detection_elapsed:.1}s ({detection_req_delta} req, {detection_findings} findings)"
-        );
-    }
 
-    // C6 strict second-pass (anti-FP P2.4): `--confirm` re-probes every
-    // confirmed non-OOB finding with fresh payloads + derived seed
-    // (historical behaviour, ~2x req documented); without the flag, the
-    // same pass re-validates confirmed non-High findings on every
-    // non-OOB technique (bounded auto anti-FP with first-pass window
-    // parity — see `needs_auto_second_pass`). Never creates new
-    // findings — only drops those that fail re-validation (0 new FP on
-    // N1/N2 by construction).
     let confirm_scope = if config.confirm {
         ConfirmScope::All
     } else {
@@ -315,9 +195,23 @@ pub(crate) async fn run_internal(
         state=?current,
         "phase fingerprint"
     );
-    let fingerprint_started = Instant::now();
-    let fingerprint_req_before = state.read().await.request_count();
-    run_fingerprint(
+    phases::run_fingerprint_phase(
+        client,
+        state,
+        cancel,
+        config,
+        &target,
+        target_str,
+        scrubber,
+        &marker_set,
+        &raw_request,
+        &baseline,
+        &effective_tampers,
+        effective_opts,
+    )
+    .await;
+
+    phases::run_extraction_phase(
         client,
         state,
         cancel,
@@ -330,192 +224,38 @@ pub(crate) async fn run_internal(
         &baseline,
         &effective_tampers,
         effective_opts,
-        &config.matcher,
+        &mut current,
     )
-    .await;
-    {
-        let fingerprint_elapsed = fingerprint_started.elapsed().as_secs_f64();
-        let fingerprint_req_delta = state
-            .read()
-            .await
-            .request_count()
-            .saturating_sub(fingerprint_req_before);
-        if fingerprint_req_delta == 0 {
-            info!("fingerprint skipped (no confirmed findings, 0 req)");
-        } else {
-            info!(
-                elapsed_s = fingerprint_elapsed,
-                requests = fingerprint_req_delta,
-                "fingerprint done in {fingerprint_elapsed:.1}s ({fingerprint_req_delta} req)"
-            );
-        }
-    }
+    .await?;
 
-    if config.enumeration.extract {
-        // Gate early (same rule as enumeration): no finding => no oracle.
-        // Prevents hundreds of blind requests on a clean target, in
-        // particular with `--auto-enumerate`.
-        let snap = state.read().await.findings().to_vec();
-        if snap.is_empty() {
-            warn!(
-                target=%scrubber.scrub(target_str),
-                "--extract requested but no confirmed vulnerability was found — skipping"
-            );
-        } else if !is_extraction_eligible(&snap) {
-            warn!(
-                target=%scrubber.scrub(target_str),
-                "likely FP, extraction skipped (no boolean-confirmed or error-with-fragment finding)"
-            );
-        } else {
-            current = EngineState::Extraction;
-            info!(
-                target=%scrubber.scrub(target_str),
-                state=?current,
-                "phase extraction — inference (opt-in)"
-            );
-            run_extraction(
-                client,
-                state,
-                cancel,
-                config,
-                &target,
-                target_str,
-                &marker_set,
-                &raw_request,
-                &baseline,
-                &effective_tampers,
-                effective_opts,
-            )
-            .await?;
-        }
-    }
+    phases::run_enumeration_phase(
+        client,
+        state,
+        cancel,
+        config,
+        scrubber,
+        &target,
+        target_str,
+        &marker_set,
+        &raw_request,
+        &baseline,
+        &effective_tampers,
+        effective_opts,
+        &mut current,
+    )
+    .await?;
 
-    // Enumeration phase (--dbs, --tables, --columns, --dump, --count,
-    // --banner, --current-user, --current-db, --hostname). Requires a
-    // *boolean-capable* finding (same bar as extraction): the enumerator
-    // runs a boolean-differential oracle, so stacked/time/union-only
-    // snapshots would chase noise into `inference inconsistency` errors
-    // after burning a full oracle pass per candidate.
-    let needs_enum = config.enumeration.dbs
-        || config.enumeration.tables
-        || config.enumeration.columns
-        || config.enumeration.dump
-        || config.enumeration.count
-        || config.enumeration.banner
-        || config.enumeration.current_user
-        || config.enumeration.current_db
-        || config.enumeration.hostname;
-    let snap_for_enum = state.read().await.findings().to_vec();
-    let enum_eligible = is_extraction_eligible(&snap_for_enum);
-    if needs_enum && enum_eligible {
-        current = EngineState::Enumeration;
-        info!(
-            target=%scrubber.scrub(target_str),
-            state=?current,
-            "phase enumeration — dbs/tables/columns/dump"
-        );
-        run_enumeration(
-            client,
-            state,
-            cancel,
-            config,
-            &target,
-            target_str,
-            &marker_set,
-            &raw_request,
-            &baseline,
-            &effective_tampers,
-            effective_opts,
-        )
-        .await?;
-    } else if needs_enum && snap_for_enum.is_empty() {
-        warn!(
-            target=%scrubber.scrub(target_str),
-            "enumeration requested but no confirmed vulnerability was found"
-        );
-    } else if needs_enum {
-        warn!(
-            target=%scrubber.scrub(target_str),
-            "likely FP, enumeration skipped (no boolean-capable finding: stacked/time-only cannot feed the oracle)"
-        );
-    }
-
-    current = EngineState::Done;
-    // C10: absorb every throttled hop (403/429, incl. retried 429s) into
-    // the run's detectability counters before reporting.
-    absorb_detectability(client, state, shared_client).await;
-    let requests = state.read().await.request_count();
-    let detectability = state.read().await.detectability();
-    let findings_snapshot = state.read().await.findings().to_vec();
-    // Incomplete runs must never look CLEAN: budget/duration stops,
-    // cancel, or an unusable (all-5xx) baseline degrade Done to
-    // Inconclusive/Cancelled when no finding was produced. Findings still
-    // surface as FINDINGS upstream (a hit is a hit, even on a truncated
-    // run); only the 0-finding case changes verdict.
-    if findings_snapshot.is_empty() {
-        if cancel.is_cancelled() {
-            current = EngineState::Cancelled;
-        } else if baseline_unreachable
-            || BudgetConfig::is_over_request_budget(requests, config.budget.request_budget)
-            || BudgetConfig::is_over_max_duration(
-                detection_started,
-                config.budget.max_duration_secs,
-            )
-        {
-            current = EngineState::Inconclusive;
-        }
-    } else if cancel.is_cancelled() {
-        current = EngineState::Cancelled;
-    }
-    let total_elapsed = run_started.elapsed().as_secs_f64();
-    // Findings per technique for the one-line summary (e.g. `boolean×1,
-    // error×1`). Sorted for deterministic output.
-    let mut by_technique: HashMap<String, usize> = HashMap::new();
-    for finding in &findings_snapshot {
-        *by_technique
-            .entry(finding.technique.to_string())
-            .or_insert(0) += 1;
-    }
-    let mut technique_parts: Vec<String> = by_technique
-        .iter()
-        .map(|(tech, count)| format!("{tech}×{count}"))
-        .collect();
-    technique_parts.sort();
-    let findings_detail = if technique_parts.is_empty() {
-        "no findings".to_owned()
-    } else {
-        format!(
-            "{} finding(s) ({})",
-            findings_snapshot.len(),
-            technique_parts.join(", ")
-        )
-    };
-    if findings_snapshot.is_empty() {
-        info!(
-            target=%scrubber.scrub(target_str),
-            state=?current,
-            requests,
-            findings = 0,
-            elapsed_s = total_elapsed,
-            count_403 = detectability.count_403,
-            count_429 = detectability.count_429,
-            "scan done: {findings_detail}, {requests} req in {total_elapsed:.1}s (403×{} 429×{})",
-            detectability.count_403,
-            detectability.count_429,
-        );
-    } else {
-        info!(
-            target=%scrubber.scrub(target_str),
-            state=?current,
-            requests,
-            findings = findings_snapshot.len(),
-            elapsed_s = total_elapsed,
-            count_403 = detectability.count_403,
-            count_429 = detectability.count_429,
-            "scan done: {findings_detail}, {requests} req in {total_elapsed:.1}s (403×{} 429×{}) — try --explain <param> for reasoning",
-            detectability.count_403,
-            detectability.count_429,
-        );
-    }
-    Ok(current)
+    Ok(phases::finalize_run(
+        client,
+        state,
+        cancel,
+        config,
+        scrubber,
+        shared_client,
+        target_str,
+        detection_started,
+        run_started,
+        baseline_unreachable,
+    )
+    .await)
 }
