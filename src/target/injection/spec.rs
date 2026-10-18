@@ -31,8 +31,7 @@ pub fn request_spec_from_raw(target: &TargetUrl, raw: &RawRequest) -> RequestSpe
     spec
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn build_injection_spec_with_raw(
     target: &TargetUrl,
     target_str: &str,

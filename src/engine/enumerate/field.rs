@@ -26,8 +26,7 @@ use tracing::{info, warn};
 /// Uses binary search on ASCII values with the provided query.
 /// Dialect-aware: length/char comparison built from `DbmsKind`
 /// (`LEN` on MSSQL, `SUBSTR` on Oracle, `::text` cast on Postgres).
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) async fn extract_enum_field(
     client: &HttpClient,
     state: &Arc<RwLock<SessionState>>,

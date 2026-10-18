@@ -29,7 +29,7 @@ use super::{boolean::confirm_boolean_second_pass, dbms_label_from_finding, push_
 /// the DB error pattern must still appear (baseline-vetoed). Fragment findings
 /// (`extracted=yes`) keep the bar; `bool_confirm=true` findings additionally
 /// require the boolean pair to still hold (via [`confirm_boolean_second_pass`]).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn confirm_error_second_pass(
     client: &HttpClient,
     state: &Arc<RwLock<SessionState>>,
