@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Token-bucket rate limiter.
 ///
-/// Note on pacing: [`HttpClient::send_with_retry`] awaits
+/// Note on pacing: [`crate::http::client::HttpClient::send_with_retry`] awaits
 /// `acquire_cancellable()` (chemin scan, annulable via `CancellationToken`)
 /// and then the jitter sleep back-to-back, so per-request pacing is additive
 /// (`rate-limit wait` + `jitter wait`), not `max()` of the two. Lower both
@@ -29,7 +29,7 @@ pub struct RateLimiter {
 }
 
 /// Single default request rate (req/s) shared by [`RateLimiter::default`]
-/// and the [`HttpClient`] fallback when no limiter is injected.
+/// and the [`crate::http::client::HttpClient`] fallback when no limiter is injected.
 pub const DEFAULT_RPS: f64 = 10.0;
 
 /// Upper bound for a `Retry-After`-driven pacing penalty (C10): the server's

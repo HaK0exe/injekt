@@ -93,11 +93,11 @@ impl BudgetConfig {
     ///
     /// CODE calibration (`--request-budget N`, OPT-IN): the per-parameter
     /// scheduler already caps each param at the same value via
-    /// [`RequestBudget::max_requests`], but schedulers are per-param
+    /// [`crate::detection::scanner::scheduler::RequestBudget::max_requests`], but schedulers are per-param
     /// instances — only this check against the shared
     /// `SessionState::request_count` is a true global plafond. Cooperative:
     /// the running technique finishes, no new one starts, the run ends as
-    /// [`EngineState::Inconclusive`] when no finding was produced (never an
+    /// [`crate::engine::EngineState::Inconclusive`] when no finding was produced (never an
     /// error, never a new finding).
     /// Concurrent params may overshoot by one technique each.
     /// Pure and unit-testable.

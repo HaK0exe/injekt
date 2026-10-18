@@ -47,7 +47,7 @@ const JWT_PLACEHOLDER: &str = "[REDACTED-JWT]";
 /// On top of the JSON fields, CSRF-shaped `<input>`/`<meta>` values are
 /// blanked (only when the tag or the value looks like a credential — see
 /// `scrub_input_tag`/`scrub_meta_tag`) and JWTs are folded to
-/// [`JWT_PLACEHOLDER`]. Free-form hex/digit runs are deliberately *not*
+/// `JWT_PLACEHOLDER`. Free-form hex/digit runs are deliberately *not*
 /// touched: masking them would hide real data, so every rule stays scoped to
 /// a named volatile region. Bodies without any marker are returned unchanged
 /// (cheap path); the probes below are single `memchr`-backed scans so several

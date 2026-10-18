@@ -101,7 +101,7 @@ fn is_stale_pool_eof_for_method(e: &reqwest::Error, method: &http::Method) -> bo
 }
 
 /// Pure idempotence gate for the stale-pool `EOF` race, unit-testable without
-/// a real `reqwest::Error`: `chain_has_eof` is the [`source_chain_has_eof`]
+/// a real `reqwest::Error`: `chain_has_eof` is the `source_chain_has_eof`
 /// verdict. `POST`/`PATCH` (non-idempotent) never retry the race, even when
 /// the chain matches — the request is surfaced as-is.
 #[must_use]

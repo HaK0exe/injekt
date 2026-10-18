@@ -4,7 +4,7 @@
 //!
 //! Target contract for unifying the 8 `test_*_bounded` loops currently in
 //! `engine::orchestrator` behind one [`Technique`] trait + a generic
-//! [`ProbeExecutor`]. This module only defines types + the trait today;
+//! `ProbeExecutor`. This module only defines types + the trait today;
 //! migration of each technique body happens in P2-1..P2-6.
 
 use crate::{

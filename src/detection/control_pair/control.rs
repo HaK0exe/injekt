@@ -81,8 +81,8 @@ pub fn derive_control_pair(
 /// sans plancher de bruit appris).
 ///
 /// Exige la cohérence de direction attendue : le contrôle `r=r` doit rester
-/// baseline-like (`diff_against_baseline` < [`SIMILAR_CONFIDENCE_MAX`]) et le
-/// contrôle `r1=r2` doit s'en écarter (`>` [`DIFFERENT_CONFIDENCE_MIN`]).
+/// baseline-like (`diff_against_baseline` < `SIMILAR_CONFIDENCE_MAX`) et le
+/// contrôle `r1=r2` doit s'en écarter (`>` `DIFFERENT_CONFIDENCE_MIN`).
 /// `inverted` est le sens renvoyé par
 /// [`crate::detection::confirmation::confirm_either`] : en mode inversé, le
 /// côté logiquement **faux** est celui qui était baseline-like.
@@ -137,7 +137,7 @@ pub fn control_verdict(
 /// injustifié et dropperait un vrai positif. Quand
 /// `classify_page_similarity(jaccard(baseline, same), match_ratio)` vaut
 /// [`PageSimilarity::Same`], le côté `same` est traité comme baseline-like
-/// même si sa confiance dépasse [`SIMILAR_CONFIDENCE_MAX`] : un
+/// même si sa confiance dépasse `SIMILAR_CONFIDENCE_MAX` : un
 /// [`ControlVerdict::Keep`] reste possible et le veto « same s'éloigne » est
 /// levé.
 ///
