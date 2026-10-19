@@ -1,9 +1,9 @@
 # bench/versions.lock — frozen official-run references.
-# pinned_at 2026-09-09T21:08:54Z (UTC). Regenerate: python3 runner/run.py pin
-mysql:8.4  [mysql@sha256:3466ba4a4828aa8d46fb7c3bc16b67b781c98413cf4ea0fac6feaa6e881faa26]
-postgres:17-alpine  [postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73]
-mcr.microsoft.com/mssql/server:2022-latest  [mcr.microsoft.com/mssql/server@sha256:97b448857967be55e005424a660056fe6d51814435804dc07e8f79f028bab5fb]
-owasp/modsecurity-crs:nginx  [owasp/modsecurity-crs@sha256:ccec5e3ecd1dcf6b48903268f4fe415fd17914e8bf30fc21263fd05cc7045f29]
-tool:injekt  injekt 0.3.0
-tool:sqlmap  1.10.7#stable
+# pinned_at 2026-10-19T03:05:57Z (UTC). Regenerate: python3 runner/run.py pin
+mysql:8.4  [mysql@sha256:24989179f58856db763f418010c1169fecc944e3ec1ea7e921572d83eb070f70]
+postgres:17-alpine  [postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24]
+mcr.microsoft.com/mssql/server:2022-latest  [mcr.microsoft.com/mssql/server@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718]
+owasp/modsecurity-crs:nginx  [owasp/modsecurity-crs@sha256:7698c48a41a43138ae317feeec964d1515b861cc1d9e50617bc1cdfe9f314e1d]
+tool:injekt  injekt 0.4.0
+tool:sqlmap  1.10.10#stable
 tool:ghauri  (unavailable: [Errno 2] No such file or directory: 'ghauri')
