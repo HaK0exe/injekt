@@ -116,6 +116,7 @@ impl InjektServer {
             command: None,
             profile: None,
             config: None,
+            quiet: false,
             target_opts: crate::cli::args::TargetOpts {
                 target: None,
                 bulk_file: None,

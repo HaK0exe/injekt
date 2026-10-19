@@ -89,6 +89,7 @@ scan
 --preset
 --profile
 --proxy
+--quiet
 --rate-limit
 --raw-dir
 --raw-file

@@ -206,6 +206,9 @@ pub struct EnumConfig {
 
 #[derive(Debug, Clone)]
 #[non_exhaustive]
+// 4 bools (`confirm`, `no_mutation`, `quiet`, `no_redact`) : record de config
+// plat par nature — un bitfield/enum unifierait des opt-ins indépendants.
+#[allow(clippy::struct_excessive_bools)]
 pub struct EngineConfig {
     pub budget: BudgetConfig,
     pub evasion: EvasionConfig,

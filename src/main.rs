@@ -82,7 +82,13 @@ async fn run() -> anyhow::Result<ExitCode> {
             .await
             .map(|()| ExitCode::SUCCESS);
     }
-    let filter = if cli.verbose { "debug" } else { "info" };
+    let filter = if cli.quiet {
+        "warn"
+    } else if cli.verbose {
+        "debug"
+    } else {
+        "info"
+    };
     fmt()
         .event_format(injekt::cli::output::console::SqlmapStyle)
         .with_writer(std::io::stderr)
@@ -90,7 +96,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
         )
         .init();
-    if !cli.no_banner {
+    if !cli.no_banner && !cli.quiet {
         injekt::cli::output::banner::print(cli.detection.seed);
     }
     let cancel = CancellationToken::new();

@@ -1,7 +1,7 @@
-use std::{io::IsTerminal as _, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use futures::StreamExt as _;
-use indicatif::ProgressBar;
+
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -54,6 +54,7 @@ pub(crate) async fn run_detection(
         Arc::new(progress.attach(crate::cli::output::progress::bar(
             to_test.len() as u64,
             "detection",
+            config.quiet,
         )))
     } else {
         Arc::new(indicatif::ProgressBar::hidden())
@@ -81,6 +82,9 @@ pub(crate) async fn run_detection(
             let pb2 = Arc::clone(&pb2);
             let raw_request = Arc::clone(raw_request);
             async move {
+                // Label = param en cours de démarrage (approx. au-delà du
+                // 1er avec concurrence > 1 : `buffer_unordered` tire à l'avance).
+                pb2.set_message(param.name.clone());
                 run_detection_for_param(
                     &client,
                     &state,

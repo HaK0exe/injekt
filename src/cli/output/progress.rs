@@ -18,21 +18,22 @@
 //! vit. Les spinners transitoires (baseline, context) restent locaux aux
 //! phases et s'effacent (`finish_and_clear`) — ils n'empilent rien.
 
+use std::io::IsTerminal as _;
 use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-use super::theme::{colors_for, Stream};
+use super::theme::{Stream, colors_for};
 
 /// Refresh rate plafonné : les redraws indicatif coûtent du CPU et brassent
 /// le terminal (OPSEC : moins de churn visuel) — 8 Hz reste fluide.
 const DRAW_HZ: u8 = 8;
 
 /// Barre de progression partagée (detection, recon bulk) : spinner + barre +
-/// compteur + elapsed + ETA + message. Hidden hors TTY.
+/// compteur + elapsed + ETA + message. Hidden hors TTY ou `quiet`.
 #[must_use]
-pub fn bar(len: u64, msg: &str) -> ProgressBar {
-    if !std::io::stderr().is_terminal() {
+pub fn bar(len: u64, msg: &str, quiet: bool) -> ProgressBar {
+    if quiet || !std::io::stderr().is_terminal() {
         return ProgressBar::hidden();
     }
     let color = colors_for(Stream::Stderr);
@@ -41,7 +42,7 @@ pub fn bar(len: u64, msg: &str) -> ProgressBar {
     } else {
         "{spinner} {bar:40} {pos}/{len} {elapsed} eta {eta} {msg}"
     };
-    let pb = ProgressBar::with_draw_target(len, ProgressDrawTarget::stderr_with_hz(DRAW_HZ));
+    let pb = ProgressBar::with_draw_target(Some(len), ProgressDrawTarget::stderr_with_hz(DRAW_HZ));
     pb.set_style(
         ProgressStyle::with_template(template)
             .unwrap_or_else(|_| ProgressStyle::default_bar())
@@ -52,19 +53,19 @@ pub fn bar(len: u64, msg: &str) -> ProgressBar {
 }
 
 /// Spinner transitoire de phase (baseline) : `{spinner} {msg} {elapsed}`.
-/// Hidden hors TTY. La phase appelle `finish_and_clear()` à la fin.
+/// Hidden hors TTY ou `quiet`. La phase appelle `finish_and_clear()` à la fin.
 #[must_use]
-pub fn spinner(msg: &str) -> ProgressBar {
-    if !std::io::stderr().is_terminal() {
+pub fn spinner(msg: &str, quiet: bool) -> ProgressBar {
+    if quiet || !std::io::stderr().is_terminal() {
         return ProgressBar::hidden();
     }
     let color = colors_for(Stream::Stderr);
     let template = if color {
-        "{spinner:.cyan} {msg} {elapsed:.3}s"
+        "{spinner:.cyan} {msg} {elapsed:.3}"
     } else {
-        "{spinner} {msg} {elapsed:.3}s"
+        "{spinner} {msg} {elapsed:.3}"
     };
-    let pb = ProgressBar::with_draw_target(0, ProgressDrawTarget::stderr_with_hz(DRAW_HZ));
+    let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(DRAW_HZ));
     pb.set_style(
         ProgressStyle::with_template(template).unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
@@ -115,7 +116,7 @@ impl PipelineView {
             t.dim(format!("· {summary}"))
         );
         let pb = self.multi.add(ProgressBar::with_draw_target(
-            1,
+            Some(1),
             ProgressDrawTarget::stderr_with_hz(DRAW_HZ),
         ));
         pb.set_style(
@@ -134,7 +135,7 @@ impl PipelineView {
             };
         }
         PhaseLine {
-            pb: self.multi.add(spinner(msg)),
+            pb: self.multi.add(spinner(msg, false)),
         }
     }
 
@@ -184,7 +185,7 @@ mod tests {
         line.clear();
         line.done("y");
         line.set_message("z");
-        assert!(view.attach(bar(10, "x")).is_hidden());
+        assert!(view.attach(bar(10, "x", false)).is_hidden());
     }
 
     #[test]
@@ -200,8 +201,9 @@ mod tests {
         // Avec `--nocapture` sur un vrai TTY, les barres sont réelles —
         // on n'affirme alors que la non-panique.
         if !std::io::stderr().is_terminal() {
-            assert!(bar(10, "x").is_hidden());
-            assert!(spinner("x").is_hidden());
+            assert!(bar(10, "x", false).is_hidden());
+            assert!(spinner("x", false).is_hidden());
+            assert!(bar(10, "x", true).is_hidden());
         }
     }
 }

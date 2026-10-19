@@ -13,6 +13,7 @@ fn blank_cli() -> Cli {
         captured_argv: Vec::new(),
         command: None,
         profile: None,
+        quiet: false,
         // Point at a path that never exists so auto-discovered files
         // (`./injekt.toml`, `~/.config/...`) still apply, but the
         // explicit slot never shadows them in these unit tests.

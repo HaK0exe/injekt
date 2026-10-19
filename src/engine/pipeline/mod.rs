@@ -141,6 +141,7 @@ pub(crate) async fn run_internal(
         "phase detection"
     );
 
+    let detection_req_before = state.read().await.request_count();
     let (detection_started, to_test_for_second_order) = phases::run_detection_phase(
         client,
         state,
@@ -157,12 +158,13 @@ pub(crate) async fn run_internal(
         &progress,
     )
     .await;
+    // Compteur DELTA (phase seule), même sémantique que la ligne baseline.
     progress.done_phase(
         "detection",
         &format!(
             "{:.1}s · {} req",
             detection_started.elapsed().as_secs_f64(),
-            state.read().await.request_count(),
+            state.read().await.request_count() - detection_req_before,
         ),
     );
 
