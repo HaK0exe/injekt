@@ -4,7 +4,7 @@
 > **Signature :** **le premier scanner SQLi orienté raisonnement : il dépense chaque requête comme une ressource, explique chacune de ses décisions et produit des résultats reproductibles avec un minimum de bruit.**
 > **Principe :** moins de requêtes → moins de bruit → plus de raisonnement → zéro FP.
 > **Interdit :** centaines de payloads, dizaines de tampers, copie sqlmap, feature bloat, LLM autonome, GUI, WASM.
-> **Version cible :** v1.0 publique. **Version actuelle :** v0.3.0. **MSRV :** 1.88, édition 2024, `deny(unsafe,unwrap,expect,dbg,todo)`.
+> **Version cible :** v1.0 publique. **Version actuelle :** v0.4.0 (release en préparation). **MSRV :** 1.88, édition 2024, `deny(unsafe,unwrap,expect,dbg,todo)`.
 
 ---
 

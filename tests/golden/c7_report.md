@@ -3,7 +3,7 @@
 - Target: `https://example.com/?id=1`
 - Findings: 2
 - Requests: 42
-- Tool: injekt 0.3.0
+- Tool: injekt 0.4.0
 
 | Parameter | Technique | Severity | Confidence | FP prob | DBMS |
 |---|---|---|---|---|---|

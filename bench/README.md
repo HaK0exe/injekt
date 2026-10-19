@@ -89,7 +89,7 @@ Append-only, gitignored like the rest of `reports/`. Schema per line:
 
 ```json
 {"ts": "2026-09-09T21:00:00Z", "run_id": "20260909T210000Z-injekt-A1-power-a1b2c3d4",
- "tool": "injekt", "tool_version": "injekt 0.3.0",
+ "tool": "injekt", "tool_version": "injekt 0.4.0",
  "scenario": "A1", "mode": "power", "arm": "stock", "repeat": 1, "seed": 42,
  "result": {"detected": true, "techniques": ["Boolean"], "params": ["id@query"],
             "dbms": ["None"], "confidence": 0.74, "request_count": 143,

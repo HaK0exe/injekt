@@ -877,7 +877,7 @@ are replayed on every target (a warning is logged).
   "extracted": [ /* strings pulled via --dbs/--tables/--columns/--dump/--banner/etc, NOT scrubbed */ ],
   "request_count": 123,
   // C1 provenance (top-level, additive):
-  "version": "0.3.0",
+  "version": "0.4.0",
   "git_sha": null,        // set when built with GIT_SHA (release/CI)
   "seed": 42,             // null = nondeterministic run
   "profile": "stealth",   // null = no preset
