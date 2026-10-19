@@ -16,6 +16,12 @@ fn profile_name(p: Profile) -> String {
 /// Résolution du fichier config : même boucle de candidats que
 /// `file_config::load` (le premier candidat *existant et lisible* arbitre).
 /// Uniquement des IO fichier local — jamais la cible, jamais le réseau.
+//
+// clippy::large_enum_variant explicite : `Found` porte `FileConfig` par
+// valeur (résumé léger, C15) et la clé `format` C16 vient de faire
+// franchir le seuil ; boxing casserait le shape C15 (construction/match
+// pattern dans `doctor.rs` + tests), donc allow scellé au shape voulu.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ConfigResolution {

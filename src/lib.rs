@@ -31,8 +31,20 @@ pub mod error {
     pub enum InjektError {
         #[error("invalid target: {0}")]
         InvalidTarget(String),
-        #[error("no target provided. Use --target <URL> or `injekt scan --target <URL>`")]
+        // C16 : message mis-à-jour avec la forme positionnelle — exit code 2
+        // inchangé (mapping `main`).
+        #[error(
+            "no target provided — use a target: `injekt <URL>`, `--target <URL>`, or `injekt auto --with-recon`"
+        )]
         NoTarget,
+        // C16 : positional ≠ `-u/--target` tapé — usage error (exit 2), la
+        // positional gagne sinon. Les valeurs peuvent porter des tokens
+        // (convention `InvalidTarget` ci-dessus : pas de scrub dans le
+        // message d'erreur, `main` imprime sur stderr).
+        #[error(
+            "conflicting targets: positional '{positional}' and --target '{target}' differ — keep one source only"
+        )]
+        TargetConflict { positional: String, target: String },
         #[error("http error: {0}")]
         Http(String),
         #[error("detection failed: {0}")]

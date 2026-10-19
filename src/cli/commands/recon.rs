@@ -222,6 +222,9 @@ pub async fn run(cli: &Cli, args: &ReconArgs, cancel: CancellationToken) -> anyh
             // no escalation). Keeps `ReconCommands::Scan` + `run_scan`
             // for MCP/tests; CLI behaviour converges on `auto`.
             let auto_args = crate::cli::args::AutoArgs {
+                // Positional jamais remplissable ici (`recon scan --target`
+                // ne crée pas de positional) — alias historique uniquement.
+                target_positional: None,
                 target: Some(scan_args.crawl.target.clone()),
                 with_recon: true,
                 depth: scan_args.crawl.depth,

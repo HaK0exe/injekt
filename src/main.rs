@@ -4,7 +4,7 @@
 #![deny(clippy::dbg_macro)]
 #![deny(clippy::todo)]
 
-use clap::Parser as _;
+use clap::{CommandFactory, FromArgMatches};
 use injekt::cli::{
     args::{Cli, Commands},
     commands::dispatch,
@@ -17,14 +17,19 @@ use tracing_subscriber::{EnvFilter, fmt};
 async fn main() -> ExitCode {
     match run().await {
         // Un chemin peut désormais porter un code d'exit dédié (C15 :
-        // `doctor` → 0 sans `✗`, 1 avec `✗`) ; les autres restent `()`.
+        // `doctor` → 0 sans `✗`, 1 avec `✗` ; C16 : erreur d'usage
+        // `NoTarget`/`TargetConflict` → 2) ; les autres restent `()`.
         Ok(code) => code,
         Err(e) => {
             let usage = e.chain().any(|c| {
-                matches!(
-                    c.downcast_ref::<injekt::error::InjektError>(),
-                    Some(injekt::error::InjektError::NoTarget)
-                )
+                c.downcast_ref::<injekt::error::InjektError>()
+                    .is_some_and(|e| {
+                        matches!(
+                            e,
+                            injekt::error::InjektError::NoTarget
+                                | injekt::error::InjektError::TargetConflict { .. }
+                        )
+                    })
             });
             eprintln!("Error: {e:#}");
             if usage {
@@ -36,8 +41,28 @@ async fn main() -> ExitCode {
     }
 }
 
+/// C16 — `-u/--target` **tapé** sur la ligne de commande, pour distinguer
+/// l'env `INJEKT_TARGET` (les deux parse dans `TargetOpts::target`). clap
+/// expose la source du root arg au niveau top-level quelle que soit la
+/// profondeur (flag tapé après une sous-commande aussi), donc la
+/// vérification top-level suffit. `None`/`EnvVariable`/défaut ⇒ `false`.
+fn cli_typed_target(matches: &clap::ArgMatches) -> bool {
+    matches
+        .value_source("target")
+        .is_some_and(|s| matches!(s, clap::parser::ValueSource::CommandLine))
+}
+
 async fn run() -> anyhow::Result<ExitCode> {
-    let mut cli = Cli::parse();
+    // C16 : parse via matches (`Cli::command().get_matches_from` +
+    // `from_arg_matches`) — même comportement d'erreur que `Cli::parse`
+    // (clap sort lui-même : usage 2, help/version 0) mais permet de
+    // distinguer `-u/--target` tapé de l'env (`cli_typed_target`).
+    let matches = Cli::command().get_matches_from(std::env::args_os());
+    let mut cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+    cli.cli_typed_target = cli_typed_target(&matches);
     // C14 : capture de l'argv original (nom du binaire exclu) pour le patch
     // de suggestion `INCONCLUSIVE`. `args_os` + `to_string_lossy` (aucun
     // panique possible : un argv non-UTF8 échoue déjà dans `Cli::parse`) ;

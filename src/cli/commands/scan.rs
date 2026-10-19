@@ -169,7 +169,11 @@ async fn run_bulk_cli(cli: &Cli, cancel: CancellationToken) -> Result<()> {
         );
     }
     if let Some(out) = &cli.output_opts.output {
-        let body = if matches!(cli.output_opts.format, crate::cli::args::ReportFormat::Json) {
+        // C16 : `--format` résolu (CLI/env > extension de `--output` >
+        // config TOML > json, warning une fois en cas de conflit explicite
+        // ≠ extension).
+        let format = cli.effective_format();
+        let body = if matches!(format, crate::cli::args::ReportFormat::Json) {
             serde_json::to_string_pretty(&report.to_json(&scrubber))?
         } else {
             // SARIF/JUnit/Markdown aggregate every per-target finding into
@@ -190,7 +194,7 @@ async fn run_bulk_cli(cli: &Cli, cancel: CancellationToken) -> Result<()> {
                 report.request_count_total,
                 crate::reporting::json::ReportMeta::default(),
             );
-            render_report(&aggregated, cli.output_opts.format, &scrubber)
+            render_report(&aggregated, format, &scrubber)
         };
         super::common::write_report_async(
             Some(out),
@@ -199,7 +203,7 @@ async fn run_bulk_cli(cli: &Cli, cancel: CancellationToken) -> Result<()> {
             &scrubber.scrub(out),
         )
         .await?;
-        info!(path=%scrubber.scrub(out), format=%cli.output_opts.format.to_string(), "bulk report written (0o600, no overwrite unless --force)");
+        info!(path=%scrubber.scrub(out), format=%format.to_string(), "bulk report written (0o600, no overwrite unless --force)");
     }
     Ok(())
 }
@@ -296,6 +300,9 @@ pub async fn run(cli: &Cli, args: &ScanArgs, cancel: CancellationToken) -> Resul
     // calling convention. Deprecation warn lives in `dispatch` (explicit
     // subcommand only — bare mode must not warn).
     let _ = args.target.as_deref();
+    // C16 : conflit positional ≠ `-u/--target` tapé → usage error (exit 2),
+    // avant tout autre traitement (dry-run inclus).
+    cli.validate_target_conflict()?;
     if cli.output_opts.dry_run {
         dry_run(cli);
         return Ok(());
@@ -353,7 +360,8 @@ pub async fn run(cli: &Cli, args: &ScanArgs, cancel: CancellationToken) -> Resul
     }
 
     if let Some(out) = &cli.output_opts.output {
-        let body = render_report(&result.report, cli.output_opts.format, &scrubber);
+        let format = cli.effective_format();
+        let body = render_report(&result.report, format, &scrubber);
         // Secure write: 0o600, create_new (no overwrite unless --force),
         // relative-only + canonicalized parent (see `output::file`).
         super::common::write_report_async(
@@ -363,7 +371,7 @@ pub async fn run(cli: &Cli, args: &ScanArgs, cancel: CancellationToken) -> Resul
             &scrubber.scrub(out),
         )
         .await?;
-        info!(path=%scrubber.scrub(out), format=%cli.output_opts.format.to_string(), "report written (0o600, no overwrite unless --force)");
+        info!(path=%scrubber.scrub(out), format=%format.to_string(), "report written (0o600, no overwrite unless --force)");
     }
 
     if let Some(path) = &cli.output_opts.export_encrypted {

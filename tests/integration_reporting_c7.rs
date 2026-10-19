@@ -16,7 +16,8 @@
 //!   not pass `--no-redact` (local debugging only).
 //! - **Backwards compatibility:** pre-C7 minimal finding JSON (6 fields)
 //!   still deserializes via `#[serde(default)]`.
-//! - **`--format` contract:** default `json`, `sarif|junit|md` accepted.
+//! - **`--format` contract:** effective default `json` (C16: clap-level
+//!   `Option`, resolved by `Cli::effective_format`), `sarif|junit|md` accepted.
 
 use clap::Parser;
 use injekt::{
@@ -314,9 +315,14 @@ fn pre_c7_minimal_finding_json_still_deserializes() {
 #[test]
 fn report_format_defaults_to_json() {
     assert!(matches!(ReportFormat::default(), ReportFormat::Json));
+    // C16: `--format` is an `Option` (no clap default); the effective
+    // default is resolved by `Cli::effective_format` (json).
     let cli = Cli::try_parse_from(["injekt", "scan", "--target", "https://example.com/?id=1"])
         .expect("cli parses");
-    assert!(matches!(cli.output_opts.format, ReportFormat::Json));
+    assert!(
+        cli.output_opts.format.is_none(),
+        "no clap-level default (C16)"
+    );
     for (flag, expected) in [
         ("sarif", ReportFormat::Sarif),
         ("junit", ReportFormat::Junit),
@@ -332,7 +338,8 @@ fn report_format_defaults_to_json() {
         ])
         .expect("cli parses with --format");
         assert_eq!(
-            cli.output_opts.format, expected,
+            cli.output_opts.format,
+            Some(expected),
             "--format {flag} not honoured"
         );
     }

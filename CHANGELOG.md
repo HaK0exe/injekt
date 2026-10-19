@@ -22,6 +22,26 @@ Roadmap `docs/ROADMAP-v1.0.md` §v1.0-rc : rien de nouveau — geler, durcir, pr
 
 ### Added
 
+- **C16 — CLI vague 1 (zéro breaking)** : (1) positional `injekt <URL>` /
+  `injekt auto <URL|HOST>` (coexiste avec `-u/--target` / env `INJEKT_TARGET` /
+  aliases existants ; précidence `--raw-file > positional > --target > env` ;
+  positional > env **silencieusement**, conflit usage `TargetConflict`
+  (`InjektError`, exit 2) seulement pour un flag `-u/--target` **tapé** ≠
+  positional, valeurs égales ⇒ silencieux) ; (2) `--format` déduit de
+  l'extension de `--output` (`cli::resolve::format::infer_from_extension` :
+  `.json/.sarif/.junit|.xml/.md|.markdown` ; précidence CLI > env
+  `INJEKT_FORMAT` > extension > clé `format` du TOML > default `json` ; warning
+  de conflit une fois max par invocation (`Arc<AtomicBool>` anti-clone),
+  extensions inconnues jamais déduites jamais warning, clé TOML inconnue ⇒
+  warn) ; (3) fixes : `InjektError::NoTarget` (message retourne les formes
+  positionnelles, exit 2 inchangé), `TargetConflict` helper d'usage,
+  commentaire mort `InitArgs`. Zéro flag supprimé, `scan`/`auto --target`/
+  aliases inchangés (zéro-break), parité MCP adaptée (`tools/builder`).
+  Tests : `tests/integration_cli_c16.rs` (9 tests, binaire réel : positional,
+  sarif-par-extension + contenu rendu, config-TOML < extension, warning
+  conflit, unknown ext silencieuse) + proptests `tests/proptest_parsers.rs`
+  (positional vs subcommand, conflits) + regen délibérée du freeze surface.
+
 - **C15 — `injekt doctor`** (0 socket TCP, 0 fetch — vérifie la config
   LOCALE, jamais la cible, jamais le réseau) : nouvelle sous-commande
   `cli::commands::doctor`, early-branchée dans `main` comme le serveur MCP

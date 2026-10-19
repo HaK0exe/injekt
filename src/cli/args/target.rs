@@ -4,8 +4,11 @@ use clap::Args;
 
 /// Target selection. Bulk ingestion (`--bulk-file`, `--raw-dir`, `--stdin`,
 /// `--openapi-file`, `--sitemap-file`, `collect_targets`) is additive;
-/// single-scan (`--target` / `scan --target` / `--raw-file`) is exclusive —
-/// `--raw-file` wins and `--target` is ignored (see `Cli::resolve`).
+/// single-scan (`positional`, `--target` / `scan --target` / `--raw-file`)
+/// is exclusive — documented precedence (C16): `--raw-file` > positional >
+/// `-u/--target` (CLI then env `INJEKT_TARGET`) > `scan --target` alias;
+/// see `Cli::effective_target` (a positional + CLI-typed `--target` that
+/// disagree is a usage error via `validate_target_conflict`).
 #[derive(Clone, Args)]
 #[non_exhaustive]
 pub struct TargetOpts {

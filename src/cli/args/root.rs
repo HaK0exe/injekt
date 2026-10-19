@@ -105,6 +105,37 @@ pub struct Cli {
     /// Vide (MCP, constructions programmatiques) ⇒ suggestion `None`.
     #[arg(skip)]
     pub captured_argv: Vec<String>,
+
+    /// C16 — cible positionnelle : `injekt <URL>` (tout token qui ne matche
+    /// pas une sous-commande). Coexiste avec `-u/--target` / env
+    /// `INJEKT_TARGET` — précidence documentée : `--raw-file` > positional >
+    /// `-u/--target` > env. Positional + `-u/--target` explicites **différents**
+    /// ⇒ erreur d'usage `TargetConflict` (exit 2, [`crate::error::InjektError`]
+    /// ; `validate_target_conflict`) ; égaux ⇒ silencieux.
+    #[arg(value_name = "URL", help_heading = "Target")]
+    pub target_positional: Option<String>,
+
+    /// C16 — `-u/--target` **typé sur la ligne de commande**
+    /// (`ValueSource::CommandLine`) vs env `INJEKT_TARGET` (`EnvVariable`) :
+    /// clap parse les deux dans le même champ `TargetOpts::target`, mais la
+    /// précidence `positional > env` impose la distinction (positional bat
+    /// l'env **silencieusement** ; le conflit d'usage n'est levé que pour un
+    /// flag tapé + positional), voir `validate_target_conflict`. Sensibilisé
+    /// dans `main` (`get_matches_from` + `from_arg_matches`), skippé par clap
+    /// (état interne, jamais un flag) ; défaut `false` garanti pour les
+    /// constructions programmatiques (MCP, tests) — aucun conflit n'y est
+    /// jamais levé. `pub` comme `captured_argv` : le binaire (`main`, crate
+    /// séparé) doit le renseigner après `from_arg_matches`.
+    #[arg(skip)]
+    pub cli_typed_target: bool,
+
+    /// C16 — garde « warning une fois » du conflit `--format` explicite
+    /// (CLI/env) ≠ extension de `--output` (`effective_format`). Skippé par
+    /// clap ; `Arc<AtomicBool>` pour survivre au `Clone` de `Cli` (une
+    /// invocation ⇒ un warning max). `pub` comme `captured_argv` (crate bin
+    /// séparé), l'écriture reste interne à la lib.
+    #[arg(skip)]
+    pub format_conflict_warned: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 // Manual `Debug` for `Cli`: secrets stay in `SecretString` / scrubbed output
@@ -127,6 +158,16 @@ impl core::fmt::Debug for Cli {
             .field("knowledge_path", &self.knowledge_path)
             .field("verbose", &self.verbose)
             .field("no_banner", &self.no_banner)
+            // C16 : la positional peut porter un token d'URL — même scrub
+            // que `TargetOpts::target` ci-dessus.
+            .field(
+                "target_positional",
+                &self
+                    .target_positional
+                    .as_ref()
+                    .map(|s| crate::session::scrubber::Scrubber::new(false).scrub(s)),
+            )
+            .field("cli_typed_target", &self.cli_typed_target)
             // `captured_argv` volontairement absent du Debug : l'argv brut peut
             // porter des secrets (tokens d'URL, cookies) — sa longueur seule.
             .field("captured_argv_len", &self.captured_argv.len())
@@ -266,10 +307,16 @@ pub struct DoctorArgs {}
 #[non_exhaustive]
 pub struct AutoArgs {
     /// Target URL or bare host. A bare host (no `://`) implies `--with-recon`.
+    /// C16 positional form `injekt auto <URL|HOST>`; coexists with the legacy
+    /// `--target` alias (whole target precedence stays documented in
+    /// `DOCUMENTATION.md` / `Cli::effective_target`).
+    #[arg(value_name = "URL|HOST", help_heading = "Target")]
+    pub target_positional: Option<String>,
+    /// Target URL or bare host (historical spelling; kept for zero-break).
     #[arg(
         long,
         hide_short_help = true,
-        help = "Alias historique de --target global (-u), préférer bare injekt --target"
+        help = "Alias historique de --target global (-u), préférer `injekt auto <URL|HOST>`"
     )]
     pub target: Option<String>,
     /// Crawl before scanning (discovers params, then tests each candidate).
@@ -298,9 +345,10 @@ pub struct InitArgs {
     /// Preset to seed the file with (`quick|balanced|stealth|aggressive`).
     #[arg(long, default_value = "balanced")]
     pub preset: String,
-    // Note: overwrite uses the global `--force` (`Cli::force`), not a
-    // subcommand-local flag, so `injekt init --force` keeps working via the
-    // global arg without a clap duplicate.
+    // Note: overwrite uses the flattened global `--force` flag
+    // (`output_opts.force`), not a subcommand-local flag, so
+    // `injekt init --force` keeps working via the flattened arg without a
+    // clap duplicate.
 }
 
 #[derive(Parser, Debug, Clone)]

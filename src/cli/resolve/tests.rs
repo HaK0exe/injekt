@@ -26,6 +26,11 @@ fn blank_cli() -> Cli {
             openapi_file: None,
             sitemap_file: None,
         },
+        // C16 : jamais de conflit positional/flag dans le fixture
+        // (constructions programmatiques ⇒ `cli_typed_target` false).
+        target_positional: None,
+        cli_typed_target: false,
+        format_conflict_warned: std::sync::Arc::default(),
         http: HttpOpts {
             method: None,
             headers: Vec::new(),
@@ -104,7 +109,9 @@ fn blank_cli() -> Cli {
         },
         output_opts: OutputOpts {
             output: None,
-            format: ReportFormat::Json,
+            // C16 : `Option` sans default clap — la résolution
+            // (`effective_format`) fournit le `json` effectif.
+            format: None,
             dry_run: false,
             no_redact: false,
             explain: None,
@@ -468,4 +475,209 @@ fn generative_defaults_to_off_byte_identical() {
         cli.effective_max_generated(),
         crate::generation::MAX_GENERATED
     );
+}
+
+// --- C16 : positional target ------------------------------------------------
+
+#[test]
+fn positional_target_top_level_wins_between_flag_and_env() {
+    // Precedence (doc figée): `--raw-file` > positional > `-u/--target` > env.
+    let mut cli = blank_cli();
+    cli.target_positional = Some("https://pos.example/?id=1".to_owned());
+    cli.target_opts.target = Some("https://flag.example/?id=1".to_owned());
+    assert_eq!(
+        cli.effective_target().as_deref(),
+        Some("https://pos.example/?id=1")
+    );
+    assert_eq!(
+        cli.try_effective_target().unwrap().as_deref(),
+        Some("https://pos.example/?id=1")
+    );
+    // Env-sourced indistinguishable from the field: no typed flag ⇒ no
+    // conflict ever (`cli_typed_target` false in programmatic fixtures).
+    assert!(cli.validate_target_conflict().is_ok());
+}
+
+#[test]
+fn positional_conflict_only_for_cli_typed_flag() {
+    let mut cli = blank_cli();
+    cli.target_positional = Some("https://pos.example/?id=1".to_owned());
+    cli.target_opts.target = Some("https://flag.example/?id=1".to_owned());
+    // env INJEKT_TARGET occupies the same field: positional > env silently.
+    cli.cli_typed_target = false;
+    assert!(cli.validate_target_conflict().is_ok());
+    cli.cli_typed_target = true;
+    // Typed `-u/--target` + different positional = usage error (exit 2).
+    let err = cli.validate_target_conflict().unwrap_err();
+    assert!(
+        matches!(err, crate::error::InjektError::TargetConflict { .. }),
+        "{err}"
+    );
+    // Equal values: silent (zero-break `injekt <URL> -u <URL>`).
+    cli.target_opts.target = Some("https://pos.example/?id=1".to_owned());
+    assert!(cli.validate_target_conflict().is_ok());
+}
+
+#[test]
+fn auto_positional_feeds_resolution_and_conflict() {
+    use crate::cli::args::{AutoArgs, Commands};
+    let mut cli = blank_cli();
+    cli.command = Some(Commands::Auto(AutoArgs {
+        target_positional: Some("https://auto.example/?id=1".to_owned()),
+        target: None,
+        with_recon: false,
+        depth: 2,
+        max_pages: 100,
+        no_escalate: false,
+        auto_enumerate: false,
+    }));
+    assert_eq!(
+        cli.effective_target().as_deref(),
+        Some("https://auto.example/?id=1")
+    );
+    assert_eq!(cli.positional_target(), Some("https://auto.example/?id=1"));
+    let mut cli = blank_cli();
+    cli.command = Some(Commands::Auto(AutoArgs {
+        target_positional: Some("https://auto.example/?id=1".to_owned()),
+        target: Some("https://legacy.example/?id=1".to_owned()),
+        with_recon: false,
+        depth: 2,
+        max_pages: 100,
+        no_escalate: false,
+        auto_enumerate: false,
+    }));
+    // Precedence `auto`: positional > legacy alias.
+    assert_eq!(
+        cli.effective_target().as_deref(),
+        Some("https://auto.example/?id=1")
+    );
+}
+
+#[test]
+fn bare_target_flag_unchanged_by_positional() {
+    use clap::Parser as _;
+    // `-u` alone (historical zero-break): identical resolution.
+    let cli = Cli::try_parse_from(["injekt", "-u", "https://flag.example/?id=1"]).unwrap();
+    assert!(cli.target_positional.is_none());
+    assert_eq!(
+        cli.effective_target().as_deref(),
+        Some("https://flag.example/?id=1")
+    );
+    // Top-level positional parses alone (no subcommand match).
+    let cli = Cli::try_parse_from(["injekt", "https://pos.example/?id=1"]).unwrap();
+    assert!(cli.command.is_none());
+    assert_eq!(
+        cli.target_positional.as_deref(),
+        Some("https://pos.example/?id=1")
+    );
+}
+
+// --- C16 : `--format` resolution --------------------------------------------
+
+#[test]
+fn format_resolution_default_json_without_extension() {
+    let mut cli = blank_cli();
+    cli.output_opts.output = Some("report.txt".to_owned());
+    assert_eq!(cli.effective_format(), ReportFormat::Json);
+    cli.output_opts.output = None;
+    assert_eq!(cli.effective_format(), ReportFormat::Json);
+    // Unknown extension never infers (silently) and never escapes the default.
+    cli.output_opts.output = Some("x.yaml".to_owned());
+    assert_eq!(cli.effective_format(), ReportFormat::Json);
+    // `format_conflict_warned` untouched by inference paths.
+    assert!(
+        !cli.format_conflict_warned
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+}
+
+#[test]
+fn format_extension_inference_maps_known_extensions() {
+    use crate::cli::resolve::format::infer_from_extension;
+    assert_eq!(
+        infer_from_extension(Some("x.sarif")),
+        Some(ReportFormat::Sarif)
+    );
+    assert_eq!(
+        infer_from_extension(Some("X.SARIF")),
+        Some(ReportFormat::Sarif)
+    );
+    assert_eq!(
+        infer_from_extension(Some("x.json")),
+        Some(ReportFormat::Json)
+    );
+    assert_eq!(
+        infer_from_extension(Some("x.junit")),
+        Some(ReportFormat::Junit)
+    );
+    assert_eq!(
+        infer_from_extension(Some("x.xml")),
+        Some(ReportFormat::Junit)
+    );
+    assert_eq!(infer_from_extension(Some("x.md")), Some(ReportFormat::Md));
+    assert_eq!(
+        infer_from_extension(Some("x.markdown")),
+        Some(ReportFormat::Md)
+    );
+    // Unknown / no extension / non-UTF8 — silent None.
+    assert_eq!(infer_from_extension(Some("x.yaml")), None);
+    assert_eq!(infer_from_extension(Some("noext")), None);
+    assert_eq!(infer_from_extension(Some(".hidden")), None);
+    assert_eq!(
+        infer_from_extension(Some("x.tar.gz".to_string().as_str())),
+        None
+    );
+    assert_eq!(infer_from_extension(None), None);
+}
+
+#[test]
+fn format_explicit_wins_over_extension_with_warn_once() {
+    use std::sync::atomic::Ordering;
+    let mut cli = blank_cli();
+    cli.output_opts.output = Some("x.sarif".to_owned());
+    // CLI/env-parsed explicit beats the extension.
+    cli.output_opts.format = Some(ReportFormat::Md);
+    assert_eq!(cli.effective_format(), ReportFormat::Md);
+    assert!(cli.format_conflict_warned.load(Ordering::Relaxed));
+    // Warn-once guard: a second clap-owned resolution stays silent.
+    assert_eq!(cli.effective_format(), ReportFormat::Md);
+    // Equal values (md file + --format md) never raise the guard.
+    let mut cli = blank_cli();
+    cli.output_opts.output = Some("x.md".to_owned());
+    cli.output_opts.format = Some(ReportFormat::Md);
+    assert_eq!(cli.effective_format(), ReportFormat::Md);
+    assert!(!cli.format_conflict_warned.load(Ordering::Relaxed));
+    // Clone shares the warn-once guard (one invocation ⇒ one warning max).
+    let mut cli = blank_cli();
+    cli.format_conflict_warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    cli.output_opts.format = Some(ReportFormat::Json);
+    assert_eq!(cli.effective_format(), ReportFormat::Json);
+}
+
+#[test]
+fn config_toml_format_below_extension() {
+    use std::io::Write as _;
+    let mut path = std::env::temp_dir();
+    path.push(format!("injekt-test-fmt-{}.toml", std::process::id()));
+    let mut file = std::fs::File::create(&path).unwrap();
+    writeln!(file, "format = \"junit\"\n").unwrap();
+    drop(file);
+    let mut cli = blank_cli();
+    cli.config = Some(path.to_string_lossy().into_owned());
+    // No --output-format conflict possible: extension is above config.
+    cli.output_opts.output = Some("r.sarif".to_owned());
+    assert_eq!(cli.effective_format(), ReportFormat::Sarif);
+    // Without a known extension, the TOML key applies.
+    cli.output_opts.output = Some("r.txt".to_owned());
+    assert_eq!(cli.effective_format(), ReportFormat::Junit);
+    // Unknown TOML name warns + falls back to the effective default.
+    cli.output_opts.format = None;
+    let mut file = std::fs::File::create(&path).unwrap();
+    writeln!(file, "format = \"yaml\"\n").unwrap();
+    drop(file);
+    let mut cli = blank_cli();
+    cli.config = Some(path.to_string_lossy().into_owned());
+    cli.file_cache = std::sync::Arc::default();
+    assert_eq!(cli.effective_format(), ReportFormat::Json);
+    std::fs::remove_file(&path).unwrap();
 }

@@ -29,13 +29,23 @@ use tokio_util::sync::CancellationToken;
 /// Returns an error when ingestion yields no target, the client fails to
 /// build, or report output cannot be written.
 pub async fn run(cli: &Cli, args: &AutoArgs, cancel: CancellationToken) -> anyhow::Result<()> {
+    // C16 : conflit positional ≠ `-u/--target` tapé → usage error (exit 2),
+    // avant tout autre traitement (dry-run inclus).
+    cli.validate_target_conflict()?;
     if let Err(e) = cli.validate_explicit_config() {
         anyhow::bail!("{e}");
     }
     if let Err(e) = cli.validate_ai_opts() {
         anyhow::bail!("{e}");
     }
-    let auto_target = args.target.clone().or_else(|| cli.effective_target());
+    // C16 : précidence cible `auto` — positional (`auto <URL|HOST>`) >
+    // alias historique `auto --target` (inchangé quand pas de positional) >
+    // résolution globale `-u`/env/raw-file/scan-alias.
+    let auto_target = args
+        .target_positional
+        .clone()
+        .or_else(|| args.target.clone())
+        .or_else(|| cli.effective_target());
     let targets = super::common::resolve_targets(cli, auto_target.as_deref())?;
 
     if cli.output_opts.dry_run {
@@ -151,6 +161,10 @@ async fn run_auto_direct(
     }
 
     if let Some(out) = cli.output_opts.output.as_deref() {
+        // C16 : `--format` résolu (CLI/env > extension de `--output` >
+        // config TOML > json, warning une fois en cas de conflit explicite
+        // ≠ extension).
+        let format = cli.effective_format();
         let base = build_engine_config(cli, EnumGate::Passthrough);
         let meta = crate::reporting::json::ReportMeta::current(
             base.seed,
@@ -174,12 +188,12 @@ async fn run_auto_direct(
         );
         super::common::write_report_async(
             Some(out),
-            &render_report(&report, cli.output_opts.format, &scrubber),
+            &render_report(&report, format, &scrubber),
             cli.output_opts.force,
             &scrubber.scrub(out),
         )
         .await?;
-        tracing::info!(path = %scrubber.scrub(out), format = %cli.output_opts.format.to_string(), "auto report written (0o600, no overwrite unless --force)");
+        tracing::info!(path = %scrubber.scrub(out), format = %format.to_string(), "auto report written (0o600, no overwrite unless --force)");
     }
     Ok(())
 }
@@ -311,8 +325,10 @@ async fn run_auto_recon(
         cli,
     );
     if let Some(out) = cli.output_opts.output.as_deref() {
-        // Unifié sur `render_report` : respecte `--format` (json/sarif/junit/md),
-        // scrubbé et idempotent. `DiscoveryReport` brut → `JsonReport` enveloppe.
+        // Unifié sur `render_report` : respecte `--format` (json/sarif/junit/md,
+        // C16 : résolu CLI/env > extension > TOML > json), scrubbé et idempotent.
+        // `DiscoveryReport` brut → `JsonReport` enveloppe.
+        let format = cli.effective_format();
         let meta = crate::reporting::json::ReportMeta::current(
             base.seed,
             cli.active_profile()
@@ -333,7 +349,7 @@ async fn run_auto_recon(
             report.request_count,
             meta,
         );
-        let body = render_report(&json_report, cli.output_opts.format, &scrubber);
+        let body = render_report(&json_report, format, &scrubber);
         super::common::write_report_async(
             Some(out),
             &body,
