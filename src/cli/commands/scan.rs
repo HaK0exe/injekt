@@ -344,6 +344,7 @@ pub async fn run(cli: &Cli, args: &ScanArgs, cancel: CancellationToken) -> Resul
         started.elapsed(),
         result.report.findings.len(),
         suggestion,
+        Some(result.config.budget.level),
         &scrubber,
     );
     console::print_findings(&result.report.findings, &scrubber);

@@ -5,6 +5,7 @@
 //! / `Engine::collect_baseline_uncached`; only `self.*` access became explicit
 //! `client/state/cancel/config/scrubber/cache` parameters.
 
+use crate::cli::output::progress;
 use crate::{
     detection::baseline,
     http::{
@@ -19,8 +20,7 @@ use crate::{
     },
     techniques::tamper::Tamper,
 };
-use crate::cli::output::progress;
-use std::{io::IsTerminal as _, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -158,7 +158,7 @@ pub(crate) async fn collect_baseline_uncached(
 ) -> crate::error::Result<Option<(baseline::Baseline, Vec<Tamper>, ProbeOpts)>> {
     // Baseline: 3 requests (hidden when stderr is not a TTY: MCP/CI).
     // `indicatif` draws to stderr only, so stdout JSON-RPC stays clean.
-    let pb = progress::spinner("collecting baseline…");
+    let pb = progress::spinner("collecting baseline…", config.quiet);
     let phase_started = Instant::now();
     let req_before = state.read().await.request_count();
 

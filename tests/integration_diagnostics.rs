@@ -250,6 +250,7 @@ async fn repeated_429s_end_rate_limited_with_flags_suggestion() {
         Duration::from_secs(0),
         result.report.findings.len(),
         Some(suggestion.as_str()),
+        None,
         &Scrubber::new(false),
     );
 }

@@ -146,6 +146,36 @@ pub async fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         );
     }
 
+    // Verdict final aligné clig.dev (« make it easy to see the current state »):
+    // une ligne résumée plutôt que relire les 4 lignes de checks.
+    let ok = checks.iter().filter(|c| c.level == CheckLevel::Ok).count();
+    let warn = checks
+        .iter()
+        .filter(|c| c.level == CheckLevel::Warn)
+        .count();
+    let fail = checks
+        .iter()
+        .filter(|c| c.level == CheckLevel::Fail)
+        .count();
+    println!();
+    if fail > 0 {
+        println!(
+            "{} {fail} échec(s) · {warn} warning(s) · {ok} ok — exit 1, corrige les ✗ d'abord",
+            theme.icon_err(),
+        );
+    } else if warn > 0 {
+        println!(
+            "{} {warn} warning(s) · {ok} ok — config utilisable",
+            theme.icon_warn(),
+        );
+    } else {
+        println!(
+            "{} {ok}/{total} checks ok",
+            theme.icon_ok(),
+            total = checks.len()
+        );
+    }
+
     let failed = checks.iter().any(|c| c.level == CheckLevel::Fail);
     Ok(if failed {
         ExitCode::FAILURE

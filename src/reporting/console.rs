@@ -5,6 +5,7 @@ use crate::session::scrubber::Scrubber;
 use crate::session::state::Finding;
 use std::time::Duration;
 use tabled::settings::Style;
+use tabled::settings::Width;
 use tabled::{Table, Tabled};
 
 #[derive(Tabled)]
@@ -84,7 +85,12 @@ pub fn print_findings(findings: &[Finding], scrubber: &Scrubber) {
     );
     println!();
 
-    let rows: Vec<Row> = findings
+    // Group by parameter (reading an exploit attempt = read one param's
+    // story end to end), confidence descending inside a group, stable on
+    // ties so repeated runs keep the detection order.
+    let ordered = sorted_findings(findings);
+
+    let rows: Vec<Row> = ordered
         .iter()
         .map(|f| {
             let sf = f.scrubbed(scrubber);
@@ -97,21 +103,36 @@ pub fn print_findings(findings: &[Finding], scrubber: &Scrubber) {
             }
         })
         .collect();
-    let table = Table::new(rows).with(Style::rounded()).to_string();
+    // `Width::wrap` guards narrow terminals (and `tmux` panes): without it
+    // a wide target column overflows the viewport and breaks the rounded
+    // frame. `keep_words` avoids splitting target/param tokens mid-word.
+    let table = Table::new(rows)
+        .with(Style::rounded())
+        .with(Width::wrap(100).keep_words(true))
+        .to_string();
     println!("{}", t.white(table));
     println!();
 
-    for f in findings {
+    for f in &ordered {
         let sf = f.scrubbed(scrubber);
-        let (icon, label) = match severity(f.confidence, f.false_positive_prob) {
-            Severity::High => (t.dot_high(), t.danger_bold("HIGH")),
-            Severity::Medium => (t.dot_medium(), t.warning_bold("MED")),
-            Severity::Low => (t.dot_low(), t.dim("LOW")),
+        let (icon, label, bar) = match severity(f.confidence, f.false_positive_prob) {
+            Severity::High => (
+                t.dot_high(),
+                t.danger_bold("HIGH"),
+                t.danger(conf_bar(f.confidence)),
+            ),
+            Severity::Medium => (
+                t.dot_medium(),
+                t.warning_bold("MED"),
+                t.warning(conf_bar(f.confidence)),
+            ),
+            Severity::Low => (t.dot_low(), t.dim("LOW"), t.dim(conf_bar(f.confidence))),
         };
         println!(
-            "{icon} {label} {} — {}",
+            "{icon} {label} {bar} {:.2} {} — {}",
+            f.confidence,
             t.accent(sf.parameter),
-            t.dim(sf.evidence)
+            t.dim(truncate_evidence(&sf.evidence, EVIDENCE_MAX_COLS))
         );
     }
 }
@@ -134,6 +155,60 @@ pub fn run_status(state: &str, findings: usize) -> &'static str {
     }
 }
 
+/// Barre de confiance 5 segments `▰▰▰▰▱` (fin du plan UI P2) : lecture
+/// instantanée du score sans lire le nombre. Pure — la couleur (accents de
+/// sévérité) est appliquée côté `print_findings`.
+#[must_use]
+pub fn conf_bar(confidence: f64) -> String {
+    const SEGMENTS: usize = 5;
+    // Clamp saturant : un score hors [0,1] (bug futur de scoring) ne doit
+    // jamais paniquer ni déborder le repeat. Le round-half-away + clamp
+    // garantit `0..=SEGMENTS` — les cast f64→usize sont donc passés au
+    // crible (pedantic), l'allow est scoped et justifié.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let filled = (confidence.clamp(0.0, 1.0) * SEGMENTS as f64).round() as usize;
+    let filled = filled.min(SEGMENTS);
+    format!("{}{}", "▰".repeat(filled), "▱".repeat(SEGMENTS - filled))
+}
+
+/// Evidence tronquée à N colonnes (wall of text obéit au viewport, clig.dev :
+/// « truncate long strings »). Coupe sur un blanc si possible, jamais au
+/// milieu d'un escape (les séquences ANSI vivent APRÈS, dans `Theme`).
+#[must_use]
+pub fn truncate_evidence(evidence: &str, max_cols: usize) -> String {
+    if evidence.chars().count() <= max_cols {
+        return evidence.to_owned();
+    }
+    let cut: String = evidence.chars().take(max_cols).collect();
+    match cut.rfind(' ') {
+        Some(idx) if idx > max_cols / 2 => format!("{}…", &cut[..idx]),
+        _ => format!("{cut}…"),
+    }
+}
+
+/// Largeur max de la ligne d'evidence (`--no-redact` peut exfiltrer des
+/// dumps longs : la ligne finding reste scannable).
+pub const EVIDENCE_MAX_COLS: usize = 96;
+
+/// Ordre de lecture des findings : regroupés par paramètre (l'histoire d'un
+/// param se lit d'un bloc), confiance décroissante dans le groupe, stable
+/// sur les égalités (ordre de détection préservé). Pure — testable sans
+/// capture stdout.
+#[must_use]
+pub fn sorted_findings(findings: &[Finding]) -> Vec<&Finding> {
+    let mut refs: Vec<&Finding> = findings.iter().collect();
+    refs.sort_by(|a, b| {
+        a.parameter
+            .cmp(&b.parameter)
+            .then(b.confidence.total_cmp(&a.confidence))
+    });
+    refs
+}
+
 /// Print the compact human-facing result of one scan.
 ///
 /// Logs remain on stderr while this summary stays with findings on stdout.
@@ -145,6 +220,11 @@ pub fn run_status(state: &str, findings: usize) -> &'static str {
 /// un `Diagnostic::scrubbed`), imprimée uniquement quand
 /// `status == "INCONCLUSIVE"` — une run CLEAN/FINDINGS/CANCELLED n'a pas de
 /// conseil de rejeu à recevoir.
+/// `level` : profil `--level` effectif de la run — sert au hint CLEAN
+/// ([`next_step_hint`]), `None` = hors CLI (MCP/tests, pas de hint).
+// `level` : hic d'API — regrouper les stats dans une `RunStats` serait le
+// vrai fix ; l'allow trace l'intention (record de rendu, pas de logique).
+#[allow(clippy::too_many_arguments)]
 pub fn print_run_summary(
     target: &str,
     state: &str,
@@ -152,6 +232,7 @@ pub fn print_run_summary(
     elapsed: Duration,
     findings: usize,
     suggestion: Option<&str>,
+    level: Option<u8>,
     scrubber: &Scrubber,
 ) {
     let target = scrubber.scrub(target);
@@ -165,10 +246,18 @@ pub fn print_run_summary(
     println!("{}", t.kv("Target", target));
     println!("{}", t.kv("Requests", request_count));
     println!("{}", t.kv("Duration", format!("{elapsed:.1}s")));
+    let rate = if elapsed > 0.0 {
+        f64::from(u32::try_from(request_count).unwrap_or(u32::MAX)) / elapsed
+    } else {
+        0.0
+    };
+    println!("{}", t.kv("Rate", format!("{rate:.1} req/s")));
     if status == "INCONCLUSIVE"
         && let Some(sug) = suggestion
     {
         println!("{}", suggestion_line(sug, t.color()));
+    } else if let Some(hint) = next_step_hint(status, level) {
+        println!("{}", next_step_line(hint, t.color()));
     }
     println!();
 }
@@ -180,6 +269,36 @@ pub fn print_run_summary(
 pub fn suggestion_line(suggestion: &str, color: bool) -> String {
     let t = Theme::new(color);
     format!("  {} {suggestion}", t.accent("→ suggestion:"))
+}
+
+/// Hint `→ suite: …` pour les statuts SANS la ligne C14 (clig.dev :
+/// « suggest commands the user should run »). Pure — textes statiques, aucun
+/// secret (pas de target/param injecté). `None` pour `INCONCLUSIVE` (C14
+/// occupe la ligne) et pour les hints inapplicables (CLEAN au `--level 3`).
+#[must_use]
+pub fn next_step_hint(status: &str, level: Option<u8>) -> Option<&'static str> {
+    if status == "INCONCLUSIVE" {
+        return None;
+    }
+    match status {
+        "FINDINGS" => Some(
+            "confirme : --confirm (2e passe, payloads frais) · verdicts : --explain <param@location>",
+        ),
+        "CLEAN" if level.is_none_or(|l| l < 3) => Some(
+            "élargis : --level 3 (charge ORDER BY 20 cols + headers) · oracle silencieux : --techniques time",
+        ),
+        "CANCELLED" => {
+            Some("reprise déterministe du flux de payloads : --seed <n> (relance la même matrix)")
+        }
+        _ => None,
+    }
+}
+
+/// Ligne `→ suite: <hint>` (même gabarit que [`suggestion_line`]).
+#[must_use]
+pub fn next_step_line(hint: &str, color: bool) -> String {
+    let t = Theme::new(color);
+    format!("  {} {hint}", t.accent("→ suite:"))
 }
 
 /// Print extracted DB data (banner, tables, dump rows, …) collected during
@@ -206,6 +325,61 @@ pub fn print_extracted(extracted: &[String]) {
 mod tests {
     use super::*;
     use crate::session::state::TechniqueKind;
+
+    #[test]
+    fn conf_bar_buckets_are_5_segments_and_saturate() {
+        assert_eq!(conf_bar(0.0), "▱▱▱▱▱");
+        assert_eq!(conf_bar(0.85), "▰▰▰▰▱");
+        assert_eq!(conf_bar(1.0), "▰▰▰▰▰");
+        // Hors bornes (bug de scoring futur) : saturé, jamais de panic.
+        assert_eq!(conf_bar(-0.5), "▱▱▱▱▱");
+        assert_eq!(conf_bar(1.5), "▰▰▰▰▰");
+    }
+
+    #[test]
+    fn sorted_findings_groups_by_parameter_conf_desc() {
+        let mk = |param: &str, conf: f64, evidence: &str| {
+            Finding::new(
+                "http://example.com/?id=1",
+                param,
+                TechniqueKind::Boolean,
+                conf,
+                evidence,
+            )
+        };
+        let findings = [
+            mk("id@query", 0.70, "e1"),
+            mk("user@post", 0.90, "e2"),
+            mk("id@query", 0.95, "e3"),
+            mk("user@post", 0.50, "e4"),
+        ];
+        let ordered = sorted_findings(&findings);
+        let keys: Vec<(&str, f64)> = ordered
+            .iter()
+            .map(|f| (f.parameter.as_str(), f.confidence))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("id@query", 0.95),
+                ("id@query", 0.70),
+                ("user@post", 0.90),
+                ("user@post", 0.50),
+            ]
+        );
+    }
+
+    #[test]
+    fn truncate_evidence_cuts_on_words_and_marks() {
+        assert_eq!(truncate_evidence("short", 96), "short");
+        let long = "word ".repeat(30);
+        let cut = truncate_evidence(&long, 20);
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(cut.chars().count() <= 21, "{cut}");
+        // Pas de blanc découpable : coupe franche à la borne (jamais mid-token).
+        let no_space = "a".repeat(100);
+        assert_eq!(truncate_evidence(&no_space, 40).chars().count(), 41);
+    }
 
     fn finding_with_secret() -> Finding {
         Finding::new(
@@ -274,6 +448,31 @@ mod tests {
         assert_eq!(
             suggestion_line("injekt --rate-limit 2", false),
             "  → suggestion: injekt --rate-limit 2"
+        );
+    }
+
+    #[test]
+    fn next_step_hint_matches_outcomes() {
+        // clig.dev : « suggest commands the user should run » — chaque statut
+        // sauf INCONCLUSIVE (la ligne C14 occupe le slot) reçoit un hint.
+        assert!(next_step_hint("INCONCLUSIVE", Some(1)).is_none());
+        assert_eq!(
+            next_step_hint("CANCELLED", Some(1)),
+            Some("reprise déterministe du flux de payloads : --seed <n> (relance la même matrix)")
+        );
+        assert!(next_step_hint("FINDINGS", Some(2)).is_some_and(|h| h.contains("--confirm")));
+        // CLEAN à level < 3 → élargir; CLEAN au max → pas de hint (pas de
+        // conseil inapplicable). `None` (MCP/tests) = toujours éligible.
+        assert!(next_step_hint("CLEAN", Some(1)).is_some());
+        assert!(next_step_hint("CLEAN", Some(3)).is_none());
+        assert!(next_step_hint("CLEAN", None).is_some());
+    }
+
+    #[test]
+    fn next_step_line_verbatim() {
+        assert_eq!(
+            next_step_line("élargis : --level 3", false),
+            "  → suite: élargis : --level 3"
         );
     }
 }

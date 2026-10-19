@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+use crate::cli::output::progress;
 use crate::{
     engine::orchestrator::{Engine, EngineConfig},
     http::client::HttpClient,
@@ -7,9 +8,8 @@ use crate::{
     session::state::Finding,
 };
 use futures::StreamExt as _;
-use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
-use std::{io::IsTerminal as _, sync::Arc};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -49,7 +49,7 @@ pub async fn scan_candidates(
     // Global progress across all candidates: per-engine bars are suppressed
     // for single-param runs, so without this a bulk scan looks hung for its
     // whole duration. Hidden when stderr is not a TTY (MCP stdio, pipes, CI).
-    let bar = Arc::new(progress_bar(total as u64));
+    let bar = Arc::new(progress::bar(total as u64, "recon", config.quiet));
     futures::stream::iter(candidates)
         .for_each_concurrent(concurrency, |candidate| {
             let config = config.clone();
@@ -118,17 +118,5 @@ pub async fn scan_candidates(
     report
 }
 
-/// Bulk progress bar, hidden when stderr is not a TTY (same contract as the
-/// engine-level bars so agent/CI output stays clean).
-fn progress_bar(len: u64) -> ProgressBar {
-    if !std::io::stderr().is_terminal() {
-        return ProgressBar::hidden();
-    }
-    let pb = ProgressBar::new(len);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{bar:40} {pos}/{len} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_bar()),
-    );
-    pb
-}
+// (le builder partagé stylé vit dans `crate::cli::output::progress::bar` —
+// même contrat TTY, template enrichi)
