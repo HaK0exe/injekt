@@ -60,7 +60,7 @@ impl Jitter {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss
     )]
-    pub fn next_delay_with_rng(&self, rng: &mut impl rand::Rng) -> std::time::Duration {
+    pub fn next_delay_with_rng(&self, rng: &mut impl rand::RngExt) -> std::time::Duration {
         let normal = match Normal::new(self.mean_ms, self.stddev_ms.max(1.0)) {
             Ok(n) => n,
             Err(_) => {
@@ -83,7 +83,7 @@ impl Jitter {
     }
 
     /// Seeded jitter sleep: delay drawn from `rng`.
-    pub async fn sleep_with_rng(&self, rng: &mut impl rand::Rng) {
+    pub async fn sleep_with_rng(&self, rng: &mut impl rand::RngExt) {
         let delay = self.next_delay_with_rng(rng);
         tokio::time::sleep(delay).await;
     }
@@ -110,7 +110,7 @@ impl Jitter {
     /// before sleeping, so `--seed` runs are deterministic.
     pub async fn sleep_cancellable_with_rng(
         &self,
-        rng: &mut impl rand::Rng,
+        rng: &mut impl rand::RngExt,
         cancel: &CancellationToken,
     ) -> bool {
         let delay = self.next_delay_with_rng(rng);

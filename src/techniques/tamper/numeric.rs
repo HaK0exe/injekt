@@ -23,7 +23,7 @@ fn integer_literal_regex() -> Option<&'static Regex> {
 /// - all-zero literals (`0`, `00`) stay `0` so `DIV 0 → NULL` (falsy, oracle
 ///   holds) and `XOR 0` (falsy) survive the ASCII-hex style (`0` → `0x30`=48
 ///   would turn falsy into truthy and flip `1 DIV 0` / `1 XOR 0` to true).
-pub(super) fn apply_numeric_obfuscate(payload: &str, rng: &mut impl rand::Rng) -> String {
+pub(super) fn apply_numeric_obfuscate(payload: &str, rng: &mut impl rand::RngExt) -> String {
     let (body, tail) = split_trailing_comment(payload);
     let Some(re) = integer_literal_regex() else {
         return payload.to_owned();

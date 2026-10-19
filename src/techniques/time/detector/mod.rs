@@ -139,7 +139,7 @@ pub fn strip_time_outliers_ms(values: &[f64], mad_coeff: f64) -> Vec<f64> {
 /// The token comes from the seeded RNG (`crate::seeded_rng::make_rng`), so
 /// `--seed` runs stay deterministic.
 #[must_use]
-pub fn cache_variant(payload: &str, rng: &mut impl rand::Rng) -> String {
+pub fn cache_variant(payload: &str, rng: &mut impl rand::RngExt) -> String {
     let token: u32 = rng.random();
     format!("/*{token:08x}*/{payload}")
 }

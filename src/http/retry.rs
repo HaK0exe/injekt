@@ -173,7 +173,7 @@ impl RetryPolicy {
         clippy::cast_sign_loss,
         clippy::cast_possible_wrap
     )]
-    pub fn delay_for_with_rng(&self, attempt: usize, rng: &mut impl rand::Rng) -> Duration {
+    pub fn delay_for_with_rng(&self, attempt: usize, rng: &mut impl rand::RngExt) -> Duration {
         if attempt == 0 {
             return Duration::from_millis(0);
         }
@@ -221,7 +221,7 @@ impl RetryPolicy {
         &self,
         attempt: usize,
         retry_after: Option<&str>,
-        rng: &mut impl rand::Rng,
+        rng: &mut impl rand::RngExt,
     ) -> Duration {
         let base = self.delay_for_with_rng(attempt, rng);
         let Some(raw) = retry_after else {

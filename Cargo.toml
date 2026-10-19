@@ -32,29 +32,32 @@ tokio-util = "0.7"
 futures = "0.3"
 
 # HTTP (`json` removed: no `Response::json`/`.json()` use — serde_json only;
-# `cookies` kept: `ClientBuilder::cookie_store` is gated behind it)
-reqwest = { version = "0.12", default-features = false, features = ["gzip", "brotli", "socks", "cookies", "rustls-tls", "stream"] }
+# `cookies` kept: `ClientBuilder::cookie_store` is gated behind it;
+# `rustls-no-provider` (0.13 renamed `rustls-tls` -> `rustls`): we install the
+# `ring` crypto provider explicitly instead of reqwest's new default aws-lc-rs)
+reqwest = { version = "0.13", default-features = false, features = ["gzip", "brotli", "socks", "cookies", "rustls-no-provider", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 url = { version = "2", features = ["serde"] }
 http = "1"
 bytes = "1"
-scraper = "0.24"
+scraper = "0.27"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 owo-colors = "4"
-indicatif = "0.17"
-tabled = "0.15"
+indicatif = "0.18"
+tabled = "0.22"
 
 # MCP
-rmcp = { version = "3.4", features = ["server", "transport-io"] }
+rmcp = { version = "3.5", features = ["server", "transport-io"] }
 schemars = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1"
 
 # Errors
 thiserror = "2"
@@ -63,15 +66,15 @@ anyhow = "1"
 # OPSEC / crypto
 zeroize = { version = "1", features = ["derive"] }
 secrecy = "0.10"
-chacha20poly1305 = "0.10"
-argon2 = "0.5"
-rand = "0.9"
-rand_distr = "0.5"
-sha2 = "0.10"
+chacha20poly1305 = "0.11"
+argon2 = "0.6"
+rand = "0.10"
+rand_distr = "0.6"
+sha2 = "0.11"
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 subtle = "2.6"
-rpassword = "7.3"
+rpassword = "7.5"
 
 # Utils
 regex = "1"

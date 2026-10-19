@@ -40,6 +40,7 @@ pub(crate) async fn run_detection_phase(
     effective_tampers: &[Tamper],
     context_result: &crate::dbms::context::ContextProbeResult,
     to_test: Vec<TargetParameter>,
+    progress: &crate::cli::output::progress::PipelineView,
 ) -> (Instant, Vec<TargetParameter>) {
     let detection_started = Instant::now();
     let detection_req_before = state.read().await.request_count();
@@ -62,6 +63,7 @@ pub(crate) async fn run_detection_phase(
         &context_result.dbms_belief,
         context_result.probes_sent,
         to_test,
+        progress,
     )
     .await;
     {

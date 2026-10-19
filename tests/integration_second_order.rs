@@ -8,6 +8,15 @@ use wiremock::{
     matchers::{method, path},
 };
 
+/// reqwest 0.13 (`rustls-no-provider`) : provider `ring` installé une fois
+/// par processus, même invariant que [`injekt::http::client::HttpClient`]
+/// (`ensure_rustls_provider` à la construction). Les tests qui construisent
+/// un `reqwest::Client` brut passent par ce helper.
+fn test_http() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::new()
+}
+
 /// Proof-of-concept harness for second-order (Option A passive + future Option B actif).
 /// POST /register stocke `user`, GET /admin reflète le stock.
 /// Aucune payload RCE, uniquement marqueur bénin `u<hex>`.
@@ -53,7 +62,7 @@ async fn second_order_store_then_manual_revisit_harness() {
     assert_eq!(state.stored_count(), 1);
 
     // 1. Store via POST.
-    let http = reqwest::Client::new();
+    let http = test_http();
     let register_url = format!("{}/register", server.uri());
     let resp = http
         .post(&register_url)
@@ -96,7 +105,7 @@ async fn second_order_no_reflection_without_store() {
         .mount(&server)
         .await;
 
-    let http = reqwest::Client::new();
+    let http = test_http();
     let body = http
         .get(format!("{}/admin", server.uri()))
         .send()

@@ -236,7 +236,7 @@ impl Tamper {
     /// Seeded variant of [`Self::apply`]: all randomness is drawn from `rng`.
     /// Pass `&mut crate::seeded_rng::make_rng(seed)` for deterministic runs.
     #[must_use]
-    pub fn apply_with_rng(&self, payload: &str, rng: &mut impl rand::Rng) -> String {
+    pub fn apply_with_rng(&self, payload: &str, rng: &mut impl rand::RngExt) -> String {
         match self {
             Self::Space2Comment => {
                 let (body, tail) = split_trailing_comment(payload);

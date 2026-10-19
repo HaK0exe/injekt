@@ -121,7 +121,7 @@ pub(super) fn apply_comment_swap(base: &str, style: CommentStyle) -> Option<Stri
 /// Même `seed` → même sortie ; `None` = OS-random (historique).
 /// `None` si aucun caractère ASCII alphabétique (rien à mixer).
 pub(super) fn apply_case_mix(base: &str, seed: Option<u64>) -> Option<String> {
-    use rand::Rng as _;
+    use rand::RngExt as _;
     if !base.chars().any(|c| c.is_ascii_alphabetic()) {
         return None;
     }

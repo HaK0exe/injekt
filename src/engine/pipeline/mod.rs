@@ -40,6 +40,9 @@ pub(crate) async fn run_internal(
     let mut current = EngineState::Parse;
     let run_started = Instant::now();
     info!(target=%scrubber.scrub(target_str), state=?current, "engine start");
+    // Vue pipeline (stderr, cargo-style) : lignes `✓ phase · résumé`
+    // persistantes + barre de détection greffée. Muet si `--quiet` ou hors TTY.
+    let progress = crate::cli::output::progress::PipelineView::new(config.quiet);
 
     // `--confirm` strict second-pass (C6): re-sonde every confirmed finding
     // with fresh payloads + derived seed after detection (OOB excluded).
@@ -58,6 +61,8 @@ pub(crate) async fn run_internal(
     let candidate_param = candidate.map(crate::recon::ParameterCandidate::target_parameter);
     let raw_request = build_raw_request(config, candidate);
 
+    let baseline_started = Instant::now();
+    let baseline_req_before = state.read().await.request_count();
     let (baseline, effective_tampers, effective_opts, baseline_unreachable) =
         match phases::run_baseline_phase(
             client,
@@ -81,6 +86,14 @@ pub(crate) async fn run_internal(
             } => (baseline, effective_tampers, opts, baseline_unreachable),
             BaselinePhase::Stop(stop) => return Ok(stop),
         };
+    progress.done_phase(
+        "baseline",
+        &format!(
+            "{:.1}s · {} req",
+            baseline_started.elapsed().as_secs_f64(),
+            state.read().await.request_count() - baseline_req_before,
+        ),
+    );
 
     current = EngineState::Context;
     info!(
@@ -98,6 +111,7 @@ pub(crate) async fn run_internal(
     );
     let raw_request = Arc::new(raw_request);
     let primary_param = to_test.first();
+    let context_started = Instant::now();
     let context_result = phases::run_context_phase(
         client,
         state,
@@ -111,6 +125,14 @@ pub(crate) async fn run_internal(
         primary_param,
     )
     .await;
+    progress.done_phase(
+        "context",
+        &format!(
+            "{:.1}s · {} param(s) à tester",
+            context_started.elapsed().as_secs_f64(),
+            to_test.len(),
+        ),
+    );
 
     current = EngineState::Detection;
     info!(
@@ -132,8 +154,17 @@ pub(crate) async fn run_internal(
         &effective_tampers,
         &context_result,
         to_test,
+        &progress,
     )
     .await;
+    progress.done_phase(
+        "detection",
+        &format!(
+            "{:.1}s · {} req",
+            detection_started.elapsed().as_secs_f64(),
+            state.read().await.request_count(),
+        ),
+    );
 
     let confirm_scope = if config.confirm {
         ConfirmScope::All
@@ -195,6 +226,7 @@ pub(crate) async fn run_internal(
         state=?current,
         "phase fingerprint"
     );
+    let fingerprint_started = Instant::now();
     phases::run_fingerprint_phase(
         client,
         state,
@@ -210,6 +242,10 @@ pub(crate) async fn run_internal(
         effective_opts,
     )
     .await;
+    progress.done_phase(
+        "fingerprint",
+        &format!("{:.1}s", fingerprint_started.elapsed().as_secs_f64()),
+    );
 
     phases::run_extraction_phase(
         client,

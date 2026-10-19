@@ -29,7 +29,7 @@ pub(super) fn apply_equal_to_like(payload: &str) -> String {
 /// Seeded trailing line-comment swap. Without a `split_trailing_comment`
 /// tail the payload is returned unchanged (still boolean-safe: both
 /// branches stay distinct).
-pub(super) fn apply_linecomment(payload: &str, rng: &mut impl rand::Rng) -> String {
+pub(super) fn apply_linecomment(payload: &str, rng: &mut impl rand::RngExt) -> String {
     static VARIANTS: &[&str] = &["--+", "%23", ";/*"];
     let (body, tail) = split_trailing_comment(payload);
     if tail.is_empty() {

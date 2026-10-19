@@ -144,7 +144,7 @@ fn rotate_by_seed(candidates: &mut [GeneratedCandidate], seed: Option<u64>) {
     }
     let mut rng = crate::seeded_rng::make_rng(seed);
     let offset = {
-        use rand::Rng as _;
+        use rand::RngExt as _;
         rng.random_range(0..candidates.len())
     };
     candidates.rotate_left(offset);

@@ -1,8 +1,8 @@
 #![deny(unsafe_code)]
 
+use crate::cli::output::theme::Theme;
 use crate::session::scrubber::Scrubber;
 use crate::session::state::Finding;
-use owo_colors::OwoColorize;
 use std::time::Duration;
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
@@ -44,13 +44,9 @@ fn severity(confidence: f64, false_positive_prob: f64) -> Severity {
 pub fn print_findings(findings: &[Finding], scrubber: &Scrubber) {
     // Results go to stdout (pipeable); colors follow NO_COLOR/TERM=dumb
     // and stdout TTY — never force ANSI into a pipe or CI log.
-    let color = crate::cli::output::console::stdout_colors_enabled();
+    let t = Theme::for_stdout();
     if findings.is_empty() {
-        if color {
-            println!("{} {}", "✓".green().bold(), "No findings.".yellow());
-        } else {
-            println!("✓ No findings.");
-        }
+        println!("{} {}", t.icon_ok(), t.warning("No findings."));
         return;
     }
 
@@ -73,30 +69,19 @@ pub fn print_findings(findings: &[Finding], scrubber: &Scrubber) {
         })
         .count();
     let low = findings.len() - high - medium;
+    let params = findings
+        .iter()
+        .map(|f| f.parameter.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
 
-    if color {
-        println!(
-            "{} {} across {} parameter(s)  {}",
-            "⚠".red().bold(),
-            format!("{} finding(s)", findings.len()).bold(),
-            findings
-                .iter()
-                .map(|f| f.parameter.as_str())
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            format!("[{high} high · {medium} medium · {low} low]").dimmed()
-        );
-    } else {
-        println!(
-            "⚠ {} finding(s) across {} parameter(s) [{high} high · {medium} medium · {low} low]",
-            findings.len(),
-            findings
-                .iter()
-                .map(|f| f.parameter.as_str())
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-        );
-    }
+    println!(
+        "{} {} across {} parameter(s) {}",
+        t.icon_alert(),
+        t.bold(format!("{} finding(s)", findings.len())),
+        t.plain(params),
+        t.dim(format!("[{high} high · {medium} medium · {low} low]")),
+    );
     println!();
 
     let rows: Vec<Row> = findings
@@ -113,34 +98,21 @@ pub fn print_findings(findings: &[Finding], scrubber: &Scrubber) {
         })
         .collect();
     let table = Table::new(rows).with(Style::rounded()).to_string();
-    if color {
-        println!("{}", table.bright_white());
-    } else {
-        println!("{table}");
-    }
+    println!("{}", t.white(table));
     println!();
 
     for f in findings {
         let sf = f.scrubbed(scrubber);
-        if color {
-            let (icon, label) = match severity(f.confidence, f.false_positive_prob) {
-                Severity::High => ("●".red().to_string(), "HIGH".red().bold().to_string()),
-                Severity::Medium => ("●".yellow().to_string(), "MED".yellow().bold().to_string()),
-                Severity::Low => ("●".dimmed().to_string(), "LOW".dimmed().to_string()),
-            };
-            println!(
-                "{icon} {label} {} — {}",
-                sf.parameter.cyan().bold(),
-                sf.evidence.dimmed()
-            );
-        } else {
-            let label = match severity(f.confidence, f.false_positive_prob) {
-                Severity::High => "HIGH",
-                Severity::Medium => "MED",
-                Severity::Low => "LOW",
-            };
-            println!("● {label} {} — {}", sf.parameter, sf.evidence);
-        }
+        let (icon, label) = match severity(f.confidence, f.false_positive_prob) {
+            Severity::High => (t.dot_high(), t.danger_bold("HIGH")),
+            Severity::Medium => (t.dot_medium(), t.warning_bold("MED")),
+            Severity::Low => (t.dot_low(), t.dim("LOW")),
+        };
+        println!(
+            "{icon} {label} {} — {}",
+            t.accent(sf.parameter),
+            t.dim(sf.evidence)
+        );
     }
 }
 
@@ -185,31 +157,18 @@ pub fn print_run_summary(
     let target = scrubber.scrub(target);
     let status = run_status(state, findings);
     let elapsed = elapsed.as_secs_f64();
-    let color = crate::cli::output::console::stdout_colors_enabled();
+    let t = Theme::for_stdout();
 
     println!();
-    if color {
-        let status_text = match status {
-            "CANCELLED" | "INCONCLUSIVE" => status.yellow().bold().to_string(),
-            "CLEAN" => status.green().bold().to_string(),
-            _ => status.red().bold().to_string(),
-        };
-        println!("{} {}", "◆".bright_cyan().bold(), "Scan complete".bold());
-        println!("  {} {}", "Status".dimmed(), status_text);
-        println!("  {} {}", "Target".dimmed(), target);
-        println!("  {} {}", "Requests".dimmed(), request_count);
-        println!("  {} {:.1}s", "Duration".dimmed(), elapsed);
-    } else {
-        println!("Scan complete");
-        println!("  Status: {status}");
-        println!("  Target: {target}");
-        println!("  Requests: {request_count}");
-        println!("  Duration: {elapsed:.1}s");
-    }
+    println!("{} {}", t.icon_diamond(), t.bold("Scan complete"));
+    println!("{}", t.kv("Status", t.status_pill(status)));
+    println!("{}", t.kv("Target", target));
+    println!("{}", t.kv("Requests", request_count));
+    println!("{}", t.kv("Duration", format!("{elapsed:.1}s")));
     if status == "INCONCLUSIVE"
         && let Some(sug) = suggestion
     {
-        println!("{}", suggestion_line(sug, color));
+        println!("{}", suggestion_line(sug, t.color()));
     }
     println!();
 }
@@ -219,11 +178,8 @@ pub fn print_run_summary(
 /// token brut ne traverse cette fonction.
 #[must_use]
 pub fn suggestion_line(suggestion: &str, color: bool) -> String {
-    if color {
-        format!("  {} {}", "→ suggestion".cyan().bold(), suggestion)
-    } else {
-        format!("  → suggestion: {suggestion}")
-    }
+    let t = Theme::new(color);
+    format!("  {} {suggestion}", t.accent("→ suggestion:"))
 }
 
 /// Print extracted DB data (banner, tables, dump rows, …) collected during
@@ -235,20 +191,14 @@ pub fn print_extracted(extracted: &[String]) {
         return;
     }
     println!();
-    if crate::cli::output::console::stdout_colors_enabled() {
-        println!(
-            "{} {}",
-            "⛏".bright_green().bold(),
-            format!("{} extracted value(s)", extracted.len()).bold()
-        );
-        for e in extracted {
-            println!("  {} {e}", "•".bright_green());
-        }
-    } else {
-        println!("⛏ {} extracted value(s)", extracted.len());
-        for e in extracted {
-            println!("  • {e}");
-        }
+    let t = Theme::for_stdout();
+    println!(
+        "{} {}",
+        t.icon_pick(),
+        t.bold(format!("{} extracted value(s)", extracted.len()))
+    );
+    for e in extracted {
+        println!("  {} {e}", t.icon_bullet());
     }
 }
 

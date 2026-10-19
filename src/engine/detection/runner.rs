@@ -1,7 +1,7 @@
 use std::{io::IsTerminal as _, sync::Arc, time::Instant};
 
 use futures::StreamExt as _;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -18,18 +18,8 @@ use crate::{
     techniques::tamper::Tamper,
 };
 
-fn progress_bar(len: u64) -> ProgressBar {
-    if !std::io::stderr().is_terminal() {
-        return ProgressBar::hidden();
-    }
-    let pb = ProgressBar::new(len);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{bar:40} {pos}/{len} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_bar()),
-    );
-    pb
-}
+// (le builder partagé stylé vit dans `crate::cli::output::progress::bar` —
+// même contrat TTY, template enrichi + greffe MultiProgress)
 
 /// Runs boolean/error/time/union/stacked/json/nosql/oob detection for every
 /// candidate parameter with bounded concurrency (respects `--threads`).
@@ -58,9 +48,13 @@ pub(crate) async fn run_detection(
     dbms_belief: &DbmsBelief,
     context_probes: usize,
     to_test: Vec<TargetParameter>,
+    progress: &crate::cli::output::progress::PipelineView,
 ) {
     let pb2 = if to_test.len() > 1 {
-        Arc::new(progress_bar(to_test.len() as u64))
+        Arc::new(progress.attach(crate::cli::output::progress::bar(
+            to_test.len() as u64,
+            "detection",
+        )))
     } else {
         Arc::new(indicatif::ProgressBar::hidden())
     };

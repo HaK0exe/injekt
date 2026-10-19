@@ -17,9 +17,8 @@
 //! silencieuse est sa raison d'être.
 
 use crate::cli::args::Cli;
-use crate::cli::output::console::stdout_colors_enabled;
+use crate::cli::output::theme::Theme;
 use crate::session::scrubber::Scrubber;
-use owo_colors::OwoColorize;
 use std::process::ExitCode;
 
 pub use self::cadence::{check_cadence, parse_jitter_pair};
@@ -85,23 +84,15 @@ impl CheckResult {
 // Entrée : rendu stdout pur + exit code
 // ---------------------------------------------------------------------------
 
-/// Symbole `✓ / ! / ✗` ; couleur selon `stdout_colors_enabled` (`NO_COLOR`,
+/// Symbole `✓ / ! / ✗` ; couleur selon le gating stdout (`NO_COLOR`,
 /// `TERM=dumb`, `CLICOLOR=0`, stdout non-TTY désactivent — la convention
 /// repo, pas d'équivalent `INJEKT_NO_COLOR` inventé).
 pub(super) fn symbol(level: CheckLevel, colors: bool) -> String {
-    let raw = match level {
-        CheckLevel::Ok => "✓",
-        CheckLevel::Warn => "!",
-        CheckLevel::Fail => "✗",
-    };
-    if colors {
-        match level {
-            CheckLevel::Ok => raw.green().bold().to_string(),
-            CheckLevel::Warn => raw.yellow().bold().to_string(),
-            CheckLevel::Fail => raw.red().bold().to_string(),
-        }
-    } else {
-        raw.to_owned()
+    let t = Theme::new(colors);
+    match level {
+        CheckLevel::Ok => t.icon_ok(),
+        CheckLevel::Warn => t.icon_warn(),
+        CheckLevel::Fail => t.icon_err(),
     }
 }
 
@@ -142,17 +133,17 @@ pub async fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
     let ingestion = check_ingestion(&collect_ingestion_sources(cli));
 
     let checks = [config, proxy, cadence, ingestion];
-    let colors = stdout_colors_enabled();
+    let theme = Theme::for_stdout();
     let scrubber = Scrubber::new(cli.output_opts.no_redact);
 
     let title = "injekt doctor — vérifications de la config locale (0 requête, 0 socket)";
-    if colors {
-        println!("{}", title.bright_cyan().bold());
-    } else {
-        println!("{title}");
-    }
+    println!("{}", theme.accent_bright(title));
     for c in &checks {
-        println!("{} {}", symbol(c.level, colors), scrubber.scrub(&c.line));
+        println!(
+            "{} {}",
+            symbol(c.level, theme.color()),
+            scrubber.scrub(&c.line)
+        );
     }
 
     let failed = checks.iter().any(|c| c.level == CheckLevel::Fail);

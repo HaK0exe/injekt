@@ -65,9 +65,11 @@ impl EncryptedExport {
         let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
             .map_err(|e| ExportError::Crypto(e.to_string()))?;
         let nonce_bytes: [u8; 24] = rand::random();
-        let nonce = XNonce::from_slice(&nonce_bytes);
+        // digest 0.11: `Nonce::from_slice` deprecated — const-array `From` impl
+        // is the preferred constructor (length checked at compile time).
+        let nonce = XNonce::from(nonce_bytes);
         let ciphertext = cipher
-            .encrypt(nonce, json.as_ref())
+            .encrypt(&nonce, json.as_ref())
             .map_err(|e| ExportError::Crypto(e.to_string()))?;
 
         let blob = EncryptedBlob {
@@ -135,9 +137,11 @@ impl EncryptedExport {
         let nonce_bytes = BASE64
             .decode(&blob.nonce_b64)
             .map_err(|e| ExportError::Serialization(e.to_string()))?;
-        if nonce_bytes.len() != 24 {
-            return Err(ExportError::Crypto("invalid nonce length".to_owned()));
-        }
+        // digest 0.11: `Nonce::from_slice` deprecated — `TryInto<[u8; 24]>` is
+        // the replacement and enforces the exact 24-byte nonce length itself.
+        let nonce_arr: [u8; 24] = nonce_bytes
+            .try_into()
+            .map_err(|_| ExportError::Crypto("invalid nonce length".to_owned()))?;
         let ciphertext = BASE64
             .decode(&blob.ciphertext_b64)
             .map_err(|e| ExportError::Serialization(e.to_string()))?;
@@ -148,10 +152,10 @@ impl EncryptedExport {
         let key = Zeroizing::new(Self::derive_key_argon2id(passphrase, &salt)?);
         let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
             .map_err(|e| ExportError::Crypto(e.to_string()))?;
-        let nonce = XNonce::from_slice(&nonce_bytes);
+        let nonce = XNonce::from(nonce_arr);
         let plaintext = Zeroizing::new(
             cipher
-                .decrypt(nonce, ciphertext.as_ref())
+                .decrypt(&nonce, ciphertext.as_ref())
                 .map_err(|e| ExportError::Crypto(e.to_string()))?,
         );
         Ok(plaintext)
