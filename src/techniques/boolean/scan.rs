@@ -277,10 +277,10 @@ impl Technique for BooleanTechnique {
                             ) {
                                 None => "skip",
                                 Some(ctrl) => {
-                                    let (ctl_true_raw, ctl_true_ms, ctl_true_status) = ctx
+                                    let (ctl_true_raw, _ctl_true_ms, ctl_true_status) = ctx
                                         .fetch_with_class(&ctrl.must_true, RequestClass::Boolean)
                                         .await;
-                                    let (ctl_false_raw, ctl_false_ms, ctl_false_status) = ctx
+                                    let (ctl_false_raw, _ctl_false_ms, ctl_false_status) = ctx
                                         .fetch_with_class(&ctrl.must_false, RequestClass::Boolean)
                                         .await;
                                     if cancel.is_cancelled() {
@@ -290,17 +290,12 @@ impl Technique for BooleanTechnique {
                                         crate::detection::control_pair::ControlVerdict::Neutral
                                     } else {
                                         crate::detection::control_pair::control_verdict_with_match_ratio(
-                                &baseline_body,
-                                &matcher
-                                    .pre_process(&baseline.strip_dynamic_content(&ctl_true_raw)),
-                                &matcher
-                                    .pre_process(&baseline.strip_dynamic_content(&ctl_false_raw)),
-                                baseline.mean_ms,
-                                ctl_true_ms,
-                                ctl_false_ms,
-                                inverted,
-                                baseline.match_ratio(),
-                            )
+                                                &baseline_body,
+                                                &matcher.pre_process(&baseline.strip_dynamic_content(&ctl_true_raw)),
+                                                &matcher.pre_process(&baseline.strip_dynamic_content(&ctl_false_raw)),
+                                                inverted,
+                                                baseline.match_ratio(),
+                                            )
                                     };
                                     match verdict {
                                         crate::detection::control_pair::ControlVerdict::Veto => {

@@ -435,7 +435,7 @@ pub(crate) async fn confirm_boolean_second_pass(
             ) {
                 None => {}
                 Some(ctrl) => {
-                    let (ctl_true_raw, ctl_true_ms, ctl_true_status) =
+                    let (ctl_true_raw, _ctl_true_ms, ctl_true_status) =
                         fetch_for_payload_with_class(
                             client,
                             state,
@@ -451,7 +451,7 @@ pub(crate) async fn confirm_boolean_second_pass(
                             RequestClass::Boolean,
                         )
                         .await;
-                    let (ctl_false_raw, ctl_false_ms, ctl_false_status) =
+                    let (ctl_false_raw, _ctl_false_ms, ctl_false_status) =
                         fetch_for_payload_with_class(
                             client,
                             state,
@@ -477,9 +477,6 @@ pub(crate) async fn confirm_boolean_second_pass(
                             &baseline_body,
                             &matcher.pre_process(&baseline.strip_dynamic_content(&ctl_true_raw)),
                             &matcher.pre_process(&baseline.strip_dynamic_content(&ctl_false_raw)),
-                            baseline.mean_ms,
-                            ctl_true_ms,
-                            ctl_false_ms,
                             inverted,
                             baseline.match_ratio(),
                         )
