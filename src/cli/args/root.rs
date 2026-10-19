@@ -85,6 +85,11 @@ pub struct Cli {
     #[arg(long, short = 'v', global = true)]
     pub verbose: bool,
 
+    /// Quiet mode: suppress the banner, progress bars and info logs (stderr
+    /// keeps warnings/errors only; stdout results and --json are unaffected)
+    #[arg(long, short = 'q', global = true)]
+    pub quiet: bool,
+
     /// Suppress the startup banner (written to stderr; stdout stays clean either way)
     #[arg(long, global = true)]
     pub no_banner: bool,
@@ -157,6 +162,7 @@ impl core::fmt::Debug for Cli {
             .field("allow_knowledge", &self.allow_knowledge)
             .field("knowledge_path", &self.knowledge_path)
             .field("verbose", &self.verbose)
+            .field("quiet", &self.quiet)
             .field("no_banner", &self.no_banner)
             // C16 : la positional peut porter un token d'URL — même scrub
             // que `TargetOpts::target` ci-dessus.

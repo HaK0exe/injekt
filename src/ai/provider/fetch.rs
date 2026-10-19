@@ -74,10 +74,13 @@ pub async fn fetch_suggestions(
     if endpoint.is_empty() || model.is_empty() {
         return Err(AiFetchError::Incomplete);
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(cfg.timeout_secs.max(1)))
-        .build()
-        .map_err(|_| AiFetchError::Network("client build failed".to_owned()))?;
+    let client = {
+        crate::http::client::ensure_rustls_provider();
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(cfg.timeout_secs.max(1)))
+            .build()
+            .map_err(|_| AiFetchError::Network("client build failed".to_owned()))?
+    };
     let (body, mut req) = match provider {
         AiProviderKind::OpenAi => {
             let body = openai_request_body(model, system, user);

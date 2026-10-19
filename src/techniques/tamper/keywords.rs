@@ -162,7 +162,7 @@ pub(super) fn apply_between_comment(payload: &str) -> String {
 /// [`Tamper::VersionedComment`] but draws one `<V>` per payload from
 /// `0/32302/50000/80000/99999` plus one `/*!` vs `/**!` opening per payload
 /// from `rng`, so `--seed` replays byte-identical output.
-pub(super) fn apply_versioned_fuzz(payload: &str, rng: &mut impl rand::Rng) -> String {
+pub(super) fn apply_versioned_fuzz(payload: &str, rng: &mut impl rand::RngExt) -> String {
     static VERSIONS: &[&str] = &["0", "32302", "50000", "80000", "99999"];
     let Some(re) = keyword_regex() else {
         return payload.to_owned();

@@ -57,17 +57,18 @@ pub fn info() -> InfoResult {
 
 /// Original CLI entry point — prints to stdout.
 pub fn run() {
-    use owo_colors::OwoColorize;
+    use crate::cli::output::theme::Theme;
 
+    let t = Theme::for_stdout();
     let info = info();
     println!(
         "{} {}",
-        "modern SQLi detection".bold(),
-        "— zero persistence, OPSEC by design".bright_black()
+        t.bold("modern SQLi detection"),
+        t.gray("— zero persistence, OPSEC by design")
     );
     println!();
     let row = |label: &str, value: &str| {
-        println!("  {:<18} {}", label.bright_cyan().bold(), value);
+        println!("  {:<18} {}", t.accent_bright(label), t.plain(value));
     };
     row("Techniques", &info.techniques.join(", "));
     row("Tampers", &info.tampers.join(", "));

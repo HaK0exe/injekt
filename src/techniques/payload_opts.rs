@@ -87,7 +87,7 @@ pub fn build_final_payload_with_rng(
     base: &str,
     tampers: &[Tamper],
     opts: &PayloadOpts,
-    rng: &mut impl rand::Rng,
+    rng: &mut impl rand::RngExt,
 ) -> String {
     let tampered = apply_tampers_with_rng(base, tampers, rng);
     let prefix = opts.prefix.as_deref().unwrap_or("");

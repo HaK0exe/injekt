@@ -34,7 +34,7 @@
 //!   tel quel quand les couleurs sont actives ; strippé proprement sinon
 //!   (`NO_COLOR`, `TERM=dumb`, pipe/CI/MCP).
 
-use super::console::colors_enabled;
+use super::theme::{Stream, colors_for};
 use owo_colors::OwoColorize as _;
 use std::sync::OnceLock;
 
@@ -137,7 +137,7 @@ pub fn sections() -> &'static [Art] {
 /// Indice tiré au sort ; déterministe sous `--seed` (même flux que le reste
 /// des choix non cryptographiques, [`crate::seeded_rng`]).
 fn random_index(len: usize, seed: Option<u64>) -> usize {
-    use rand::Rng as _;
+    use rand::RngExt as _;
     if len == 0 {
         return 0;
     }
@@ -283,7 +283,7 @@ pub fn print(seed: Option<u64>) {
     // résultat qui suit, via le `eprintln!()` final). Tout l'espacement vit
     // ici, jamais dans `ascii_art.txt`.
     eprintln!();
-    let colors = colors_enabled();
+    let colors = colors_for(Stream::Stderr);
     emit(&arts[index], colors);
     tagline(colors);
     eprintln!();

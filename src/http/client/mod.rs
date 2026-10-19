@@ -31,6 +31,7 @@ mod sender;
 mod throttle;
 
 pub use body::MAX_RESPONSE_BODY_BYTES;
+pub(crate) use builder::ensure_rustls_provider;
 pub use builder::{ClientBuilder, HasTimeout, NeedTimeout};
 pub use error::ClientError;
 

@@ -26,6 +26,18 @@ pub struct NeedTimeout;
 #[derive(Debug)]
 pub struct HasTimeout;
 
+/// Install the `ring` rustls crypto provider (process-global, idempotent).
+///
+/// reqwest 0.13 uses the `rustls-no-provider` feature here: every
+/// `reqwest::Client` built in-process (the shared [`HttpClient`] **and** the
+/// AI suggest fetcher) requires a provider to be installed beforehand.
+/// `install_default` returns `Err(Arc<_>)` when one is already installed —
+/// keeping the existing provider is correct: this binary only ever
+/// configures `ring` itself.
+pub(crate) fn ensure_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Builder with typestate: timeout mandatory.
 #[derive(Debug)]
 pub struct ClientBuilder<State> {
@@ -211,13 +223,16 @@ impl ClientBuilder<HasTimeout> {
         // callers: `HttpClient::redirect_policy()` still reports the
         // configured manual limit.
         let reqwest_policy = reqwest::redirect::Policy::none();
+        // reqwest 0.13 (`rustls-no-provider`): install the `ring` crypto
+        // provider before the first client build (see `ensure_rustls_provider`).
+        ensure_rustls_provider();
         let mut builder = Client::builder()
             .timeout(timeout)
             .connect_timeout(self.connect_timeout.unwrap_or(Duration::from_secs(10)))
             .gzip(true)
             .brotli(true)
             .cookie_store(false) // we manage cookies manually for OPSEC
-            .use_rustls_tls()
+            .tls_backend_rustls()
             // Pool vs Cloudflare-style edge: CF closes idle keep-alive
             // connections without TLS `close_notify`, and rustls surfaces
             // the reuse as `UnexpectedEof` (see `retry::is_retryable_error`,

@@ -220,6 +220,10 @@ pub struct EngineConfig {
     pub matcher: crate::detection::matcher::MatcherConfig,
     pub confirm: bool,
     pub seed: Option<u64>,
+    /// `--quiet` : coupe banner/spinners/bars et remonte le filtre de logs à
+    /// `warn` (décision prise dans `main`, mémorisée ici pour que le moteur
+    /// construise une [`crate::cli::output::progress::PipelineView`] muette).
+    pub quiet: bool,
     /// C5-tardif escape hatch (`--no-mutation`): when `true`, the
     /// confirm-second-pass mini-mutation is fully skipped (0 extra request,
     /// 0 trace record). Default `false` = mutation ON but strictly scoped
@@ -288,6 +292,7 @@ impl Default for EngineConfig {
             matcher: crate::detection::matcher::MatcherConfig::default(),
             confirm: false,
             seed: None,
+            quiet: false,
             no_mutation: false,
             explain: None,
             no_redact: false,

@@ -133,6 +133,7 @@ pub fn build_engine_config(cli: &Cli, enum_gate: EnumGate) -> EngineConfig {
         confirm: cli.detection.confirm,
         no_mutation: cli.evasion.no_mutation,
         seed: cli.effective_seed_with(&snap),
+        quiet: cli.quiet,
         explain: cli.output_opts.explain.clone(),
         no_redact: cli.output_opts.no_redact,
         dbms_hint: cli.normalized_dbms_hint(),

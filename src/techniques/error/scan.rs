@@ -129,7 +129,10 @@ impl Technique for ErrorTechnique {
                             // read back. Fresh RNG: the tamper stream stays untouched
                             // (seeded determinism of the payload matrix preserved).
                             let mut control_rng = crate::seeded_rng::make_rng(seed);
-                            let token = rand::Rng::random::<u32>(&mut control_rng);
+                            let token = {
+                                use rand::RngExt as _;
+                                control_rng.random::<u32>()
+                            };
                             let control_payload = format!("z{token:08x}");
                             let (control_raw, _control_ms, control_status) =
                                 ctx.fetch(&control_payload).await;

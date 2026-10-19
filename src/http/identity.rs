@@ -47,7 +47,7 @@ impl Identity {
     /// Seeded UA pick: draws from `rng` so the same `--seed` yields the same
     /// identity. Pass `&mut crate::seeded_rng::make_rng(seed)`.
     #[must_use]
-    pub fn random_with_rng(rng: &mut impl rand::Rng) -> Self {
+    pub fn random_with_rng(rng: &mut impl rand::RngExt) -> Self {
         let (ua, ch) = Self::POOL.choose(&mut *rng).unwrap_or(&Self::POOL[0]);
         Self {
             user_agent: (*ua).to_owned(),

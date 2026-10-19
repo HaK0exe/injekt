@@ -19,7 +19,7 @@ use crate::{
     },
     techniques::tamper::Tamper,
 };
-use indicatif::{ProgressBar, ProgressStyle};
+use crate::cli::output::progress;
 use std::{io::IsTerminal as _, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -27,23 +27,8 @@ use tracing::{info, warn};
 
 use super::config::EngineConfig;
 
-/// Spinner hidden when stderr is not a TTY (MCP stdio, pipes, CI).
-/// `indicatif` writes to stderr, so stdout JSON-RPC stays clean, but hidden
-/// avoids spam + steady-tick CPU in agent mode.
-fn spinner(msg: &str) -> ProgressBar {
-    if !std::io::stderr().is_terminal() {
-        return ProgressBar::hidden();
-    }
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    pb.set_message(msg.to_owned());
-    pb.enable_steady_tick(std::time::Duration::from_millis(80));
-    pb
-}
+// (les builders partagés vivent dans `crate::cli::output::progress` — même
+// contrat TTY/OPSEC, template enrichi)
 
 /// Outcome of one concurrent baseline fetch (Phase 3, `join_all` borné).
 /// `BodyReadFailed` (compté, retry) vs `TransportFailed` (non compté, retry)
@@ -173,7 +158,7 @@ pub(crate) async fn collect_baseline_uncached(
 ) -> crate::error::Result<Option<(baseline::Baseline, Vec<Tamper>, ProbeOpts)>> {
     // Baseline: 3 requests (hidden when stderr is not a TTY: MCP/CI).
     // `indicatif` draws to stderr only, so stdout JSON-RPC stays clean.
-    let pb = spinner("collecting baseline…");
+    let pb = progress::spinner("collecting baseline…");
     let phase_started = Instant::now();
     let req_before = state.read().await.request_count();
 

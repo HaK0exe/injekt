@@ -99,31 +99,32 @@ impl BulkReport {
     /// Console summary: totals plus one line per target. Never prints evidence,
     /// targets and errors are scrubbed — no secrets on stdout.
     pub fn print_summary(&self, scrubber: &Scrubber) {
-        use owo_colors::OwoColorize;
+        use crate::cli::output::theme::Theme;
 
+        let t = Theme::for_stdout();
         println!(
             "{} {}/{} {}  {}  {}",
-            "▶ bulk scan:".bold(),
-            self.targets_ok,
-            self.targets_total,
-            "ok".green(),
-            format!("{} failed", self.targets_failed).red(),
-            format!("{} requests", self.request_count_total).dimmed()
+            t.bold("▶ bulk scan:"),
+            t.plain(self.targets_ok),
+            t.plain(self.targets_total),
+            t.ok("ok"),
+            t.danger(format!("{} failed", self.targets_failed)),
+            t.dim(format!("{} requests", self.request_count_total))
         );
         for r in &self.per_target {
             let target = scrubber.scrub(&r.target);
             if let Some(e) = r.error.as_deref() {
                 println!(
                     "  {} {target}: {}",
-                    "✗".red().bold(),
-                    scrubber.scrub(e).red()
+                    t.icon_err(),
+                    t.danger(scrubber.scrub(e))
                 );
             } else {
                 let findings = r.findings.len();
                 let mark = if findings > 0 {
-                    "!".yellow().bold().to_string()
+                    t.icon_warn()
                 } else {
-                    "✓".green().to_string()
+                    t.icon_ok()
                 };
                 println!(
                     "  {mark} {target}: findings={findings} reqs={}",

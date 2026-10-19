@@ -19,7 +19,7 @@ pub fn apply_tampers(payload: &str, tampers: &[Tamper]) -> String {
 pub fn apply_tampers_with_rng(
     payload: &str,
     tampers: &[Tamper],
-    rng: &mut impl rand::Rng,
+    rng: &mut impl rand::RngExt,
 ) -> String {
     let mut out = payload.to_owned();
     for t in tampers {
@@ -49,7 +49,7 @@ pub fn expand_with_tampers(payload: &str, tampers: &[Tamper]) -> Vec<String> {
 pub fn expand_with_tampers_with_rng(
     payload: &str,
     tampers: &[Tamper],
-    rng: &mut impl rand::Rng,
+    rng: &mut impl rand::RngExt,
 ) -> Vec<String> {
     if tampers.is_empty() {
         return vec![payload.to_owned()];

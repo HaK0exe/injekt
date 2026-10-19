@@ -5,20 +5,23 @@
 //! [`make_rng`] is the single entry point for all *non-cryptographic*
 //! randomness (tampers, jitter, UA rotation, retry backoff): `Some(seed)` yields
 //! a deterministic [`StdRng`] via [`rand::SeedableRng::seed_from_u64`], `None`
-//! preserves the historical nondeterministic behaviour via
-//! [`StdRng::from_os_rng`].
+//! preserves the historical nondeterministic behaviour via [`rand::make_rng`].
 //!
 //! Cryptographic randomness (`session/export.rs` salt/nonce, temp filenames)
 //! must NEVER use this helper — those stay on OS randomness unconditionally.
 
-use rand::{SeedableRng as _, rngs::StdRng};
+use rand::SeedableRng as _;
+use rand::rngs::StdRng;
 
 /// Build the run RNG: deterministic when `seed` is `Some`, OS-random otherwise.
 #[must_use]
 pub fn make_rng(seed: Option<u64>) -> StdRng {
     match seed {
         Some(s) => StdRng::seed_from_u64(s),
-        None => StdRng::from_os_rng(),
+        // rand 0.10: `StdRng::from_os_rng` removed — official replacement is
+        // `rand::make_rng` (ThreadRng-reseeded, fine for the non-crypto path;
+        // `session/export` crypto randomness stays on OS `rand::random`).
+        None => rand::make_rng::<StdRng>(),
     }
 }
 
@@ -26,7 +29,7 @@ pub fn make_rng(seed: Option<u64>) -> StdRng {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use rand::Rng as _;
+    use rand::RngExt as _;
 
     #[test]
     fn same_seed_same_stream() {
