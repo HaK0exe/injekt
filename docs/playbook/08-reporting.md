@@ -78,7 +78,7 @@ Schéma `JsonReport` (C7 complet, cf. `DOCUMENTATION.md` § Report schema) :
   "extracted": [ /* --dbs/--tables/--columns/--dump/--banner/… — NON scrubbé, sensible */ ],
   "request_count": 123,
   // Provenance C1 (top-level, additive) :
-  "version": "0.3.0",
+  "version": "0.4.0",
   "git_sha": null,        // renseigné si compilé avec GIT_SHA (release/CI)
   "seed": 42,             // null = run non déterministe
   "profile": "stealth",   // null = pas de preset

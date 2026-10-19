@@ -7,7 +7,7 @@
 # Install automatique (Linux/macOS) : détecte OS/arch, vérifie SHA256SUMS, installe dans ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/HaK0exe/injekt/main/install.sh | sh
 # Options :
-INJEKT_INSTALL_DIR=~/.local/bin INJEKT_VERSION=v0.3.0 sh install.sh
+INJEKT_INSTALL_DIR=~/.local/bin INJEKT_VERSION=v0.4.0 sh install.sh
 # Toujours lire install.sh avant curl|sh (règle curl-pipe).
 ```
 
@@ -39,7 +39,7 @@ injekt info
 injekt --no-banner info   # stdout propre (banner sur stderr)
 ```
 
-Sortie attendue (v0.3.0) :
+Sortie attendue (v0.4.0) :
 ```
 Techniques      boolean, time, error, union, stacked, oob, json, nosql
 Tampers         space2comment, space2plus, space2tab, space2newline, space2randomblank, ...

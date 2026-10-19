@@ -16,7 +16,13 @@ Seuils calibrés (C7, gelés v1.0-rc — voir `src/reporting/verdict.rs` +
   repli conservateur compilé ci-dessus (les deux signaux doivent concorder).
   Toute recalibration sous les précisions promises casse le test de calibration.
 
-## [Unreleased] — v1.0-rc (hardening, en cours)
+## [0.4.0] — 2026-10-19 — Hardening v1.0-rc (première release taguée post-v0.3.0)
+
+> **Consolidation de versions :** les jalons C1→C13 documentés plus bas sous les
+> intitulés `[0.4.0]`→`[0.7.0]` sont des jalons internes du plan de versions
+> (`docs/ROADMAP-v1.0.md` §4), jamais tagués au fil du travail — leurs contenus
+> font partie de cette release `0.4.0`. Les intitulés sont conservés pour la
+> granularité : à lire comme des jalons, pas des releases taguées.
 
 Roadmap `docs/ROADMAP-v1.0.md` §v1.0-rc : rien de nouveau — geler, durcir, prouver.
 
