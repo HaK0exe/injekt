@@ -38,6 +38,13 @@ impl Baseline {
             .map(|text| Self::hash(text.as_bytes()))
             .collect();
         let body_lengths = samples.iter().map(|s| s.body.len()).collect();
+        // Longueurs des textes NORMALISÉS (mêmes textes que
+        // `normalized_hashes`) : clé de stabilité. Les longueurs brutes
+        // oscillent avec la variabilité d'affichage des champs volatils
+        // (re-trims de zéros de queue d'un epoch float `generated_at` :
+        // 173↔174 octets sur le lab bench) ; le texte normalisé ne bouge
+        // qu'avec le contenu réel.
+        let normalized_lengths: Vec<usize> = normalized_texts.iter().map(String::len).collect();
         let durations = samples.iter().map(|s| s.duration).collect();
         let ms: Vec<f64> = samples
             .iter()
@@ -114,6 +121,7 @@ impl Baseline {
             status_codes,
             body_hashes,
             normalized_hashes,
+            normalized_lengths,
             body_lengths,
             durations,
             mean_ms: mean,
@@ -279,8 +287,11 @@ impl Baseline {
     /// checked over the *normalized* hashes: [`normalize_response_for_diff`]
     /// blanked volatile regions (CSRF/JWT/JSON noise) before hashing, so a
     /// page rotating those no longer flips to unstable (see
-    /// [`Self::normalized_hashes`]). Raw byte lengths stay part of the key,
-    /// so a sample whose size moved is still treated as changed; any
+    /// [`Self::normalized_hashes`]). The key pairs each normalized hash with
+    /// its NORMALIZED text length ([`Self::normalized_lengths`]): raw byte
+    /// lengths drift with volatile-field repr variability (a `generated_at`
+    /// epoch float losing a trailing zero reads 173↔174 bytes) while real
+    /// content changes still shift the normalized length, so any
     /// non-volatile difference keeps the gate fail-closed. This is
     /// deliberately conservative: callers should report an inconclusive scan
     /// rather than manufacture a finding from an unstable page.
@@ -305,7 +316,7 @@ impl Baseline {
         let bodies: Vec<String> = self
             .normalized_hashes
             .iter()
-            .zip(self.body_lengths.iter())
+            .zip(self.normalized_lengths.iter())
             .map(|(hash, length)| format!("{hash}:{length}"))
             .collect();
         // Exact normalized-hash + length agreement is a cheap fast path:
@@ -335,7 +346,9 @@ impl Baseline {
         let mut similarities = Vec::new();
         for (idx, left) in self.normalized_hashes.iter().enumerate() {
             for (right_idx, right) in self.normalized_hashes.iter().enumerate().skip(idx + 1) {
-                if left == right && self.body_lengths[idx] == self.body_lengths[right_idx] {
+                if left == right
+                    && self.normalized_lengths[idx] == self.normalized_lengths[right_idx]
+                {
                     similarities.push(1.0);
                 } else {
                     // Hashes are one-way: a normalized-hash or length mismatch

@@ -78,6 +78,38 @@ fn rotating_json_trace_id_keeps_baseline_stable() {
     assert!(Baseline::new(&samples).is_stable());
 }
 
+/// Les zéros de queue du repr float `generated_at` (sérialisation JSON d'un
+/// epoch : `1792424567.061479` = 17 chars vs `1792424567.127892`… le nombre
+/// de décimales varie d'un sample à l'autre) déplacent la longueur brute du
+/// corps de ±1 octet (lab bench : 173↔174) sans toucher au contenu — la
+/// clé de stabilité indexe donc les longueurs des textes NORMALISÉS
+/// (champ volatil remis à zéro). Avant le fix, cette baserline parfaitment
+/// stable retournait `is_stable() == false` et le scan entier tombait en
+/// INCONCLUSIVE (~80 % sur le lab bench A1).
+#[test]
+fn generated_at_repr_length_drift_keeps_baseline_stable() {
+    let body = |generated_at: &str| {
+        format!(
+            "{{\n  \"data\": [\n    {{\n      \"id\": 1,\n      \"username\": \"alice\",\
+             \n      \"email\": \"alice@example.com\"\n    }}\n  ],\n \
+             \"request_id\": \"84d82c70\",\n  \"generated_at\": {generated_at}\n}}"
+        )
+    };
+    let samples = vec![
+        sample(200, body("1792424567.061479").as_bytes(), &[]),
+        sample(200, body("1792424567.0745852").as_bytes(), &[]),
+        sample(200, body("1792424567.127892").as_bytes(), &[]),
+    ];
+    let bl = Baseline::new(&samples);
+    // Les longueurs BRUTES divergent réellement (17-chars vs 16-chars reprs).
+    assert_ne!(bl.body_lengths[0], bl.body_lengths[1]);
+    // La clé normalisée reste l'identique : stabilité.
+    assert!(
+        bl.is_stable(),
+        "drift de repr uniquement : la baseline reste un oracle"
+    );
+}
+
 #[test]
 fn unnamed_rotating_zone_is_marked_and_stabilized() {
     // Bannière rotative NON nommée (hors champs volatils connus) entre
@@ -163,17 +195,30 @@ fn identical_pages_with_static_csrf_stay_stable() {
 }
 
 #[test]
-fn rotating_token_with_changing_length_stays_unstable() {
+fn rotating_named_token_length_change_keeps_baseline_stable() {
     let body = |token: &str| format!("<input name=\"csrf_token\" value=\"{token}\"><h1>ok</h1>");
     let samples = vec![
         sample(200, body("short-token-1").as_bytes(), &[]),
         sample(200, body("a-much-longer-rotating-token-2").as_bytes(), &[]),
         sample(200, body("medium-token-333").as_bytes(), &[]),
     ];
-    // Normalization blanks all three values, but the raw byte length is
-    // part of the stability key: a sample envelope whose size moved keeps
-    // the gate fail-closed (documented residual strictness).
-    assert!(!Baseline::new(&samples).is_stable());
+    // Normalisation efface les trois valeurs (champ volatil NOMMÉ) et les
+    // longueurs NORMALISÉS coïncident : la rotation incluant sa variabilité
+    // de taille est absorbée. Historiquement la longueur brute restait dans
+    // la clé fail-closed — ce comportement provoquait une tempête
+    // INCONCLUSIVE sur les corps Les longueurs brutes d'un float
+    // `generated_at` re-tronqué diffèrent de ±1 octet (lab bench A1).
+    // La vraie instabilité (contenu non marqué / flancs courts /
+    // changement de statut) reste fail-closed via le hash normalisé.
+    assert!(Baseline::new(&samples).is_stable());
+
+    // Le fail-closed est préservé : du contenu qui ne se normalise pas
+    // (champ inconnu, pas de marquage exploitable) retourne instable
+    // peu importe sa longueur.
+    let mut real_change = samples.clone();
+    real_change[2].body =
+        b"<input name=\"csrf_token\" value=\"short-token-1\"><h1>ok</h1><p>hostile</p>".to_vec();
+    assert!(!Baseline::new(&real_change).is_stable());
 }
 
 #[test]

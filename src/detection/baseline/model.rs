@@ -10,8 +10,18 @@ pub struct Baseline {
     pub body_hashes: Vec<String>,
     /// SHA-256 of each sample body after [`crate::detection::response_diff::normalize_response_for_diff`]
     /// blanked volatile regions (rotating CSRF/JWT/JSON noise). Drives
-    /// [`Baseline::is_stable`] together with the raw `body_lengths`.
+    /// [`Baseline::is_stable`] together with the NORMALIZED lengths
+    /// ([`Self::normalized_lengths`]).
     pub normalized_hashes: Vec<String>,
+    /// Byte lengths of each NORMALIZED sample text (the same texts hashed in
+    /// [`Self::normalized_hashes`]). The stability key uses these instead of
+    /// the raw lengths: raw lengths drift with volatile-field repr
+    /// variability (a `generated_at` epoch float losing a trailing zero is a
+    /// ±1 byte move), while real content changes still shift the normalized
+    /// length. See [`Self::is_stable`].
+    pub normalized_lengths: Vec<usize>,
+    /// Raw byte lengths of each sample body (diagnostics only; stability
+    /// decisions use [`Self::normalized_lengths`]).
     pub body_lengths: Vec<usize>,
     pub durations: Vec<Duration>,
     pub mean_ms: f64,

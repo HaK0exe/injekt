@@ -157,6 +157,7 @@ mod tests {
             status_codes: vec![200],
             body_hashes: vec!["hash1".to_owned()],
             normalized_hashes: vec!["hash1".to_owned()],
+            normalized_lengths: vec![4],
             body_lengths: vec![100],
             durations: vec![Duration::from_millis(50)],
             mean_ms: 50.0,
