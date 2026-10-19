@@ -9,6 +9,7 @@
 mod ai;
 mod auth;
 mod effective;
+mod format;
 mod net;
 mod opts;
 mod snapshot;

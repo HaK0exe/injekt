@@ -89,8 +89,12 @@ cargo install --path .
 
 ### Global Structure
 ```bash
+injekt [OPTIONS] <URL>              # scan direct (positional, C16)
+injekt auto <URL|HOST>              # ingestion → scan → escalation → énumération
 injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 ```
+
+La cible admet quatre sources (précidence) : `--raw-file` > positional `injekt <URL>` > `-u/--target` > env `INJEKT_TARGET`. Un positional + un flag `-u/--target` **tapés et différents** = erreur d'usage (exit 2) ; le positional bat l'env silencieusement.
 
 ### Global Options (available everywhere)
 | Flag | Description | Default |
@@ -142,7 +146,7 @@ injekt [GLOBAL_OPTIONS] [COMMAND] [COMMAND_OPTIONS]
 | `--dbms <KIND>` | Force DBMS: `mysql`, `postgres`, `mssql`, `oracle` | auto-fingerprint |
 | `--extract` | Enable data extraction (opt-in, uses `SecretString`) | `false` |
 | `--output <PATH>` | Write report to file in `--format` serialization (0o600 on Unix, relative path, never overwrites an existing file) | stdout |
-| `--format <FMT>` | Report serialization: `json` (default), `sarif`, `junit`, `md` — all scrubbed | `json` |
+| `--format <FMT>` | Report serialization: `json` (default), `sarif`, `junit`, `md` — all scrubbed. **C16** : absent explicitément (ni `INJEKT_FORMAT` ni TOML), le format est déduit de l'extension de `--output` (`.sarif`/`.junit`/`.md`/`.json`) ; extension inconnue ⇒ jamais déduite, jamais warning | extension / `json` |
 | `--rate-limit <RPS>` | Token-bucket requests/second | `10` (always enforced; there is no "unlimited" mode via CLI) |
 | `--jitter <MEAN,STD>` | **Milliseconds**, e.g. `"750,250"` (750±250ms, floor 200ms) | `750,250` (human jitter is **on by default**, even without the flag) |
 | `--marker <STR>` | Injection marker: `*`, `§`, `{{}}` | auto-detect |
@@ -313,6 +317,18 @@ modern SQLi detection — zero persistence, OPSEC by design
   DBMS            mysql, postgres, mssql, oracle
   Docs            docs/OPSEC.md (JA3, jitter, proxy socks5h)
 ```
+
+#### `doctor` — Local Config Health Checks (`0` réseau)
+```bash
+injekt doctor
+```
+Checks the local config, never the target, never the network (0 socket, 0 request): 
+1. `config` — `--config` / `./injekt.toml` / `~/.config/injekt/config.toml`, parse TOML, résumé (preset effectif + threads) ; TOML cassé ⇒ `✗` avec la ligne/colonne du crate `toml` ;
+2. `proxy` — schéma seulement (`ProxyConfig::parse`) : `socks5://` ⇒ `✗` message DNS-leak exact (`socks5h://` requis),userinfo redirigé ; aucune connexion n'est tentée ;
+3. `cadence` — `1000/rate_limit ≥ jitter_mean − 2σ` : plus rapide que le jitter ⇒ `!` « pattern détectable » + correction chiffrée (`--rate-limit ≤ ...`) ; neutre si rien d'explicite ;
+4. `ingestion` — stat lexical des 5 sources (`--bulk-file/--raw-file/--raw-dir/--openapi-file/--sitemap-file`) : absent/illisible ⇒ `✗`.
+
+Sortie `✓ / ! / ✗` une ligne par check (scrubbée, `--no-redact` respecté) — exit `0` sans `✗`, `1` avec.
 
 #### `mcp` — MCP Server Mode
 ```bash

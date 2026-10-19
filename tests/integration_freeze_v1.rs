@@ -162,10 +162,22 @@ fn profile_names_frozen_at_4() {
 #[test]
 fn report_format_variants_frozen() {
     // `ReportFormat` is the `--format` value surface: json/sarif/junit/md.
+    // C16: the clap-level value is an `Option` (extension inference +
+    // config-TOML key resolve in `Cli::effective_format`, effective
+    // default `json` unchanged).
     assert!(matches!(ReportFormat::default(), ReportFormat::Json));
     let cli = Cli::try_parse_from(["injekt", "scan", "--target", "https://example.com/?id=1"])
         .expect("cli parses");
-    assert!(matches!(cli.output_opts.format, ReportFormat::Json));
+    assert!(
+        cli.output_opts.format.is_none(),
+        "no clap-level --format default (C16 effective_format)"
+    );
+    let explicit =
+        Cli::try_parse_from(["injekt", "scan", "--format", "sarif"]).expect("cli parses --format");
+    assert!(matches!(
+        explicit.output_opts.format,
+        Some(ReportFormat::Sarif)
+    ));
 }
 
 // ---------------------------------------------------------------------------

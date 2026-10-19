@@ -210,7 +210,10 @@ impl InjektServer {
             },
             output_opts: crate::cli::args::OutputOpts {
                 output: None,
-                format: crate::cli::args::ReportFormat::Json,
+                // C16 : pas de format explicite côté MCP (default `json`
+                // effectif à la résolution, extension désactivée : pas de
+                // `--output` sur la surface stdio).
+                format: None,
                 dry_run: false,
                 no_redact: false,
                 explain: None,
@@ -224,6 +227,12 @@ impl InjektServer {
             knowledge_path: None,
             verbose: false,
             no_banner: true,
+            // C16 : positional jamais exposée via MCP (surface stdio) ; le
+            // flag CLI n'y est pas « typé » (constructions programmatiques)
+            // — `validate_target_conflict` est un no-op garantie.
+            target_positional: None,
+            cli_typed_target: false,
+            format_conflict_warned: std::sync::Arc::default(),
         }
     }
 

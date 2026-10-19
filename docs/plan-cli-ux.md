@@ -168,16 +168,24 @@ régression OPSEC.
 
 Une PR de trois items (petits, committables séparément) :
 
-- [ ] **Positional** : `injekt <URL>` (top-level, coexiste avec `Option<Commands>` —
+- [x] **Positional** : `injekt <URL>` (top-level, coexiste avec `Option<Commands>` —
   token non-matching subcommand → positional) et `injekt auto <URL|HOST>` (positional
   dans `AutoArgs`, bare host ⇒ `--with-recon` inchangé). Précidence cible documentée :
-  `--raw-file > positional > --target(-u) > env`. Verrouillage parse par `proptest`
-  dans `tests/proptest_parsers.rs` (+ codec subcommand-first).
-- [ ] **Format par extension** : `--output x.sarif` ⇒ SARIF quand `--format` n'est
+  `--raw-file > positional > --target(-u) > env`. Fait : positional top-level +
+  `AutoArgs::target_positional`, distinction `CommandLine` vs `EnvVariable`
+  (`Cli::cli_typed_target` — positional > env silencieux, erreur `TargetConflict`
+  exit 2 seulement pour un flag **tapé** ≠ positional), validate `validate_target_conflict`,
+  proptests parse dans `tests/proptest_parsers.rs`.
+- [x] **Format par extension** : `--output x.sarif` ⇒ SARIF quand `--format` n'est
   défini ni par CLI ni par env ni par config. Ordre final : CLI > env > extension >
-  config > default `json`, warning si conflit.
-- [ ] **Fix cosmétique** : `InjektError::NoTarget` (message déprécié), commentaire
-  mort `InitArgs` sur `Cli::force` (`cli/args/root.rs`).
+  config > default `json`, warning si conflit. Fait : `cli::resolve::format`
+  (`infer_from_extension` — `.json/.sarif/.junit|.xml/.md|.markdown`, extensions
+  inconnues jamais déduites jamais warning), `Cli::effective_format` (warning
+  conflit une fois max par invocation, `Arc<AtomicBool>` anti-clone, scrubbed),
+  clé `format` du TOML lue via `file_config::file_format` (clé inconnue ⇒ warn).
+- [x] **Fix cosmétique** : `InjektError::NoTarget` (message déprécié → formes
+  positionnelles, exit code 2 inchangé) + nouvelle erreur `TargetConflict`,
+  commentaire mort `InitArgs` corrigé (`output_opts.force`).
 
 **Acceptation** : `injekt <URL>` tourne ; `--output x.sarif` sans `--format` → SARIF ;
 roughly zéro changement de comportement de détection.
@@ -267,6 +275,15 @@ Exemple de diagnostic (JSON, champ optionnel — retro-compatible) :
 > Format : `> Progrès AAAA-MM-JJ (chantier étape): …` — mêmes conventions que
 > `docs/REFACTOR_PLAN.md`.
 
+- > Progrès 2026-10-19 (C16 done): CLI vague 1 — positional `injekt <URL>` /
+  `injekt auto <URL|HOST>` (précidence `--raw-file` > positional > `-u/--target`
+  > env, conflit usage `TargetConflict` exit 2 seulement flag-tapé ≠ positional,
+  proptests) ; `--format` par extension (`cli::resolve::format`, précidence
+  CLI/env > extension > TOML > json, warning conflit une fois max, extensions
+  inconnues silencieuses) ; fixes (`NoTarget`, commentaire `InitArgs`). Call-sites
+  adaptés (`scan/bulk/recon`, MCP `tools/builder`), tests : `integration_cli_c16.rs`
+  (9 tests binaire réel + résolution) + proptest + regen freeze surface. Gates
+  fmt/clippy/test/doc/deny verts.
 - > Progrès 2026-10-19 (C15 done): `injekt doctor` câblé —
   `cli::commands::doctor.rs` (4 checks purs `fn check_*(…) -> CheckResult
   {level,line}` : **config** via `file_config.rs` tel quel (`candidate_paths`
@@ -296,7 +313,6 @@ Exemple de diagnostic (JSON, champ optionnel — retro-compatible) :
   verts ; regen délibérée du golden `cli-flags.txt` (freeze surface :
   exactement 1 entrée subcommand `doctor`, aucun flag nouveau, revue du
   diff). Non fait : C16/C17/C18 (tâches suivantes, cochées vide).
-- > Progrès 2026-10-19 (C14 done): moteur diagnostics `INCONCLUSIVE` câblé —
 
 - > Progrès 2026-10-19 (C14 done): moteur diagnostics `INCONCLUSIVE` câblé —
   `src/engine/diagnostics.rs` (types purs : `InconclusiveCause`/`Diagnostic`/`DiagSignals`,
@@ -314,4 +330,3 @@ Exemple de diagnostic (JSON, champ optionnel — retro-compatible) :
   `shared_client`, `cancel` ⇒ jamais de diagnostic. Gates fmt/clippy/test/doc/deny
   verts ; regen golden `v1-report-schema.json` délibérée (clé `diagnostic`, revue
   du diff : 4 clés fixes + top-level `diagnostic` quand attaché).
-- [aucun encore] Période : doc créé, C14 non démarré.

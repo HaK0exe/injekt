@@ -30,6 +30,24 @@ impl core::fmt::Display for ReportFormat {
     }
 }
 
+impl ReportFormat {
+    /// C16 — strict name form (`json|sarif|junit|md`) for the config-TOML
+    /// `format` key. clap parses the CLI/env spellings itself (with its own
+    /// `invalid value` usage error); only the file key is resolved here.
+    /// Case-insensitive; unknown names yield `None` (the caller warns once,
+    /// like the unknown-profile path).
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "json" => Some(Self::Json),
+            "sarif" => Some(Self::Sarif),
+            "junit" => Some(Self::Junit),
+            "md" => Some(Self::Md),
+            _ => None,
+        }
+    }
+}
+
 /// Output / reporting (files, formats, dry-run, redaction).
 #[derive(Debug, Clone, Args)]
 #[non_exhaustive]
@@ -38,19 +56,27 @@ pub struct OutputOpts {
     #[arg(long, global = true, help_heading = "Output")]
     pub output: Option<String>,
 
-    /// Report serialization for `--output` files: `json` (default, historical
-    /// `JsonReport` schema + C7 calibrated fields), `sarif` (2.1.0, CI
-    /// code-scanning), `junit` (CI test cases), `md` (human-sendable with
-    /// remediation). Console output is unchanged. All formats are scrubbed.
+    /// Report serialization for `--output` files: `json` (effective default,
+    /// historical `JsonReport` schema + C7 calibrated fields), `sarif`
+    /// (2.1.0, CI code-scanning), `junit` (CI test cases), `md`
+    /// (human-sendable with remediation). Console output is unchanged. All
+    /// formats are scrubbed.
+    ///
+    /// C16 — `Option` (no clap default): effective resolution in
+    /// `Cli::effective_format` is `--format`/`INJEKT_FORMAT` (this field,
+    /// parsed by clap for both sources) > `--output` file extension
+    /// (`*.sarif` → sarif, `*.json` → json, `*.junit`/`*.xml` → junit,
+    /// `*.md`/`*.markdown` → md; unknown extensions never infer) > config
+    /// TOML `format` key > `json`. Explicit-vs-extension conflict warns
+    /// once and keeps the explicit value.
     #[arg(
         long,
         global = true,
         value_enum,
-        default_value = "json",
         env = "INJEKT_FORMAT",
         help_heading = "Output"
     )]
-    pub format: ReportFormat,
+    pub format: Option<ReportFormat>,
 
     /// Dry run: resolve config + targets and print the execution plan
     /// without sending any network request (OPSEC-safe).

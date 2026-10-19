@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 /// techniques = ["boolean", "error"]
 /// seed = 42
 /// proxy = "socks5h://127.0.0.1:9050"
+/// format = "sarif"
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -44,6 +45,11 @@ pub struct FileConfig {
     pub proxy: Option<String>,
     pub oob_wait_secs: Option<u64>,
     pub seed: Option<u64>,
+    /// C16 — report format for `--output` files (`json|sarif|junit|md`).
+    /// Lowest effective precedence: explicit `--format`/`INJEKT_FORMAT` and
+    /// the `--output` extension both win over it (see
+    /// `Cli::effective_format`). Unknown names warn + ignore at resolution.
+    pub format: Option<String>,
 }
 
 impl FileConfig {
@@ -69,6 +75,15 @@ impl FileConfig {
             "aggressive" => Some(crate::cli::profile::Profile::Aggressive),
             _ => None,
         }
+    }
+
+    /// C16 — resolve the `format` key named in the file, if any. Unknown
+    /// names yield `None` (caller logs a warning) like unknown profiles.
+    #[must_use]
+    pub fn file_format(&self) -> Option<crate::cli::args::ReportFormat> {
+        self.format
+            .as_deref()
+            .and_then(crate::cli::args::ReportFormat::from_name)
     }
 }
 

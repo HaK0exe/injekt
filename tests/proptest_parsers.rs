@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+use clap::Parser as _;
 use injekt::target::{
     markers::{InjectionMarker, MarkerSet},
     raw_request::RawRequest,
@@ -151,5 +152,97 @@ proptest! {
         if res.is_ok() {
             prop_assert!(false, "expected rejection for {input}");
         }
+    }
+
+    #[test]
+    fn c16_top_level_positional_never_parse_errors(
+        url in "https://[a-z]{3,8}\\.example/[?]id=[0-9]{3}",
+    ) {
+        let argv = ["injekt".to_owned(), url.clone()];
+        let cli = injekt::cli::args::Cli::try_parse_from(argv).expect("top-level positional parse");
+        prop_assert!(cli.command.is_none(), "no subcommand expected for {url}");
+        prop_assert_eq!(cli.target_positional.as_deref(), Some(url.as_str()));
+        let resolved = cli.effective_target();
+        prop_assert_eq!(resolved.as_deref(), Some(url.as_str()));
+    }
+
+    #[test]
+    fn c16_auto_positional_bare_host_implies_recon(
+        host in "[a-z]{5,8}\\.[a-z]{2,3}",
+    ) {
+        let argv = ["injekt".to_owned(), "auto".to_owned(), host.clone()];
+        let cli = injekt::cli::args::Cli::try_parse_from(argv).expect("auto positional parse");
+        let Some(injekt::cli::args::Commands::Auto(args)) = &cli.command else {
+            prop_assert!(false, "auto subcommand expected for bare host {host}");
+            return Ok(());
+        };
+        prop_assert_eq!(args.target_positional.as_deref(), Some(host.as_str()));
+        // Existing bare-host trigger (unchanged): the positional form is the
+        // only source here and a bare host never carries a `://`.
+        prop_assert!(!host.contains("://"), "bare host has no scheme by construction");
+    }
+
+    #[test]
+    fn c16_positional_vs_typed_flag_conflicts_or_stays_silent(
+        url in "https://[a-z]{3,8}\\.example/[?]id=[0-9]{3}",
+        other_id in 100u32..999,
+    ) {
+        // Distinct positional vs typed `-u/--target` (typed ⇒ `main` sets the
+        // clap ValueSource bit; fixtures set it explicitly) → usage error.
+        let other = format!("{url}{other_id}");
+        let argv = [
+            "injekt".to_owned(),
+            url.clone(),
+            "-u".to_owned(),
+            other.clone(),
+        ];
+        let mut cli = injekt::cli::args::Cli::try_parse_from(argv).expect("conflict parse");
+        prop_assert_eq!(cli.target_positional.as_deref(), Some(url.as_str()));
+        cli.cli_typed_target = true;
+        let err = cli
+            .validate_target_conflict()
+            .expect_err("conflicting positional/flag must be a usage error");
+        let is_conflict =
+            matches!(err, injekt::error::InjektError::TargetConflict { .. });
+        prop_assert!(is_conflict, "expected TargetConflict, got {err}");
+        // Equal spellings stay silent (zero-break), and `-u` parsing never
+        // touches the `--format` warn guard.
+        let argv = [
+            "injekt".to_owned(),
+            url.clone(),
+            "-u".to_owned(),
+            url.clone(),
+        ];
+        let mut cli = injekt::cli::args::Cli::try_parse_from(argv).expect("equal spelling parse");
+        cli.cli_typed_target = true;
+        prop_assert!(cli.validate_target_conflict().is_ok());
+        prop_assert!(
+            !cli
+                .format_conflict_warned
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "--target parsing never touches the format warn guard"
+        );
+    }
+
+    #[test]
+    fn c16_target_flag_alone_unchanged_under_positional_surface(
+        url in "https://[a-z]{3,8}\\.example/[?]id=[0-9]{3}",
+    ) {
+        let argv = ["injekt".to_owned(), "-u".to_owned(), url.clone()];
+        let cli = injekt::cli::args::Cli::try_parse_from(argv).expect("-u alone parse");
+        prop_assert!(cli.target_positional.is_none(), "-u alone fills no positional");
+        let resolved = cli.effective_target();
+        prop_assert_eq!(resolved.as_deref(), Some(url.as_str()));
+        // Zero-break double-check: the historical `scan --target` alias.
+        let argv = [
+            "injekt".to_owned(),
+            "scan".to_owned(),
+            "--target".to_owned(),
+            url.clone(),
+        ];
+        let cli = injekt::cli::args::Cli::try_parse_from(argv).expect("scan alias parse");
+        prop_assert!(cli.target_positional.is_none());
+        let resolved = cli.effective_target();
+        prop_assert_eq!(resolved.as_deref(), Some(url.as_str()));
     }
 }

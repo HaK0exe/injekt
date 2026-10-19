@@ -1,8 +1,20 @@
-//! Target resolution: `--target` / bulk / raw request precedence.
+//! Target resolution: `--target` / positional / bulk / raw request precedence.
 
 use crate::cli::args::{Cli, Commands};
 
 impl Cli {
+    /// C16 positional target location: the top-level `injekt <URL>`
+    /// positional, else the `auto` subcommand's own `<URL|HOST>` positional.
+    /// The whole precedence chain (raw-file > positional > flag > env) lives
+    /// in [`Self::effective_target`].
+    #[must_use]
+    pub fn positional_target(&self) -> Option<&str> {
+        self.target_positional.as_deref().or(match &self.command {
+            Some(Commands::Auto(a)) => a.target_positional.as_deref(),
+            _ => None,
+        })
+    }
+
     #[must_use]
     pub fn effective_target(&self) -> Option<String> {
         if let Some(raw) = &self.target_opts.raw_file {
@@ -28,6 +40,14 @@ impl Cli {
             }
             tracing::warn!(path=%raw, "raw request missing Host header or invalid path");
             return None;
+        }
+        // C16: the positional outranks the explicit flag / env (both parse
+        // into `TargetOpts::target`). A positional that disagrees with a
+        // CLI-typed `-u/--target` is a usage error raised by
+        // `validate_target_conflict` at the command entry points; here we
+        // only resolve deterministically.
+        if let Some(pos) = self.positional_target() {
+            return Some(pos.to_owned());
         }
         self.target_opts
             .target
@@ -59,6 +79,9 @@ impl Cli {
                 return Ok(Some(url));
             }
             anyhow::bail!("raw request in '{raw}' missing Host header or invalid path");
+        }
+        if let Some(pos) = self.positional_target() {
+            return Ok(Some(pos.to_owned()));
         }
         Ok(self
             .target_opts
