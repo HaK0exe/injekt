@@ -38,7 +38,7 @@ pub fn run(
     // Argon2id JSON blob): decrypt and print a scrubbed summary. This is an
     // inspection command, not a full scan resume — findings are shown so the
     // operator can re-target manually.
-    if let Ok(passphrase) = passphrase_for_replay() {
+    if let Ok(passphrase) = super::session::passphrase_for_session("replay") {
         match crate::session::export::EncryptedExport::decrypt_from_file(&passphrase, &file) {
             Ok(plain) => {
                 print_snapshot_summary(&plain, opts)?;
@@ -54,26 +54,6 @@ pub fn run(
     println!("replay: {} bytes from {}", data.len(), file);
     println!("hint: set INJEKT_PASSPHRASE (min 12 chars) to decrypt an --export-encrypted session");
     Ok(())
-}
-
-/// Passphrase from `INJEKT_PASSPHRASE` (CI-safe) or interactive TTY prompt.
-fn passphrase_for_replay() -> anyhow::Result<secrecy::SecretString> {
-    if let Ok(env_pass) = std::env::var("INJEKT_PASSPHRASE") {
-        if env_pass.len() < 12 {
-            anyhow::bail!("INJEKT_PASSPHRASE too short (min 12)");
-        }
-        return Ok(secrecy::SecretString::from(env_pass));
-    }
-    // No env: try TTY prompt; non-TTY (CI/MCP) means "no passphrase", caller
-    // falls back to the raw-size report.
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        anyhow::bail!("no INJEKT_PASSPHRASE and no TTY");
-    }
-    let p = rpassword::prompt_password("Passphrase replay (min 12 chars): ").context("tty read")?;
-    if p.len() < 12 {
-        anyhow::bail!("passphrase too short (min 12)");
-    }
-    Ok(secrecy::SecretString::from(p))
 }
 
 /// Scrubbed human summary of a decrypted snapshot (no secrets printed).

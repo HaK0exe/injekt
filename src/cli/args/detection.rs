@@ -134,6 +134,35 @@ pub struct DetectionOpts {
     #[arg(long, global = true, help_heading = "Detection")]
     pub code: Option<u16>,
 
+    /// C17 — response matcher expression, repeatable (OR between exprs:
+    /// one hit suffices). Frozen grammar:
+    /// `status==N` (must equal — legacy `--code N`),
+    /// `body=CONTENU` (must contain — legacy `--string`),
+    /// `body~RE` (must match regex — no legacy equivalent).
+    /// Invalid expr or regex = usage error (exit 2), validated at parse.
+    #[arg(
+        long = "match",
+        global = true,
+        help_heading = "Detection",
+        value_name = "EXPR",
+        value_parser = parse_match_expr
+    )]
+    pub match_expr: Vec<MatchExprKind>,
+
+    /// C17 — response veto expression, repeatable (OR between vetoes).
+    /// Frozen grammar:
+    /// `status==N` (veto when equal), `status!=N` (must equal — legacy
+    /// `--code N`), `body=CONTENU` (veto when contained — legacy
+    /// `--not-string`), `body~RE` (veto when the regex matches).
+    #[arg(
+        long = "veto",
+        global = true,
+        help_heading = "Detection",
+        value_name = "EXPR",
+        value_parser = parse_match_expr
+    )]
+    pub veto_expr: Vec<MatchExprKind>,
+
     /// Strip HTML tags/entities before matching and detection
     #[arg(long, global = true, help_heading = "Detection")]
     pub text_only: bool,
@@ -383,6 +412,8 @@ impl core::fmt::Debug for DetectionOpts {
             .field("string", &self.string)
             .field("not_string", &self.not_string)
             .field("code", &self.code)
+            .field("match_expr", &self.match_expr)
+            .field("veto_expr", &self.veto_expr)
             .field("text_only", &self.text_only)
             .field("max_duration", &self.max_duration)
             .field("request_budget", &self.request_budget)
@@ -402,5 +433,122 @@ impl core::fmt::Debug for DetectionOpts {
             .field("generative", &self.generative)
             .field("max_generated", &self.max_generated)
             .finish_non_exhaustive()
+    }
+}
+
+/// C17 — frozen grammar of `--match`/`--veto` EXPRs (migration 3).
+///
+/// The classification validates at parse time (status parsed `u16`,
+/// regex compiled once for the check), invalid expr = usage error exit
+/// 2 (nothing deferred to the engine). Literal/regex are explicitly
+/// distinguished: `body=` is contains, `body~` is a regex (`regex`
+/// crate, already a declared dependency — no new dep).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchExprKind {
+    /// `status==N` — the status must equal `N`.
+    StatusEq(u16),
+    /// `status!=N` — the status must be equal (equivalent legacy `--code`).
+    StatusNe(u16),
+    /// `body=CONTENU` — must contain the literal string.
+    BodyContains(String),
+    /// `body~RE` — must match the regex.
+    BodyRegex(String),
+}
+
+/// Classify + validate a `--match`/`--veto` expression (parse-time only).
+///
+/// # Errors
+/// Unknown frozen form, non-`u16` status, empty `body=` content, or a
+/// non-compiled `body~` regex (usage error, exit 2).
+pub fn parse_match_expr(expr: &str) -> Result<MatchExprKind, String> {
+    let reject = |message: String| -> Result<MatchExprKind, String> {
+        Err(format!("invalid --match/--veto EXPR `{expr}`: {message}"))
+    };
+    if let Some(rest) = expr.strip_prefix("status==") {
+        return match rest.parse::<u16>() {
+            Ok(status) => Ok(MatchExprKind::StatusEq(status)),
+            Err(e) => reject(format!("status== needs a u16: {e}")),
+        };
+    }
+    if let Some(rest) = expr.strip_prefix("status!=") {
+        return match rest.parse::<u16>() {
+            Ok(status) => Ok(MatchExprKind::StatusNe(status)),
+            Err(e) => reject(format!("status!= needs a u16: {e}")),
+        };
+    }
+    if let Some(rest) = expr.strip_prefix("body~") {
+        return match regex::Regex::new(rest) {
+            Ok(_) => Ok(MatchExprKind::BodyRegex(rest.to_owned())),
+            Err(e) => reject(format!("regex `{rest}` does not compile: {e}")),
+        };
+    }
+    if let Some(rest) = expr.strip_prefix("body=") {
+        if rest.is_empty() {
+            return reject("empty `body=` content (no-op matcher rejected)".to_owned());
+        }
+        return Ok(MatchExprKind::BodyContains(rest.to_owned()));
+    }
+    reject(
+        "unknown frozen grammar — expected `status==N`, `status!=N`, \
+         `body=CONTENU` or `body~RE` (literal and regex are distinct)"
+            .to_owned(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::MatchExprKind;
+    use super::parse_match_expr;
+
+    #[test]
+    fn classifies_the_frozen_forms() {
+        assert_eq!(
+            parse_match_expr("status==404"),
+            Ok(MatchExprKind::StatusEq(404))
+        );
+        assert_eq!(
+            parse_match_expr("status!=404"),
+            Ok(MatchExprKind::StatusNe(404))
+        );
+        assert_eq!(
+            parse_match_expr("body=welcome"),
+            Ok(MatchExprKind::BodyContains("welcome".to_owned()))
+        );
+        assert_eq!(
+            parse_match_expr("body~wel.*come"),
+            Ok(MatchExprKind::BodyRegex("wel.*come".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_grammar() {
+        let err = parse_match_expr("status=404").expect_err("single = is not the frozen grammar");
+        assert!(err.contains("unknown frozen grammar"), "{err}");
+        assert!(parse_match_expr("carry").is_err());
+        // Literal/regex split: "body=all that follows" — "==" is therefore
+        // a valid literal equal to "=x" (not a special case).
+        assert_eq!(
+            parse_match_expr("body==x"),
+            Ok(MatchExprKind::BodyContains("=x".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_bad_status_digits() {
+        assert!(parse_match_expr("status==99999").is_err());
+        assert!(parse_match_expr("status!=abc").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_body_contains() {
+        let err = parse_match_expr("body=").expect_err("empty content is inconsistent");
+        assert!(err.contains("empty `body=` content"), "{err}");
+    }
+
+    #[test]
+    fn rejects_non_compiling_regex() {
+        let err = parse_match_expr("body~[").expect_err("regex post gating");
+        assert!(err.contains("does not compile"), "{err}");
     }
 }

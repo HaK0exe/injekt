@@ -12,6 +12,9 @@ recon import
 recon scan
 replay
 scan
+session
+session export
+session replay
 # flags (sorted --long, all levels)
 --ai-api-key
 --ai-endpoint
@@ -45,6 +48,7 @@ scan
 --discover-params
 --dry-run
 --dump
+--enum
 --enumerate
 --explain
 --export-encrypted
@@ -61,10 +65,12 @@ scan
 --ignore-robots
 --import
 --include-subdomains
+--input
 --jitter
 --knowledge-path
 --level
 --marker
+--match
 --max-candidates
 --max-discover
 --max-duration
@@ -96,6 +102,7 @@ scan
 --request-budget
 --retries
 --safe-chars
+--scope
 --second-order
 --second-order-max-stores
 --second-order-revisit-url
@@ -117,4 +124,5 @@ scan
 --threads
 --timeout
 --verbose
+--veto
 --with-recon

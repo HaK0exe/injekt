@@ -121,6 +121,9 @@ impl InjektServer {
                 target: None,
                 bulk_file: None,
                 raw_file: None,
+                // C17 : `--input` est une shape CLI seulement — le MCP
+                // continue d'exposer les modes individuels.
+                input: None,
                 raw_dir: None,
                 stdin: false,
                 openapi_file: None,
@@ -154,6 +157,10 @@ impl InjektServer {
                 string: None,
                 not_string: None,
                 code: None,
+                // C17 : `--match`/`--veto` = shapes CLI — le MCP expose
+                // toujours les paramètres string/not-string/code directs.
+                match_expr: Vec::new(),
+                veto_expr: Vec::new(),
                 text_only: false,
                 max_duration: None,
                 // Budgets OPT-IN (None = illimité, comportement historique) :
@@ -194,6 +201,10 @@ impl InjektServer {
             },
             enumeration: crate::cli::args::EnumOpts {
                 extract: false,
+                // C17 : `--enum`/`--scope` sont des shapes CLI — le MCP
+                // écrit les bools directs (shapes individuelles conservées).
+                enum_items: Vec::new(),
+                scope: None,
                 dbs: false,
                 tables: false,
                 columns: false,

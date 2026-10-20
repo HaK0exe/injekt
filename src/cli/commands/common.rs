@@ -27,6 +27,8 @@ pub fn is_bulk(cli: &Cli) -> bool {
         || cli.target_opts.openapi_file.is_some()
         || cli.target_opts.sitemap_file.is_some()
         || cli.target_opts.raw_dir.is_some()
+        // C17 : la forme unifiée couvre les mêmes modes multi-cibles.
+        || cli.target_opts.input.is_some()
 }
 
 /// Thin wrapper over [`crate::target::ingest::collect_targets`].

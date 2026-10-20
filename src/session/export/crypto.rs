@@ -54,6 +54,17 @@ impl EncryptedExport {
         // `Zeroizing` until encryption consumes them.
         snapshot.zeroize();
 
+        Self::encrypt_json_to_file(&json, passphrase, path)
+    }
+
+    /// Blob-writing core shared by [`Self::encrypt_to_file`] and the C17
+    /// [`Self::rekey_from_file`] rotation helper: fresh OS-random salt/nonce,
+    /// Argon2id KDF, 0o600 `create_new` write.
+    fn encrypt_json_to_file(
+        json: &Zeroizing<Vec<u8>>,
+        passphrase: &SecretString,
+        path: &str,
+    ) -> Result<(), ExportError> {
         // SECURITY: salt/nonce MUST stay on OS randomness (`rand::random`) and
         // must NEVER be routed through the seeded run RNG
         // (`crate::seeded_rng::make_rng`): a deterministic salt/nonce from
@@ -159,6 +170,57 @@ impl EncryptedExport {
                 .map_err(|e| ExportError::Crypto(e.to_string()))?,
         );
         Ok(plaintext)
+    }
+
+    /// C17 — rotation helper (`injekt session export <PATH> --import <FILE>`):
+    /// decrypt the encrypted export at `from_path`, then re-encrypt the
+    /// EXACT same plaintext (byte-for-byte JSON passthrough, fresh
+    /// OS-random salt/nonce) under `passphrase` into `to_path`. Blob
+    /// upgrades (v1/v2 → current) happen as a side effect of the rotation.
+    ///
+    /// Validation is minimal by design: the plaintext must still parse as a
+    /// JSON object (fail fast on a corrupted source) — the schema stays the
+    /// engine's business. Self-verification is the caller's job (see the
+    /// `session` command: the output is decrypted again once after write).
+    ///
+    /// # Errors
+    /// Source decrypt failure (wrong passphrase / old blob), non-JSON
+    /// plaintext, the same [`MIN_PASSPHRASE_LEN`] gate as
+    /// [`Self::encrypt_to_file`], destination already existing (unless
+    /// `force` — the previous 0o600 file is removed only after the source
+    /// decrypts and validates), or IO failures.
+    pub fn rekey_from_file(
+        source_passphrase: &SecretString,
+        from_path: &str,
+        passphrase: &SecretString,
+        to_path: &str,
+        force: bool,
+    ) -> Result<(), ExportError> {
+        if passphrase.expose_secret().len() < MIN_PASSPHRASE_LEN {
+            return Err(ExportError::Crypto(format!(
+                "passphrase too short (min {MIN_PASSPHRASE_LEN} chars)"
+            )));
+        }
+        // Decrypt + validate the SOURCE before touching the destination:
+        // with `--force`, a wrong source passphrase must never destroy the
+        // pre-existing destination file.
+        let plain = Self::decrypt_from_file(source_passphrase, from_path)?;
+        if serde_json::from_slice::<serde::de::IgnoredAny>(&plain).is_err() {
+            return Err(ExportError::Serialization(
+                "decrypted export is not valid JSON (corrupted source?)".to_owned(),
+            ));
+        }
+        if std::path::Path::new(to_path).exists() {
+            if !force {
+                return Err(ExportError::Io(format!(
+                    "destination already exists (use --force to replace): '{to_path}'"
+                )));
+            }
+            std::fs::remove_file(to_path)
+                .map_err(|e| ExportError::Io(format!("cannot replace '{to_path}': {e}")))?;
+        }
+        // Byte-for-byte passthrough: same plaintext, fresh envelope.
+        Self::encrypt_json_to_file(&plain, passphrase, to_path)
     }
 
     fn derive_key_argon2id(

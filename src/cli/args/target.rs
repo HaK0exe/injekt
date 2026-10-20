@@ -36,6 +36,21 @@ pub struct TargetOpts {
     #[arg(long, global = true, help_heading = "Target")]
     pub raw_file: Option<String>,
 
+    /// C17 — unified ingestion (merges `--bulk-file`, `--stdin`,
+    /// `--openapi-file`, `--sitemap-file`, `--raw-dir`; those stay
+    /// functional 2 releases). Auto-detection (frozen grammar):
+    /// `-` → stdin; existing directory → raw-dir; `.json/.yaml/.yml`
+    /// containing an `openapi` key → openapi; `.xml` with a `<urlset>`
+    /// root → sitemap; otherwise TXT target list (`#` comments).
+    /// Additive like the legacy modes (dedup handles overlaps).
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Target",
+        value_name = "PATH|-|DIR"
+    )]
+    pub input: Option<String>,
+
     /// Directory of raw HTTP request files (Burp/ZAP exports, `*.txt`):
     /// every parseable file becomes a target (multi-raw ingestion).
     #[arg(long, global = true, help_heading = "Target")]

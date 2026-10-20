@@ -6,10 +6,34 @@ use super::{
 };
 use crate::cli::profile::Profile;
 use crate::cli::styles::CLI_STYLES;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+
+// C17 — session namespace shape is re-exported for `commands::session`
+// (dispatch) parity with the other `Commands` payloads.
+
+/// C18 (Phase 4 UI) — clig.dev « lead with examples » : `--help` s'ouvre sur
+/// des invocations typiques AVANT la liste des options, et documente les exit
+/// codes (contrat `main` : `0` run terminé, `1` runtime, `2` usage ;
+/// `doctor` : 0/1). `const` (pas de runtime) — la surface freeze
+/// `tests/golden/cli-flags.txt` ne capture que les flags/sous-commandes :
+/// un `after_help` n'y change rien et le golden reste valide sans regen.
+const AFTER_HELP: &str = concat!(
+    "Examples:\n",
+    "  injekt https://lab.example.com/?id=1        scan a parameterized URL\n",
+    "  injekt auto lab.example.org                 crawl, then scan discovered params\n",
+    "  injekt --raw-file burp.txt                  inject into a Burp/ZAP raw request\n",
+    "  injekt --target <URL> --profile stealth -q  quiet run, minimized footprint\n",
+    "  injekt doctor                               sanity-check local config (no network)\n",
+    "\n",
+    "Exit codes:\n",
+    "  0  run completed (findings or none — read stdout / the JSON report)\n",
+    "  1  runtime failure (network, I/O, …)\n",
+    "  2  usage error (no target, conflicting targets)\n",
+    "  doctor: 0 every check passed, 1 at least one failure",
+);
 
 #[derive(Parser, Clone)]
-#[command(name="injekt", version, about="Modern SQLi detection — zero persistence, anonymisation by design", long_about=None, styles = CLI_STYLES)]
+#[command(name="injekt", version, about="Modern SQLi detection — zero persistence, anonymisation by design", long_about=None, styles = CLI_STYLES, after_help = AFTER_HELP)]
 #[non_exhaustive]
 // Each bool is an independent CLI flag (clap derive); a state-machine/enum
 // refactor would break the flat --flag command-line surface.
@@ -186,7 +210,15 @@ impl core::fmt::Debug for Cli {
 pub enum Commands {
     Scan(ScanArgs),
     Recon(ReconArgs),
+    /// C17 — deprecated hidden alias of `session replay` (still functional,
+    /// 2 releases left; a warning names the equivalent on each run).
+    #[command(hide = true)]
     Replay(ReplayArgs),
+    /// C17 — session namespace: re-key an encrypted export
+    /// (`session export <PATH> --import <FILE>`) and inspect it
+    /// (`session replay <FILE>`). Same argon2id v2 engine, runtime
+    /// unknown (offline command, 0 socket).
+    Session(SessionArgs),
     Info(InfoArgs),
     /// One-command pipeline: ingestion -> scan -> escalation -> enumeration.
     Auto(AutoArgs),
@@ -295,6 +327,55 @@ pub struct ScanArgs {
 #[non_exhaustive]
 pub struct ReplayArgs {
     #[arg(long)]
+    pub file: String,
+}
+
+/// C17 — namespace `session` (migration 4) : regroupement du cycle
+/// export chiffré / replay d'inspection sur un sous-commande dédié, en
+/// réutilisant `session::export` tel quel (v2 argon2id, 0o600). L'alias
+/// top-level `replay` reste fonctionnel mais caché et déprécié.
+#[derive(Subcommand, Debug, Clone)]
+#[non_exhaustive]
+pub enum SessionCommands {
+    /// Re-key an existing encrypted export: decrypt `--import <FILE>`
+    /// (passphrase env `INJEKT_PASSPHRASE` or TTY), re-encrypt the identical
+    /// snapshot under a fresh passphrase into <PATH> (fresh argon2id
+    /// salt/nonce, 0o600, no overwrite unless global `--force`; output is
+    /// self-verified by a decrypt pass after write). Blob upgrades
+    /// (v1/v2 → current) happen as a side effect.
+    Export(SessionExportArgs),
+    /// Decrypt + inspect an encrypted export (scrubbed summary, offline).
+    ///
+    /// `injekt session replay <FILE>` — the `--file` flag and `--import`
+    /// fallback of the deprecated top-level `injekt replay` alias keep
+    /// working; prefer the positional <FILE>.
+    Replay(SessionReplayArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+#[non_exhaustive]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub command: SessionCommands,
+}
+
+/// Destination of a re-keyed export; the source comes from the global
+/// `--import <FILE>` (shared with the legacy replay fallback).
+#[derive(Args, Debug, Clone)]
+#[non_exhaustive]
+pub struct SessionExportArgs {
+    /// Destination encrypted export (0o600, never overwritten unless `--force`)
+    #[arg(value_name = "PATH")]
+    pub path: String,
+}
+
+/// C17 — positional shape of `session replay <FILE>`. The deprecated
+/// top-level alias keeps the flag shape (`replay --file <FILE>`) untouched.
+#[derive(Args, Debug, Clone)]
+#[non_exhaustive]
+pub struct SessionReplayArgs {
+    /// Encrypted export to inspect (`--export-encrypted` blob)
+    #[arg(value_name = "FILE")]
     pub file: String,
 }
 

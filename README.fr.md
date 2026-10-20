@@ -115,7 +115,7 @@ injekt scan --target "https://example.com/?id=1"
 injekt recon crawl --target "example.com" --depth 2 --max-pages 100
 
 # Crawler, tester chaque paramètre découvert, puis énumérer les vulnérabilités confirmées
-injekt recon scan --target "example.com" --auto-enumerate --dbs
+injekt recon scan --target "example.com" --auto-enumerate --enum dbs
 
 # Importer des candidats déjà découverts
 injekt recon import --file discovered.json --test
@@ -131,7 +131,7 @@ injekt --target "https://example.com/?id=1" --tamper space2comment,randomcase --
 
 # Tampers requête : HPP (duplique ?id=1&id=PAYLOAD) et chunked (body streamé)
 injekt --target "https://example.com/?id=1" --hpp --techniques boolean
-injekt recon scan --target "example.com" --hpp --chunked --auto-enumerate --dbs
+injekt recon scan --target "example.com" --hpp --chunked --auto-enumerate --enum dbs
 
 # OPSEC : Tor + jitter + rate limit
 injekt --target "https://example.com/?id=1" \
@@ -143,7 +143,9 @@ injekt --target "http://192.168.1.10/?id=1" --allow-private
 
 # Export chiffré de session (OPT-IN) — crée un artefact sensible
 injekt --target "https://example.com/?id=1" --export-encrypted ./session.enc
-INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc  # inspection déchiffrée
+INJEKT_PASSPHRASE='...' injekt session replay ./session.enc  # inspection déchiffrée
+# Rotation de passphrase (re-key d'un export existant, même boucle d'inspection) :
+injekt session export ./session-v2.enc --import ./session.enc
 injekt info
 
 # Serveur MCP (assistants IA) — voir docs/MCP.md
@@ -197,13 +199,16 @@ injekt [OPTIONS] [COMMAND]
 Commandes:
   scan    Lance la détection (défaut quand --target est fourni)
   recon   Crawle les cibles, découvre les paramètres, scanne les candidats, importe du JSON
-  replay  Rejoue une session chiffrée
+  replay  Rejoue une session chiffrée (alias caché déprécié — utilisez `session replay`)
+  session export <PATH> --import <FILE>  Rotation de passphrase d'un export (re-key, C17)
+  session replay <FILE>  Rejoue une session chiffrée (C17)
   info    Affiche version / techniques / SGBD
   mcp     Serveur MCP over stdio (Claude Code, Codex, OpenCode, Cursor, VS Code)
 
 Options:
   -u, --target <URL>              URL cible (--raw-file prioritaire si les deux sont donnés)
   -m, --bulk-file <CHEMIN>        Scan bulk : une cible/ligne, commentaires `#` ignorés, max 1000
+      --input <CHEMIN|-|Dossier>  Ingestion unifiée (C17, sniff : stdin/dossier/OpenAPI/sitemap/TXT) ; modes legacy encore 2 releases
                                   (conflit avec --target/--raw-file/--export-encrypted)
       --profile <NOM>             Preset : quick|balanced|stealth|aggressive (les flags explicites gagnent)
       --config <CHEMIN>           Fichier TOML (défaut : ./injekt.toml, ~/.config/injekt/config.toml)
@@ -229,7 +234,10 @@ Options:
       --safe-chars <STR>          Caractères exemptés du percent-encoding
       --skip-urlencode            Envoie les payloads sans URL-encoding (prudence)
       --string/--not-string <STR> La réponse doit (ne pas) contenir ce fragment, sinon veto
-      --code <N>                  Le statut réponse doit égaler N, sinon veto
+                                  (deprecated C17 : ⚠ voir --match/--veto)
+      --match <EXPR>              Matchers C17, répétables (OU) : status==N, body=CONTENU, body~RE
+      --veto <EXPR>               Vetos C17, répétables : status==N, status!=N, body=CONTENU, body~RE
+      --code <N>                  Le statut réponse doit égaler N, sinon veto (deprecated : --match status==N)
       --text-only                 Strip tags/entités HTML avant matching
       --level <1-5>               Agressivité [défaut: 1]
       --seed <N>                  Seed RNG déterministe (enregistré dans le rapport)
@@ -240,9 +248,10 @@ Options:
       --oob-wait-secs <N>         Attente avant polling [défaut: 5]
       --dbms <TYPE>               mysql|postgres|mssql|oracle (défaut: fingerprint auto)
       --extract                   Active l'extraction (opt-in, SecretString)
-      --dbs/--tables/--columns/--dump  Énumération (requiert --extract ou recon --auto-enumerate)
-  -b, --banner, --current-user, --current-db, --hostname  Énumération d'identité
-      --db/--table/--column <NOM> Périmètre d'énumération ; --start/--stop/--count pour dumps
+      --enum <ITEMS>              Énumération compacte (C17, virgules): dbs,tables,columns,dump,banner,user,db,hostname
+      --scope <DB[.TABLE[.COL]]>  Périmètre d'énumération (C17) ; --start/--stop/--count pour dumps
+      --dbs/--tables/--columns/--dump, -b/--banner/--current-user/--current-db/--hostname, --db/--table/--column <NOM>
+                                  (anciens flags, deprecated 2 releases — mapping affiché en warning)
       --marker <STR>              Marqueur d'injection (*, §, {{}})
       --output <CHEMIN>           Chemin rapport JSON (0o600 sur Unix)
       --export-encrypted <CHEMIN> Snapshot chiffré (XChaCha20-Poly1305/Argon2id)
