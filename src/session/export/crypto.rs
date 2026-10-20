@@ -187,7 +187,8 @@ impl EncryptedExport {
     /// Source decrypt failure (wrong passphrase / old blob), non-JSON
     /// plaintext, the same [`MIN_PASSPHRASE_LEN`] gate as
     /// [`Self::encrypt_to_file`], destination already existing (unless
-    /// `force` — the previous 0o600 file is removed first), or IO failures.
+    /// `force` — the previous 0o600 file is removed only after the source
+    /// decrypts and validates), or IO failures.
     pub fn rekey_from_file(
         source_passphrase: &SecretString,
         from_path: &str,
@@ -200,6 +201,15 @@ impl EncryptedExport {
                 "passphrase too short (min {MIN_PASSPHRASE_LEN} chars)"
             )));
         }
+        // Decrypt + validate the SOURCE before touching the destination:
+        // with `--force`, a wrong source passphrase must never destroy the
+        // pre-existing destination file.
+        let plain = Self::decrypt_from_file(source_passphrase, from_path)?;
+        if serde_json::from_slice::<serde::de::IgnoredAny>(&plain).is_err() {
+            return Err(ExportError::Serialization(
+                "decrypted export is not valid JSON (corrupted source?)".to_owned(),
+            ));
+        }
         if std::path::Path::new(to_path).exists() {
             if !force {
                 return Err(ExportError::Io(format!(
@@ -208,12 +218,6 @@ impl EncryptedExport {
             }
             std::fs::remove_file(to_path)
                 .map_err(|e| ExportError::Io(format!("cannot replace '{to_path}': {e}")))?;
-        }
-        let plain = Self::decrypt_from_file(source_passphrase, from_path)?;
-        if serde_json::from_slice::<serde::de::IgnoredAny>(&plain).is_err() {
-            return Err(ExportError::Serialization(
-                "decrypted export is not valid JSON (corrupted source?)".to_owned(),
-            ));
         }
         // Byte-for-byte passthrough: same plaintext, fresh envelope.
         Self::encrypt_json_to_file(&plain, passphrase, to_path)
