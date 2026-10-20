@@ -8,8 +8,8 @@ use crate::cli::profile::Profile;
 use crate::cli::styles::CLI_STYLES;
 use clap::{Args, Parser, Subcommand};
 
-/// C17 — session namespace shape is re-exported for `commands::session`
-/// (dispatch) parity with the other `Commands` payloads.
+// C17 — session namespace shape is re-exported for `commands::session`
+// (dispatch) parity with the other `Commands` payloads.
 
 #[derive(Parser, Clone)]
 #[command(name="injekt", version, about="Modern SQLi detection — zero persistence, anonymisation by design", long_about=None, styles = CLI_STYLES)]
