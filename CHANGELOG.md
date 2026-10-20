@@ -63,6 +63,26 @@ Seuils calibrés (C7, gelés v1.0-rc — voir `src/reporting/verdict.rs` +
   (le prompt replay historique délègue, où l'absence de TTY/env reste un
   repli gracieux vers le rapport raw-size — pour `session export` c'est
   une erreur bloquante, aucun write sans key material). Offline, 0 socket.
+- **P5 — dialecte SQLite complet (`--dbms sqlite`)** : le 5e dialecte
+  (`DbmsKind::Sqlite` — fingerprint `sqlite_version()` et grammaire
+  `src/dbms/sqlite/*` présents depuis la base) est routé de bout en bout
+  par le hint `--dbms` : payloads error (`abs(-9223372036854775808)`
+  overflow, `json_extract('__bad__','$') malformed`), time (proxy CPU
+  `RANDOMBLOB`/`LIKE` — pas de `SLEEP()` SQL portable), boolean/union
+  (terminator ` --`), énumération `sqlite_master` / `pragma_table_info`
+  (`--tables`/`--columns`), dumps par `group_concat` paginé `LIMIT/OFFSET`,
+  identité (`banner` = `sqlite_version()`, `current_db` = `main`,
+  `current_user` = `sqlite`), extraction blind `UNICODE(SUBSTR((q),i,1))`.
+  Alias `sqlite3` accepté aux trois routeurs (`normalized_dbms_hint`,
+  `dbms_hint_kind`, `DbmsBelief::from_hint`) et dans le docstring MCP.
+  **Défaut inchangé (OFF)** : sans `--dbms`, l'auto-fingerprint reste
+  byte-identique (aucune requête supplémentaire) — le hint ne fait que
+  restreindre le vocabulaire du run. Nouvelle suite
+  `tests/integration_dbms_sqlite.rs` (wiremock : confirmation boolean +
+  dump tables via l'oracle `LENGTH`/`UNICODE`, pureté dialecte sur le
+  sink de requêtes — aucun payload mysql/pg/mssql/oracle envoyé sous
+  hint sqlite, alias `sqlite3`). Docs playbook 05/README. Comble le gap
+  G5 (`docs/plan-gaps-2026.md` §2).
 
 ### Changed
 - Flags legacy d'`EnumOpts` (`--dbs/--tables/--columns/--dump`,
