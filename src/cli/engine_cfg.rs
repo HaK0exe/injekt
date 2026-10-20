@@ -100,6 +100,16 @@ pub fn build_engine_config(cli: &Cli, enum_gate: EnumGate) -> EngineConfig {
     if !legacy_matcher.is_empty() {
         tracing::warn!("legacy matcher flags deprecated (2 releases left): {legacy_matcher}");
     }
+    // C17 — `--export-encrypted` deprecated: the post-run inline export
+    // stays functional; passphrase rotation now has a dedicated offline
+    // entry point (one-line nudge, no value echo — OPSEC).
+    if cli.output_opts.export_encrypted.is_some() {
+        tracing::warn!(
+            "legacy `--export-encrypted` flag deprecated (2 releases left): \
+             the post-run export is unchanged; passphrase rotation via \
+             `injekt session export <PATH> --import <FILE>`"
+        );
+    }
     // C17 — `--enum <items>` / `--scope <db[.table[.column]]>` applied to
     // the historical fields (UNION, never a downgrade): the same internal
     // `EnumConfig`, MCP shapes (direct write of bools) untouched.

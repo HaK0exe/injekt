@@ -231,3 +231,83 @@ fn short_salt_and_unknown_kdf_rejected() {
     assert!(err.to_string().contains("KDF"), "unexpected error: {err}");
     let _ = fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// C17 — `rekey_from_file` (migration 4 : `injekt session export <PATH>`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rekey_preserves_snapshot_and_updates_envelope() {
+    let state = test_state();
+    let a = SecretString::from("passphrase123456");
+    let b = SecretString::from("new-passphrase-987");
+    let src = temp_path();
+    let dst = temp_path();
+    EncryptedExport::encrypt_to_file(&state, &a, &src).unwrap();
+    EncryptedExport::rekey_from_file(&a, &src, &b, &dst, false).unwrap();
+    // New file opens with the NEW passphrase only.
+    let plain = EncryptedExport::decrypt_from_file(&b, &dst).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+    assert_eq!(
+        v.get("request_count").and_then(serde_json::Value::as_u64),
+        Some(0),
+        "snapshot byte-contenu préservé (re-key, pas de reserialization)"
+    );
+    assert_eq!(
+        v.get("findings")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    // Source still opens with the OLD passphrase (untouched).
+    EncryptedExport::decrypt_from_file(&a, &src).unwrap();
+    fs::remove_file(&src).unwrap();
+    fs::remove_file(&dst).unwrap();
+}
+
+#[test]
+fn rekey_requires_force_to_replace_destination() {
+    let state = test_state();
+    let a = SecretString::from("passphrase123456");
+    let b = SecretString::from("new-passphrase-987");
+    let src = temp_path();
+    let dst = temp_path();
+    EncryptedExport::encrypt_to_file(&state, &a, &src).unwrap();
+    EncryptedExport::encrypt_to_file(&state, &a, &dst).unwrap();
+    let err = EncryptedExport::rekey_from_file(&a, &src, &b, &dst, false).unwrap_err();
+    assert!(
+        err.to_string().contains("destination already exists"),
+        "unexpected error: {err}"
+    );
+    // Pre-existing destination untouched by the failed rotation.
+    EncryptedExport::decrypt_from_file(&a, &dst).unwrap();
+    EncryptedExport::rekey_from_file(&a, &src, &b, &dst, true).unwrap();
+    EncryptedExport::decrypt_from_file(&b, &dst).unwrap();
+    fs::remove_file(&src).unwrap();
+    fs::remove_file(&dst).unwrap();
+}
+
+#[test]
+fn rekey_rejects_wrong_source_passphrase_and_short_dest() {
+    let state = test_state();
+    let a = SecretString::from("passphrase123456");
+    let src = temp_path();
+    let dst = temp_path();
+    EncryptedExport::encrypt_to_file(&state, &a, &src).unwrap();
+    // Wrong source passphrase: decrypt fails before any write. The AEAD
+    // opaque error (`aead::Error`-ish) carries no stable wording — assert
+    // the BEHAVIOR: no partial write, source still intact.
+    let wrong = SecretString::from("this-is-not-the-pass");
+    let _err = EncryptedExport::rekey_from_file(&wrong, &src, &a, &dst, false)
+        .expect_err("wrong passphrase must fail");
+    assert!(!fs::exists(&dst).unwrap(), "aucune écriture partielle");
+    EncryptedExport::decrypt_from_file(&a, &src).unwrap();
+    // Destination passphrase below MIN_PASSPHRASE_LEN: no write.
+    let short = SecretString::from("too-6short");
+    let err = EncryptedExport::rekey_from_file(&a, &src, &short, &dst, false).unwrap_err();
+    assert!(
+        err.to_string().contains("passphrase too short"),
+        "unexpected error: {err}"
+    );
+    fs::remove_file(&src).unwrap();
+}

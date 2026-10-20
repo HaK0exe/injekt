@@ -436,3 +436,159 @@ async fn legacy_string_flag_warns_with_match_body_mapping() {
         stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// C17 migration 4 — `injekt session` namespace (export re-key + replay)
+// ---------------------------------------------------------------------------
+
+/// Binary runner with an env override (passphrase via `INJEKT_PASSPHRASE`).
+fn run_binary_env(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_injekt"));
+    cmd.args(args)
+        .env_remove("INJEKT_TARGET")
+        .env_remove("INJEKT_FORMAT");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run injekt binary");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn session_temp(suffix: &str) -> String {
+    let path = std::env::temp_dir().join(format!(
+        "injekt-c17-session-{}-{suffix}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    path.to_string_lossy().into_owned()
+}
+
+/// Minimum session state for the CLI roundtrip (no Finding construct: the
+/// shape is what matters — a valid argon2id blob).
+fn encrypted_export_fixture(path: &str, passphrase: &str) {
+    use secrecy::SecretString;
+    let state = injekt::session::state::SessionState::new();
+    injekt::session::export::EncryptedExport::encrypt_to_file(
+        &state,
+        &SecretString::from(passphrase.to_owned()),
+        path,
+    )
+    .expect("fixture export writes");
+}
+
+#[tokio::test]
+async fn session_export_rekey_and_replay_roundtrip() {
+    let src = session_temp("src.enc");
+    let dst = session_temp("dst.enc");
+    encrypted_export_fixture(&src, "passphrase123456");
+    // Source AND destination via env (non-TTY test process): same passphrase
+    // both sides here — a TTY rotation prompts a distinct one.
+    let (code, stdout, stderr) = run_binary_env(
+        &["session", "export", &dst, "--no-banner", "--import", &src],
+        &[("INJEKT_PASSPHRASE", "passphrase123456")],
+    );
+    assert!(code == 0, "stdout: {stdout} stderr: {stderr}");
+    assert!(stdout.contains("session export:"), "{stdout}");
+    assert!(stdout.contains("self-verified"), "{stdout}");
+    assert!(std::fs::exists(&dst).unwrap(), "re-keyed file written");
+    // The re-keyed blob opens with the (same) passphrase and replays.
+    let (code, stdout, stderr) = run_binary_env(
+        &["session", "replay", &dst],
+        &[("INJEKT_PASSPHRASE", "passphrase123456")],
+    );
+    assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
+    assert!(stdout.contains("replay: decrypted session"), "{stdout}");
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}
+
+#[tokio::test]
+async fn session_export_requires_force_to_replace() {
+    let src = session_temp("src2.enc");
+    let dst = session_temp("dst2.enc");
+    encrypted_export_fixture(&src, "passphrase123456");
+    let envs = [("INJEKT_PASSPHRASE", "passphrase123456")];
+    let (code, _stdout, _stderr) = run_binary_env(
+        &["session", "export", &dst, "--no-banner", "--import", &src],
+        &envs,
+    );
+    assert_eq!(code, 0);
+    let (code, _stdout, stderr) = run_binary_env(
+        &["session", "export", &dst, "--no-banner", "--import", &src],
+        &envs,
+    );
+    assert_ne!(code, 0, "second write must fail without --force");
+    assert!(stderr.contains("destination already exists"), "{stderr}");
+    let (code, stdout, _stderr) = run_binary_env(
+        &[
+            "session",
+            "export",
+            &dst,
+            "--no-banner",
+            "--import",
+            &src,
+            "--force",
+        ],
+        &envs,
+    );
+    assert_eq!(code, 0, "{stdout}");
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}
+
+#[tokio::test]
+async fn session_export_without_import_is_usage_error() {
+    let dst = session_temp("dst3.enc");
+    let (code, _stdout, stderr) = run_binary_env(
+        &["session", "export", &dst, "--no-banner"],
+        &[("INJEKT_PASSPHRASE", "passphrase123456")],
+    );
+    assert_ne!(code, 0, "no --import = nothing to re-key");
+    assert!(stderr.contains("--import"), "{stderr}");
+}
+
+#[tokio::test]
+async fn legacy_replay_alias_warns_and_still_inspects() {
+    let src = session_temp("src4.enc");
+    encrypted_export_fixture(&src, "passphrase123456");
+    let (code, stdout, stderr) = run_binary_env(
+        &["replay", "--file", &src, "--no-banner"],
+        &[("INJEKT_PASSPHRASE", "passphrase123456")],
+    );
+    assert_eq!(code, 0, "l'alias legacy reste fonctionnel");
+    assert!(stdout.contains("replay: decrypted session"), "{stdout}");
+    assert!(
+        stderr.contains("legacy `injekt replay` alias deprecated"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[tokio::test]
+async fn export_encrypted_flag_warns_deprecation_on_dry_run() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let target = format!("{}/?id=1", server.uri());
+    let (code, stdout, stderr) = run_binary(&[
+        &target,
+        "--dry-run",
+        "--allow-private",
+        "--no-banner",
+        "--export-encrypted",
+        "/tmp/never-written-in-dryrun.enc",
+    ]);
+    assert_eq!(code, 0, "le flag legacy reste fonctionnel: {stderr}");
+    assert!(stdout.contains("dry-run: scan plan"));
+    assert!(
+        stderr.contains("legacy `--export-encrypted` flag deprecated"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("injekt session export"), "{stderr}");
+}

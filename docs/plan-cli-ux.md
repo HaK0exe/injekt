@@ -236,9 +236,27 @@ Interne inchangé (`EnumConfig`, `MatcherConfig`), parité MCP vérifiée.
   `regex` dépendance déjà déclarée (Cargo.toml:80) — zéro nouvelle dep.
   Note `main.rs`: `Box::pin(run())` (clippy `large_futures` > 16 KiB après
   croissance d'`Cli`).*
-- [ ] **Session namespace** : `injekt session export <PATH>` / `session replay <FILE>`
+- [x] **Session namespace** : `injekt session export <PATH>` / `session replay <FILE>`
   ; `replay` devient alias caché déprécié ; `--export-encrypted` déprécié ; réutilise
   `session::export` tel quel (v2 argon2id 0o600).
+  *Fait 2026-10-20 : `Commands::Session` + `SessionCommands::{Export,Replay}` (root.rs),
+  `commands/session.rs` (`run_export` + helper passphrase mutualisé
+  `passphrase_for_session` — replay.rs délègue), dispatch m4 (warning alias legacy
+  unique), `EncryptedExport::rekey_from_file` (crypto.rs — core
+  `encrypt_json_to_file` factorisé, passthrough byte-for-byte du JSON déchiffré,
+  sel/nonce neufs, garde MIN_PASSPHRASE_LEN, refus écrasement sauf `--force`),
+  auto-vérification du re-key côté commande (déchiffrement immédiat, suppression
+  best-effort si échec), warning legacy `--export-encrypted` dans engine_cfg.
+  `session replay` réutilise `replay::run` tel quel (shape positionnelle
+  `SessionReplayArgs` → `ReplayArgs`). Tests : 3 unit re-key (roundtrip
+  passphrase+envelope, force/overwrite, passphrase fausse/courte sans write
+  partiel) + 5 intégration binaire (roundtrip re-key+replay env, overwrite/force,
+  `--import` manquant, alias legacy warn, `--export-encrypted` warn dry-run).
+  Golden regen (+`session`, `+session export`, `+session replay` ; `replay` reste
+  listé — collecte programmatique, hidden ≠ retiré). Docs : README/fr (exemples +
+  commandes), DOCUMENTATION (rows Output + section `session` + 3 exemples),
+  CHANGELOG (Added/Changed/Migration). Gates fmt/clippy/47 suites/944 lib
+  tests/doc verts. **C17 vague 2 : 4/4**.*
 
 **Acceptation par migration** : flag ancien fonctionnel avec warning + ligne
 équivalente ; suite `integration_enumeration.rs` / `tests/mcp_stdio.rs` maintenue
@@ -417,6 +435,40 @@ Exemple de diagnostic (JSON, champ optionnel — retro-compatible) :
   Detection + notes deprecated). Gates fmt/clippy/47 suites/941 tests
   lib/doc verts (build copie nvme). Reste C17 : migration 4 (session
   namespace).
+
+- > Progrès 2026-10-20 (C17 migration 4 done — même branche, **vague 2 :
+  4/4**) : namespace `session` — `Commands::Session` +
+  `SessionCommands::{Export(ExportArgs), Replay(SessionReplayArgs)}` (root.rs ;
+  `Replay` conservé en variante cachée `#[command(hide = true)]`, warning
+  flag-only unique dans le dispatch). `commands/session.rs` : `run_export`
+  (exige le global `--import <FILE>`, NOTHING sans key material) +
+  `passphrase_for_session(role)` mutalisé — le prompt replay historique
+  délègue (repli gracieux raw-size préservé) ; export lit source PUIS
+  destination (env ⇒ même passphrase des deux côtés, TTY ⇒ deux lectures).
+  `EncryptedExport::rekey_from_file` (crypto.rs) : core d'écriture factorisé
+  en `encrypt_json_to_file` (ZÉRO changement crypto, même corps déplacé) ;
+  re-key = passthrough byte-for-byte du JSON déchiffré (pas de
+  re-sérialisation), sel/nonce OS-aléatoires neufs, garde
+  `MIN_PASSPHRASE_LEN`, refus d'écrasement sauf `--force` (rm préalable),
+  validation minimale `IgnoredAny` (fail-fast JSON corrompu) ; blob TOUJOURS
+  réécrit en version courante ⇒ upgrade v1/v2 → v3 comme effet de bord
+  documenté. L'output est auto-vérifié par un déchiffrement immédiat côté
+  commande (fichier supprimé best-effort si échec). `session replay <FILE>`
+  réutilise `replay::run` tel quel (littéral `ReplayArgs` intra-crate). 
+  Warning legacy `--export-encrypted` (engine_cfg, flag-only, jamais de
+  valeur écho). MCP : aucun nouveau champ de commandes (bools/modes
+  inchangés, littéraux Cli intacts). Tests : 3 unit re-key (roundtrip
+  passphrase+contenu, overwrite/force + fichier préexistant intact, source
+  fausse/courte ⇒ aucun write partiel) + 5 intégration binaire zéro-requête
+  (roundtrip re-key + replay via `INJEKT_PASSPHRASE`, overwrite refusé puis
+  `--force`, `--import` manquant ⇒ exit ≠ 0, alias legacy warn, dry-run +
+  `--export-encrypted` warn). Golden regen : `+session`, `+session export`,
+  `+session replay` (l'alias `replay` RESTE listé — la surface figée collecte
+  les sous-commandes programmatiquement, hide ≠ retrait). Docs : README/fr
+  (exemples + commandes), DOCUMENTATION (rows `--export-encrypted`/`--import`
+  + section `session` + 2 exemples inspection), CHANGELOG
+  (Added/Changed/Migration guide). Gates fmt/clippy/47 suites/944 lib
+  tests/doc verts (build copie nvme).
 
 - > Progrès 2026-10-19 (C14 done): moteur diagnostics `INCONCLUSIVE` câblé —
   `src/engine/diagnostics.rs` (types purs : `InconclusiveCause`/`Diagnostic`/`DiagSignals`,
