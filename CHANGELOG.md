@@ -26,6 +26,15 @@ Seuils calibrés (C7, gelés v1.0-rc — voir `src/reporting/verdict.rs` +
   le mapping vers les mêmes champs internes d'`EnumConfig` (UNION : une
   nouvelle shape ne désactive jamais un flag explicite). La parité MCP est
   inchangée : les paramètres booléens individuels écrivent le même socle.
+- **C17 — CLI vague 2, migration 2 (`--input <PATH|-|DIR>`)** : ingestion
+  unifiée sur les mêmes loaders legacy (`target::ingest`). Sniff figé : `-`
+  → stdin; dossier existant → raw-dir; `.json/.yaml/.yml` avec un marqueur
+  `openapi` dans le premier KiB → openapi; `.xml` avec un document `<urlset`
+  → sitemap; sinon liste TXT (`#` commentaires). Source additive comme les
+  modes legacy (dedup sur les chevauchements, cap `MAX_BULK_TARGETS`
+  inchangé) ; `is_bulk()` couvre `--input` (pipeline bulk déclenché) ;
+  `injekt doctor` liste désormais la 6e source (`--input` : fichier ou
+  dossier tous deux valides, alias stdin accepté).
 
 ### Changed
 - Flags legacy hôtes du cluster (`--dbs/--tables/--columns/--dump`,
@@ -35,6 +44,10 @@ Seuils calibrés (C7, gelés v1.0-rc — voir `src/reporting/verdict.rs` +
   dbs`, le triple → `--scope`) sans valeur écho (scrub-by-design). Gate
   `recon` strict étendu aux deux nouvelles shapes (pas d'`--auto-enumerate`
   ⇒ ignorées avec le warning historical).
+- Modes ingestion legacy (`--bulk-file/-m`, `--stdin`, `--openapi-file`,
+  `--sitemap-file`, `--raw-dir` — pas concernés : `--raw-file` reste la
+  voie single-scan exclusive) : inchangés et alternatifs à `--input` ;
+  aucune dépréciation forcée à ce stade (coexistence additive).
 
 ### Migration guide
 - Énumération : `injekt <URL> --dbs --current-user` ⇒ `injekt <URL> --enum
@@ -43,6 +56,12 @@ Seuils calibrés (C7, gelés v1.0-rc — voir `src/reporting/verdict.rs` +
   `injekt <URL> --enum columns --scope shop.users.password`. Un nom de db
   contenant un `.` littéral garde le triple legacy (la CLI n'est pas un
   parseur de noms).
+- Ingestion : `--bulk-file f.txt` ⇔ `--input f.txt` (TXT) ; `--stdin` ⇔
+  `--input -` ; `--openapi-file spec.json` ⇔ `--input spec.json` (sniff);
+  `--sitemap-file sitemap.xml` ⇔ `--input sitemap.xml` (sniff);
+  `--raw-dir dumps/` ⇔ `--input dumps/` (dossier). Une source ambiguë
+  (JSON sans clé `openapi`, XML sans `<urlset>`) retombe en liste TXT —
+  utiliser le mode legacy équivalent si l'intention diffère.
 - Le reporting, le rapport JSON et la sortie console restent byte-identiques :
   seul l'appel CLI change (l'engine struct reçoit les mêmes champs).
 
