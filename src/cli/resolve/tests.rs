@@ -383,6 +383,9 @@ fn dbms_hint_normalizes_sqlite_and_aliases() {
     assert_eq!(cli.normalized_dbms_hint().as_deref(), Some("sqlite"));
     cli.detection.dbms = Some("  SQLITE ".to_owned());
     assert_eq!(cli.normalized_dbms_hint().as_deref(), Some("sqlite"));
+    // P5: `sqlite3` alias (CLI parity) survives normalization.
+    cli.detection.dbms = Some("sqlite3".to_owned());
+    assert_eq!(cli.normalized_dbms_hint().as_deref(), Some("sqlite"));
     cli.detection.dbms = Some("pg".to_owned());
     assert_eq!(cli.normalized_dbms_hint().as_deref(), Some("postgres"));
     cli.detection.dbms = Some("nope".to_owned());

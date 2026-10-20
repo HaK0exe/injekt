@@ -321,7 +321,8 @@ pub(crate) fn dbms_hint_kind(config: &EngineConfig) -> Option<crate::dbms::DbmsK
         "postgres" | "postgresql" | "pg" | "pgsql" => Some(crate::dbms::DbmsKind::Postgres),
         "mssql" | "sqlserver" | "sql-server" | "tsql" => Some(crate::dbms::DbmsKind::MsSql),
         "oracle" | "ora" => Some(crate::dbms::DbmsKind::Oracle),
-        "sqlite" => Some(crate::dbms::DbmsKind::Sqlite),
+        // P5: `sqlite3` alias (CLI binary name parity) alongside `sqlite`.
+        "sqlite" | "sqlite3" => Some(crate::dbms::DbmsKind::Sqlite),
         _ => {
             warn!(dbms=%hint, "unknown --dbms hint, ignoring (auto-fingerprint)");
             None

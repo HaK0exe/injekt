@@ -38,7 +38,7 @@ detection → fingerprint → extraction (opt-in)`.
    │
 4. Évasion si WAF : `--tamper` progressif → `--hpp`/`--chunked` → `--level 2/3`
    │
-5. Fingerprint DBMS : auto puis `--dbms mysql|postgres|mssql|oracle` forcé si doute
+5. Fingerprint DBMS : auto puis `--dbms mysql|postgres|mssql|oracle|sqlite` forcé si doute
    │
 6. Exploitation OPT-IN : `--extract --dbs` → `--tables` → `--columns` → `--dump`
    │                     (+ `--banner/--current-user/--current-db/--hostname`)
@@ -103,8 +103,9 @@ L1 budget historique, L2 double, L3+ tout + `ORDER BY` élargi.
 
 ### DBMS (`src/dbms/`)
 - Trait `DbmsDetector` (`async fn` natif), fingerprint MySQL 8.x (`@@version`),
-  Postgres 15+ (`version()`), MSSQL 2022 (`@@version`), Oracle 21c (`v$version`).
-- `--dbms mysql|postgres|mssql|oracle` (alias `mariadb→mysql`, `pg→postgres`, `sqlserver→mssql`, `ora→oracle`).
+  Postgres 15+ (`version()`), MSSQL 2022 (`@@version`), Oracle 21c (`v$version`),
+  SQLite 3.x (`sqlite_version()`).
+- `--dbms mysql|postgres|mssql|oracle|sqlite` (alias `mariadb→mysql`, `pg→postgres`, `sqlserver→mssql`, `ora→oracle`, `sqlite3→sqlite`).
 
 ### Extraction (`src/extraction/`)
 - Recherche binaire ASCII 32-126, `buffer_unordered` borné, vérification

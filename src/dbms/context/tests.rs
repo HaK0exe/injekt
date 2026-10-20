@@ -26,6 +26,11 @@ fn test_dbms_belief_from_hint() {
     let sqlite = DbmsBelief::from_hint("sqlite");
     assert_eq!(sqlite.sqlite, 1.0);
     assert_eq!(sqlite.top_candidate().0, DbmsKind::Sqlite);
+
+    // P5: `sqlite3` alias mirrors `sqlite` in the belief router too.
+    let sqlite3 = DbmsBelief::from_hint("sqlite3");
+    assert_eq!(sqlite3.sqlite, 1.0);
+    assert_eq!(sqlite3.top_candidate().0, DbmsKind::Sqlite);
 }
 
 #[test]

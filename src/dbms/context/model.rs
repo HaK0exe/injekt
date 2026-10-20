@@ -151,7 +151,7 @@ impl DbmsBelief {
                 oracle: 1.0,
                 sqlite: 0.0,
             },
-            "sqlite" => Self {
+            "sqlite" | "sqlite3" => Self {
                 mysql: 0.0,
                 postgres: 0.0,
                 mssql: 0.0,
