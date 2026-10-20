@@ -93,6 +93,8 @@ fn blank_cli() -> Cli {
         },
         enumeration: EnumOpts {
             extract: false,
+            enum_items: Vec::new(),
+            scope: None,
             dbs: false,
             tables: false,
             columns: false,

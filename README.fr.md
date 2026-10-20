@@ -115,7 +115,7 @@ injekt scan --target "https://example.com/?id=1"
 injekt recon crawl --target "example.com" --depth 2 --max-pages 100
 
 # Crawler, tester chaque paramètre découvert, puis énumérer les vulnérabilités confirmées
-injekt recon scan --target "example.com" --auto-enumerate --dbs
+injekt recon scan --target "example.com" --auto-enumerate --enum dbs
 
 # Importer des candidats déjà découverts
 injekt recon import --file discovered.json --test
@@ -131,7 +131,7 @@ injekt --target "https://example.com/?id=1" --tamper space2comment,randomcase --
 
 # Tampers requête : HPP (duplique ?id=1&id=PAYLOAD) et chunked (body streamé)
 injekt --target "https://example.com/?id=1" --hpp --techniques boolean
-injekt recon scan --target "example.com" --hpp --chunked --auto-enumerate --dbs
+injekt recon scan --target "example.com" --hpp --chunked --auto-enumerate --enum dbs
 
 # OPSEC : Tor + jitter + rate limit
 injekt --target "https://example.com/?id=1" \
@@ -240,9 +240,10 @@ Options:
       --oob-wait-secs <N>         Attente avant polling [défaut: 5]
       --dbms <TYPE>               mysql|postgres|mssql|oracle (défaut: fingerprint auto)
       --extract                   Active l'extraction (opt-in, SecretString)
-      --dbs/--tables/--columns/--dump  Énumération (requiert --extract ou recon --auto-enumerate)
-  -b, --banner, --current-user, --current-db, --hostname  Énumération d'identité
-      --db/--table/--column <NOM> Périmètre d'énumération ; --start/--stop/--count pour dumps
+      --enum <ITEMS>              Énumération compacte (C17, virgules): dbs,tables,columns,dump,banner,user,db,hostname
+      --scope <DB[.TABLE[.COL]]>  Périmètre d'énumération (C17) ; --start/--stop/--count pour dumps
+      --dbs/--tables/--columns/--dump, -b/--banner/--current-user/--current-db/--hostname, --db/--table/--column <NOM>
+                                  (anciens flags, deprecated 2 releases — mapping affiché en warning)
       --marker <STR>              Marqueur d'injection (*, §, {{}})
       --output <CHEMIN>           Chemin rapport JSON (0o600 sur Unix)
       --export-encrypted <CHEMIN> Snapshot chiffré (XChaCha20-Poly1305/Argon2id)

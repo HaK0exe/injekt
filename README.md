@@ -118,8 +118,8 @@ injekt recon crawl --target "example.com" --depth 2 --max-pages 100
 
 # Crawl, test each discovered parameter, then enumerate confirmed findings
 # (`recon scan` = alias ; voie recommandée : `auto --with-recon`)
-injekt recon scan --target "example.com" --auto-enumerate --dbs
-injekt auto --target "example.com" --with-recon --auto-enumerate --dbs
+injekt recon scan --target "example.com" --auto-enumerate --enum dbs
+injekt auto --target "example.com" --with-recon --auto-enumerate --enum dbs
 
 # Import previously discovered candidates
 injekt recon import --file discovered.json --test
@@ -136,7 +136,7 @@ injekt --target "https://example.com/?id=1" --tamper versionedcomment,charencode
 
 # Request-level tampers: HPP (?id=1&id=PAYLOAD) and chunked (streamed body)
 injekt --target "https://example.com/?id=1" --hpp --techniques boolean
-injekt auto --target "example.com" --with-recon --hpp --chunked --auto-enumerate --dbs
+injekt auto --target "example.com" --with-recon --hpp --chunked --auto-enumerate --enum dbs
 # (ancien: `recon scan --target "example.com" --hpp --chunked --auto-enumerate --dbs` — alias conservé)
 
 # Bulk auto-détecté : --bulk-file / --stdin / --openapi-file / --sitemap-file / --raw-dir
@@ -264,9 +264,10 @@ Options:
       --oob-wait-secs <N>         Wait before polling collaborator [default: 5]
       --dbms <KIND>               mysql|postgres|mssql|oracle (default: auto-fingerprint)
       --extract                   Enable data extraction (opt-in, SecretString)
-      --dbs/--tables/--columns/--dump  Enumeration (needs --extract or recon --auto-enumerate)
-  -b, --banner, --current-user, --current-db, --hostname  Identity enumeration
-      --db/--table/--column <NAME>  Enumeration scope; --start/--stop/--count for dumps
+      --enum <ITEMS>              Compact enumeration (C17, comma-separated): dbs,tables,columns,dump,banner,user,db,hostname
+      --scope <DB[.TABLE[.COL]]>  Enumeration scope (C17); --start/--stop/--count for dumps
+      --dbs/--tables/--columns/--dump, -b/--banner/--current-user/--current-db/--hostname, --db/--table/--column <NAME>
+                                  (legacy flags, deprecated 2 releases — equivalent mapping shown as warning)
       --marker <STR>              Injection marker (*, §, {{}})
       --output <PATH>             JSON report path (0o600 on Unix)
       --export-encrypted <PATH>   Encrypted snapshot (XChaCha20-Poly1305/Argon2id)

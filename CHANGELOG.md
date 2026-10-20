@@ -16,6 +16,36 @@ Seuils calibrés (C7, gelés v1.0-rc — voir `src/reporting/verdict.rs` +
   repli conservateur compilé ci-dessus (les deux signaux doivent concorder).
   Toute recalibration sous les précisions promises casse le test de calibration.
 
+## [Unreleased]
+
+### Added
+- **C17 — CLI vague 2, migration 1 (`--enum` + `--scope`)** : `--enum <ITEMS>`
+  (items figés par value_parser : `dbs,tables,columns,dump,banner,user,db,hostname`,
+  séparés par `,` — items inconnus ⇒ usage exit 2) et `--scope
+  <DB[.TABLE[.COLUMN]]>` remplacent le cluster legacy d'`EnumOpts` en conservant
+  le mapping vers les mêmes champs internes d'`EnumConfig` (UNION : une
+  nouvelle shape ne désactive jamais un flag explicite). La parité MCP est
+  inchangée : les paramètres booléens individuels écrivent le même socle.
+
+### Changed
+- Flags legacy hôtes du cluster (`--dbs/--tables/--columns/--dump`,
+  `-b/--banner`, `--current-user`, `--current-db`, `--hostname`,
+  `--db/--table/--column`) : **deprecated, fonctionnels encore 2 releases**.
+  Un warning unique par run liste le mapping équivalent (`--dbs -> --enum
+  dbs`, le triple → `--scope`) sans valeur écho (scrub-by-design). Gate
+  `recon` strict étendu aux deux nouvelles shapes (pas d'`--auto-enumerate`
+  ⇒ ignorées avec le warning historical).
+
+### Migration guide
+- Énumération : `injekt <URL> --dbs --current-user` ⇒ `injekt <URL> --enum
+  dbs,user` (ou `--enum dbs --enum user`, répétable).
+- Scope : `injekt <URL> --db shop --table users --column password` ⇒
+  `injekt <URL> --enum columns --scope shop.users.password`. Un nom de db
+  contenant un `.` littéral garde le triple legacy (la CLI n'est pas un
+  parseur de noms).
+- Le reporting, le rapport JSON et la sortie console restent byte-identiques :
+  seul l'appel CLI change (l'engine struct reçoit les mêmes champs).
+
 ## [0.4.0] — 2026-10-19 — Hardening v1.0-rc (première release taguée post-v0.3.0)
 
 > **Consolidation de versions :** les jalons C1→C13 documentés plus bas sous les

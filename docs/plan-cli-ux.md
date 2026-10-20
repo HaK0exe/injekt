@@ -195,12 +195,18 @@ roughly zéro changement de comportement de détection.
 Prompt/PR **dédiée**, un commit par migration, gate utilisateur entre chaque.
 Interne inchangé (`EnumConfig`, `MatcherConfig`), parité MCP vérifiée.
 
-- [ ] **`--enum <items>` + `--scope <db[.table[.col]]>`** fusionnent le cluster
+- [x] **`--enum <items>` + `--scope <db[.table[.col]]>`** fusionnent le cluster
   `EnumOpts` (15 bools : `--dbs --tables --columns --dump -b --current-user
   --current-db --hostname --db --table --column`). Items : `dbs,tables,columns,dump,
   user,db,hostname`. `--start/--stop/--count` inchangés. Anciens flags → warning +
   commande équivalente + mapping vers les mêmes champs `EnumConfig`. ⚠ `mcp/tools/params.rs`
   expose les mêmes — les deux shapes restent.
+  *(fait 2026-10-20 : item `banner` ajouté au set (`banner` absent de cette
+  liste d'origine — union des deux nomenclatures, value_parser figé) ;
+  warning une ligne par run `legacy enumeration flags deprecated (2 releases
+  left)` + paires `flag -> --enum item` / triple -> `--scope` ; suite
+  `tests/integration_cli_c17.rs` 6 tests zéro requête ; golden regen (+2
+  flags) ; parité MCP = shapes bools directes inchangées.)*
 - [ ] **`--input <PATH|-|DIR>`** (detection auto du format : dir → raw-dir ; `.xml`
   racine `<urlset>` → sitemap ; `.json/.yaml` clé `openapi` → OpenAPI ; `-` → stdin ;
   sinon liste TXT `#`-commenté) fusionne les 7 modes ingestion. Point de branch
@@ -313,6 +319,32 @@ Exemple de diagnostic (JSON, champ optionnel — retro-compatible) :
   verts ; regen délibérée du golden `cli-flags.txt` (freeze surface :
   exactement 1 entrée subcommand `doctor`, aucun flag nouveau, revue du
   diff). Non fait : C16/C17/C18 (tâches suivantes, cochées vide).
+
+- > Progrès 2026-10-20 (C17 migration 1 done — branch `feat/cli-vague2`) : `--enum
+  <ITEMS>` (`long = "enum"` explicite — le derive clap produit
+  `--enum-items`, trap vu au test ; value_parser figé sur
+  `dbs|tables|columns|dump|banner|user|db|hostname`, `value_delimiter(',')`,
+  item inconnu = usage exit 2) + `--scope <DB[.TABLE[.COLUMN]]>`
+  (`splitn(3,'.')`, segments vides → `None`) dans
+  `src/cli/args/enumeration.rs` ; mapping `apply_enum_items`/`apply_scope`
+  appliqué à une copie d'`EnumOpts` dans `src/cli/engine_cfg.rs` (UNION —
+  un item/le scope ne désactivent jamais un flag explicite) ; warning
+  deprecated legacy UNE ligne par run + paires `--dbs -> --enum dbs` /
+  `--db/--table/--column -> --scope` sans valeurs, collecté AVANT le
+  mapping (un item ne masque jamais le warning) ; gate
+  `EnumGate::Strict` étendu aux deux nouvelles shapes ; parité MCP =
+  shapes bools directes inchangées (builder complété des 2 nvx champs,
+  defaults neutres). Tests : 13 unit (parse_scope, union,
+  mapping legacy, `Cli::parse_from` → `EnumConfig`, gate strict) +
+  `tests/integration_cli_c17.rs` 6 tests `CARGO_BIN_EXE` zéro requête
+  (dry-run : shape nouvelle sans warning, legacy warning + mapping,
+  item inconnu exit 2). Docs : README/README.fr (flags block + exemples
+  → `--enum`), DOCUMENTATION (table + exemples). Golden `cli-flags.txt`
+  regen délibérée (+ `--enum`, `--scope`, revue du diff). Gates
+  fmt/clippy/47 suites/doc verts sur build copie nvme ;
+  apprentissage : `const fn` ne peut pas matcher sur `str` sous 1.98
+  (E0658, PartialEq const-trail non stable) → `legacy_item_flag` en `fn`
+  classique.
 
 - > Progrès 2026-10-19 (C14 done): moteur diagnostics `INCONCLUSIVE` câblé —
   `src/engine/diagnostics.rs` (types purs : `InconclusiveCause`/`Diagnostic`/`DiagSignals`,

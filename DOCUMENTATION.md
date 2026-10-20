@@ -245,14 +245,16 @@ they stay available to single-payload techniques as explicit opt-in).
 **Enumeration/Extraction Flags** (require `--extract` or `--auto-enumerate` in recon):
 | Flag | Description |
 |------|-------------|
-| `--dbs` | Enumerate databases |
-| `--tables` | Enumerate tables (with `--db`) |
-| `--columns` | Enumerate columns (with `--db`, `--table`) |
-| `--dump` | Dump table data (with `--db`, `--table`, `--column`) |
-| `--banner` | Retrieve DBMS version |
-| `--current-user` | Retrieve current DB user |
-| `--current-db` | Retrieve current database name |
-| `--hostname` | Retrieve server hostname |
+| `--enum <ITEMS>` | C17 — compact enumeration, comma-separated: `dbs,tables,columns,dump,banner,user,db,hostname` (replaces the 8 legacy flag forms — deprecated but still functional 2 releases) |
+| `--scope <DB[.TABLE[.COLUMN]]>` | C17 — replaces the `--db/--table/--column` triple (same legacy window); a database name containing a literal `.` must use the legacy triple |
+| `--dbs` | *(deprecated, voir `--enum`)* Enumerate databases |
+| `--tables` | *(deprecated, voir `--scope`)* Enumerate tables (with `--db`) |
+| `--columns` | *(deprecated, voir `--scope`)* Enumerate columns (with `--db`, `--table`) |
+| `--dump` | *(deprecated, voir `--scope`)* Dump table data (with `--db`, `--table`, `--column`) |
+| `--banner` | *(deprecated, voir `--enum banner`)* Retrieve DBMS version |
+| `--current-user` | *(deprecated, voir `--enum user`)* Retrieve current DB user |
+| `--current-db` | *(deprecated, voir `--enum db`)* Retrieve current database name |
+| `--hostname` | *(deprecated, voir `--enum hostname`)* Retrieve server hostname |
 | `--db <NAME>` | Specific database |
 | `--table <NAME>` | Specific table |
 | `--column <NAME>` | Specific column |
@@ -266,8 +268,8 @@ they stay available to single-payload techniques as explicit opt-in).
 injekt recon crawl --target "example.com" --depth 2 --max-pages 100
 
 # Crawl + scan discovered parameters (`recon scan` = alias ; voie recommandée : `auto --with-recon`)
-injekt recon scan --target "example.com" --auto-enumerate --dbs
-injekt auto --target "example.com" --with-recon --auto-enumerate --dbs
+injekt recon scan --target "example.com" --auto-enumerate --enum dbs
+injekt auto --target "example.com" --with-recon --auto-enumerate --enum dbs
 
 # Import previously discovered candidates
 injekt recon import --file discovered.json --test
@@ -667,8 +669,8 @@ injekt -u "https://target.onion/?id=1" \
 injekt recon crawl --target "https://example.com" --depth 3 --max-pages 200 --output discovered.json
 
 # 2. Scan discovered parameters (`recon scan` = alias → préférer `auto --with-recon`)
-injekt recon scan --target "https://example.com" --auto-enumerate --dbs --output scan-report.json
-injekt auto --target "https://example.com" --with-recon --auto-enumerate --dbs --output scan-report.json
+injekt recon scan --target "https://example.com" --auto-enumerate --enum dbs --output scan-report.json
+injekt auto --target "https://example.com" --with-recon --auto-enumerate --enum dbs --output scan-report.json
 
 # 3. Import and test offline candidates
 injekt recon import --file discovered.json --test --enumerate --output final-report.json

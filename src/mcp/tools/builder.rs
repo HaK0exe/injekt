@@ -194,6 +194,10 @@ impl InjektServer {
             },
             enumeration: crate::cli::args::EnumOpts {
                 extract: false,
+                // C17 : `--enum`/`--scope` sont des shapes CLI — le MCP
+                // écrit les bools directs (shapes individuelles conservées).
+                enum_items: Vec::new(),
+                scope: None,
                 dbs: false,
                 tables: false,
                 columns: false,
