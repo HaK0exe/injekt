@@ -219,10 +219,23 @@ Interne inchangé (`EnumConfig`, `MatcherConfig`), parité MCP vérifiée.
   alias stdin, dir/fichier valides) ; 6 tests binaire réel zéro requête
   (TXT/OpenAPI/sitemap/stdin/dedup-positional/gate) ; golden regen (+ `--input`)
   ; MCP shape inchangée.)*
-- [ ] **`--match EXPR` / `--veto EXPR`** (rép.) remappent `--string/--not-string/--code`
+- [x] **`--match EXPR` / `--veto EXPR`** (rép.) remappent `--string/--not-string/--code`
   vers `detection::matcher::MatcherConfig`. Grammaire figée : `status==N`, `status!=N`,
   `body=CONTENU` (contient littéral), `body~RE` (regex) — littéral et regex
   **distingués explicitement**. `--text-only` reste un preprocessing (pas un veto).
+  *(fait 2026-10-20 : `MatchExprKind` + `parse_match_expr` validé au parse
+  (`value_parser = parse_match_expr`, champs `Vec<MatchExprKind>` typés — usage
+  exit 2 sur forme inconnue/status non-u16/`body=` vide/regex non compilable) ;
+  mapping `matcher_config` (legacy d'abord, dernier expr gagne sur les Options ;
+  regex compilées UNE fois dans le resolver, hot path jamais recompilé ;
+  `veto_codes` champ nouveau sans équivalent legacy) ; ordre `matches()` étendu
+  (code → veto_codes → not_string → veto_regex → valid-page OU) ; legacy
+  matcher warning flag-only ; `evidence_suffix()` étendu. Tests : 5 unit
+  grammaire + 6 unit matcher gates + 4 unit mapping/precedence/doc-warning +
+  5 intégration binaire (usage-errors exit 2, legacy pairs, dry-run clean).
+  `regex` dépendance déjà déclarée (Cargo.toml:80) — zéro nouvelle dep.
+  Note `main.rs`: `Box::pin(run())` (clippy `large_futures` > 16 KiB après
+  croissance d'`Cli`).*
 - [ ] **Session namespace** : `injekt session export <PATH>` / `session replay <FILE>`
   ; `replay` devient alias caché déprécié ; `--export-encrypted` déprécié ; réutilise
   `session::export` tel quel (v2 argon2id 0o600).
@@ -375,6 +388,35 @@ Exemple de diagnostic (JSON, champ optionnel — retro-compatible) :
   bulk). Golden `cli-flags.txt` regen délibérée (+ `--input`). Gates
   fmt/clippy/47 suites/doc verts sur build copie nvme. Reste C17 :
   migration 3 (`--match/--veto`), migration 4 (session namespace).
+
+- > Progrès 2026-10-20 (C17 migration 3 done — même branche) :
+  `--match EXPR`/`--veto EXPR` répétables (OU interne des exprs, un hit
+  couvre la condition de page valide, premier veto gagne). Grammaire
+  figée `status==N|status!=N|body=CONTENU|body~RE` classifiée par
+  `MatchExprKind` (`src/cli/args/detection.rs`), `value_parser =
+  parse_match_expr` (champs retypés `Vec<MatchExprKind>` — zéro re-parse
+  dans le mapping ; erreurs d'usage exit 2 : forme inconnue, status
+  non-u16, `body=` vide, regex non compilable — `regex` déjà dépendance
+  déclarée : zéro nouvelle dep). Mapping `matcher_config`
+  (`src/cli/resolve/opts.rs`) : legacy d'abord puis exprs (dernier expr
+  gagne sur `code`/`string`/`not_string`), regex COMPILÉES UNE FOIS
+  (`Vec<Regex>` + `_src` pour evidence) — `matches()` (hot path
+  par-réponse) ne recompile pas. Extensions `MatcherConfig`:
+  `match_regex`/`match_regex_src`/`veto_regex`/`veto_regex_src`/
+  `veto_codes` (`#[non_exhaustive]`, littéraux tests via
+  `..Default::default()`), `is_active` et `evidence_suffix()` étendus
+  (re-match:/re-veto:/status-veto:). Ordre `matches()` : code →
+  veto_codes → not_string → veto_regex → valid-page (string OU
+  match_regex). Warning legacy matcher flag-only (jamais de valeur
+  utilisateur écho). `main.rs`: `Box::pin(run())` (clippy
+  `large_futures` — `Cli` a dépassé 16 KiB de future après les nvx
+  champs). Tests : 5 unit grammaire, 6 unit gates matcher, 4 unit
+  mapping/precedence/warning, +5 intégration binaire (usage-errors
+  exit 2, pairs legacy, dry-run clean). Golden regen (`--match`,
+  `--veto`). Docs : README/README.fr flags-block, DOCUMENTATION (row
+  Detection + notes deprecated). Gates fmt/clippy/47 suites/941 tests
+  lib/doc verts (build copie nvme). Reste C17 : migration 4 (session
+  namespace).
 
 - > Progrès 2026-10-19 (C14 done): moteur diagnostics `INCONCLUSIVE` câblé —
   `src/engine/diagnostics.rs` (types purs : `InconclusiveCause`/`Diagnostic`/`DiagSignals`,

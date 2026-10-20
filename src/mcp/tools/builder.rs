@@ -157,6 +157,10 @@ impl InjektServer {
                 string: None,
                 not_string: None,
                 code: None,
+                // C17 : `--match`/`--veto` = shapes CLI — le MCP expose
+                // toujours les paramètres string/not-string/code directs.
+                match_expr: Vec::new(),
+                veto_expr: Vec::new(),
                 text_only: false,
                 max_duration: None,
                 // Budgets OPT-IN (None = illimité, comportement historique) :

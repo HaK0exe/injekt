@@ -230,7 +230,10 @@ Options:
       --safe-chars <STR>          Caractères exemptés du percent-encoding
       --skip-urlencode            Envoie les payloads sans URL-encoding (prudence)
       --string/--not-string <STR> La réponse doit (ne pas) contenir ce fragment, sinon veto
-      --code <N>                  Le statut réponse doit égaler N, sinon veto
+                                  (deprecated C17 : ⚠ voir --match/--veto)
+      --match <EXPR>              Matchers C17, répétables (OU) : status==N, body=CONTENU, body~RE
+      --veto <EXPR>               Vetos C17, répétables : status==N, status!=N, body=CONTENU, body~RE
+      --code <N>                  Le statut réponse doit égaler N, sinon veto (deprecated : --match status==N)
       --text-only                 Strip tags/entités HTML avant matching
       --level <1-5>               Agressivité [défaut: 1]
       --seed <N>                  Seed RNG déterministe (enregistré dans le rapport)

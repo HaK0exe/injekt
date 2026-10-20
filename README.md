@@ -256,7 +256,10 @@ Options:
       --safe-chars <STR>          Extra chars exempted from percent-encoding
       --skip-urlencode            Send payloads without URL-encoding (use with care)
       --string/--not-string <STR> Response must (not) contain substring, else veto finding
-      --code <N>                  Response status must equal N, else veto finding
+                                  (deprecated C17: ⚠ see --match/--veto)
+      --match <EXPR>              C17 matchers, repeatable (OR): status==N, body=CONTENU, body~RE
+      --veto <EXPR>               C17 vetoes, repeatable: status==N, status!=N, body=CONTENU, body~RE
+      --code <N>                  Response status must equal N, else veto finding (deprecated: --match status==N)
       --text-only                 Strip HTML tags/entities before matching
       --level <1-5>               Aggressiveness [default: 1]
       --seed <N>                  Deterministic RNG seed (recorded in report)

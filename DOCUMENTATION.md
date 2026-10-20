@@ -118,9 +118,11 @@ La cible admet quatre sources (précidence) : `--raw-file` > positional `injekt 
 | `--safe-chars <STR>` | Extra chars exempted from percent-encoding (e.g. `"(),"`) | — |
 | `--skip-urlencode` | Send payloads without URL-encoding (use with care) | `false` |
 | `--fetch-using <MODE>` | Force fetch oracle: `direct`, `boolean` or `time` (narrows default technique set) | `direct` |
-| `--string <STR>` | Response body **must contain** this substring, otherwise veto finding | — |
-| `--not-string <STR>` | Response body **must NOT contain** this substring, otherwise veto finding | — |
-| `--code <N>` | Response status **must equal** this code, otherwise veto finding | — |
+| `--string <STR>` | *(deprecated, voir `--match body=…`)* Response body **must contain** this substring, otherwise veto finding | — |
+| `--not-string <STR>` | *(deprecated, voir `--veto body=…`)* Response body **must NOT contain** this substring, otherwise veto finding | — |
+| `--code <N>` | *(deprecated, voir `--match status==N`)* Response status **must equal** this code, otherwise veto finding | — |
+| `--match <EXPR>` | C17 — response matcher, repeatable (OR): `status==N`, `body=CONTENU` (contains literal), `body~RE` (regex). Invalid expr = usage exit 2. Disjunction: one hit registers the valid page | — |
+| `--veto <EXPR>` | C17 — repeatable veto: `status==N` (veto when equal), `status!=N` (must equal), `body=CONTENU`, `body~RE`. Veto-first priority over `--match` | — |
 | `--text-only` | Strip HTML tags/entities before matching and detection | `false` |
 | `--level <1-5>` | Aggressiveness: L1 = historical payload budget, L2 doubles it, L3+ tries every payload and widens ORDER BY enumeration | `1` |
 | `--max-duration <SECS>` | Global detection time budget (**OPT-IN**): detection stops cooperatively once the shared detection clock exceeds `SECS` (running technique finishes early, clean `Done`, no error, no new finding; the union starvation guard is skipped once spent). `None` = unlimited (default, historical behaviour) | — |

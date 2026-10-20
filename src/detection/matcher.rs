@@ -1,17 +1,31 @@
 #![deny(unsafe_code)]
 
-//! Custom response matchers (`--string`, `--not-string`, `--code`, `--text-only`).
+//! Custom response matchers (`--string`, `--not-string`, `--code`,
+//! `--text-only`; plus the C17 `--match`/`--veto` expression forms —
+//! same `MatcherConfig`, richer grammar).
 //!
 //! [`MatcherConfig`] is a lightweight veto gate evaluated *before* the
 //! statistical detector: it can only reject a candidate (`Some(false)`)
 //! or abstain (`None`) and let the detector decide. It never confirms
 //! a finding on its own.
 
+use regex::Regex;
+
 /// User-supplied matching constraints for response gating.
 ///
 /// All string comparisons are case-sensitive. The caller is expected to
 /// pre-process the body via [`MatcherConfig::pre_process`] (handles
 /// `--text-only`) before calling [`MatcherConfig::matches`].
+///
+/// C17 — `--match EXPR`/`--veto EXPR` (frozen grammar:
+/// `status==N`, `status!=N`, `body=CONTENU`, `body~RE`) map onto this
+/// struct exactly:
+/// * `--match status==N` ⇔ `code` (must equal) — same field, expr ordering
+///   validated at parse;
+/// * `--veto status!=N` ⇔ `code` too (must equal, inverted wording);
+/// * `--veto status==N` ⇒ `veto_codes` (no legacy equivalent);
+/// * `--match body=…` ⇔ `string`, `--veto body=…` ⇔ `not_string`;
+/// * `body~RE` ⇒ the compiled regex lists below (no legacy equivalent).
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct MatcherConfig {
@@ -23,13 +37,32 @@ pub struct MatcherConfig {
     pub code: Option<u16>,
     /// Strip HTML tags/entities before matching.
     pub text_only: bool,
+    /// C17 — compiled `--match body~RE` expressions (disjunction: any
+    /// hit satisfies the gate). Compiled ONCE in the resolver — this
+    /// hot path (per response) must never recompile a regex; sources
+    /// kept in `*_src` for evidence/debugging only.
+    pub match_regex: Vec<Regex>,
+    /// C17 — source patterns of [`MatcherConfig::match_regex`].
+    pub match_regex_src: Vec<String>,
+    /// C17 — compiled `--veto body~RE` expressions: any hit vetoes.
+    pub veto_regex: Vec<Regex>,
+    /// C17 — source patterns of [`MatcherConfig::veto_regex`].
+    pub veto_regex_src: Vec<String>,
+    /// C17 — `--veto status==N`: veto when the status equals one of these.
+    pub veto_codes: Vec<u16>,
 }
 
 impl MatcherConfig {
     /// Returns `true` when at least one constraint is set.
     #[must_use]
-    pub const fn is_active(&self) -> bool {
-        self.string.is_some() || self.not_string.is_some() || self.code.is_some() || self.text_only
+    pub fn is_active(&self) -> bool {
+        self.string.is_some()
+            || self.not_string.is_some()
+            || self.code.is_some()
+            || self.text_only
+            || !self.match_regex.is_empty()
+            || !self.veto_regex.is_empty()
+            || !self.veto_codes.is_empty()
     }
 
     /// Pre-process a response body according to the config.
@@ -49,8 +82,12 @@ impl MatcherConfig {
     ///
     /// Order matters (first veto wins):
     /// 1. `code` mismatch → `Some(false)`
-    /// 2. `not_string` contained → `Some(false)`
-    /// 3. `string` missing → `Some(false)`
+    /// 2. C17 `veto_codes` hit (status equal) → `Some(false)`
+    /// 3. `not_string` contained → `Some(false)`
+    /// 4. C17 any `veto_regex` hit → `Some(false)`
+    /// 5. valid-page conditions — when at least one is requested
+    ///    (`string` XOR the C17 `match` list): no legacy `string` hit AND
+    ///    no regex hit ⇒ `Some(false)`.
     ///
     /// Otherwise returns `None` (no verdict, let the detector decide).
     #[must_use]
@@ -60,15 +97,24 @@ impl MatcherConfig {
         {
             return Some(false);
         }
+        if self.veto_codes.contains(&status) {
+            return Some(false);
+        }
         if let Some(needle) = self.not_string.as_deref()
             && body.contains(needle)
         {
             return Some(false);
         }
-        if let Some(needle) = self.string.as_deref()
-            && !body.contains(needle)
-        {
+        if self.veto_regex.iter().any(|re| re.is_match(body)) {
             return Some(false);
+        }
+        // Valid-page conditions (require-style): satisfied = abstain.
+        if self.string.is_some() || !self.match_regex.is_empty() {
+            let covered = self.string.as_deref().is_some_and(|n| body.contains(n))
+                || self.match_regex.iter().any(|re| re.is_match(body));
+            if !covered {
+                return Some(false);
+            }
         }
         None
     }
@@ -117,8 +163,31 @@ impl MatcherConfig {
         let code = self
             .code
             .map_or_else(|| "-".to_owned(), |c| truncate24(&c.to_string()));
+        // C17 — regex sources rendered as a `|`-join (per-expr truncated).
+        let display_list = |srcs: &[String]| -> String {
+            if srcs.is_empty() {
+                "-".to_owned()
+            } else {
+                srcs.iter()
+                    .map(|s| truncate24(s))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            }
+        };
+        let veto_codes = if self.veto_codes.is_empty() {
+            "-".to_owned()
+        } else {
+            self.veto_codes
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join("|")
+        };
         format!(
-            " matcher=string:{string},not-string:{not_string},code:{code},text-only:{}",
+            " matcher=string:{string},not-string:{not_string},code:{code},\
+             re-match:{},re-veto:{},status-veto:{veto_codes},text-only:{}",
+            display_list(&self.match_regex_src),
+            display_list(&self.veto_regex_src),
             self.text_only
         )
     }
@@ -180,6 +249,7 @@ pub fn strip_html(body: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -420,5 +490,95 @@ mod tests {
         // 24-char truncation of the alphabet prefix.
         assert!(suffix.contains("string:abcdefghijklmnopqrstuvwx"));
         assert!(!suffix.contains(long));
+    }
+
+    // ------------------------------------------------------------------
+    // C17 — expression gates (`--match`/`--veto`)
+    // ------------------------------------------------------------------
+
+    fn regex_cfg(match_src: &[&str], veto_src: &[&str], veto_codes: &[u16]) -> MatcherConfig {
+        MatcherConfig {
+            match_regex: match_src.iter().map(|s| Regex::new(s).unwrap()).collect(),
+            match_regex_src: match_src.iter().map(|s| (*s).to_owned()).collect(),
+            veto_regex: veto_src.iter().map(|s| Regex::new(s).unwrap()).collect(),
+            veto_regex_src: veto_src.iter().map(|s| (*s).to_owned()).collect(),
+            veto_codes: veto_codes.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn regex_match_passes_on_hit_abstains() {
+        let cfg = regex_cfg(&["wel.*come", "^canvas[[:alnum:]]+$"], &[], &[]);
+        // Any hit satisfies the valid-page condition → abstain.
+        assert!(cfg.matches("a welcome page", 200).is_none());
+        assert!(cfg.matches("canvas123", 200).is_none());
+        assert_eq!(
+            cfg.matches("nothing relevant", 200),
+            Some(false),
+            "aucun hit sur les deux regex ⇒ veto"
+        );
+    }
+
+    #[test]
+    fn regex_veto_on_hit_vetoes() {
+        let cfg = regex_cfg(&[], &["maintenance|waf"], &[]);
+        assert_eq!(
+            cfg.matches("under maintenance", 200),
+            Some(false),
+            "veto regex hit ⇒ Some(false)"
+        );
+        assert!(
+            cfg.matches("all good", 200).is_none(),
+            "pas de hit veto ⇒ abstension"
+        );
+    }
+
+    #[test]
+    fn status_veto_codes_veto_on_equal() {
+        let cfg = regex_cfg(&[], &[], &[503, 429]);
+        assert_eq!(cfg.matches("ok", 503), Some(false));
+        assert_eq!(cfg.matches("ok", 429), Some(false));
+        assert!(cfg.matches("ok", 200).is_none());
+    }
+
+    #[test]
+    fn veto_wins_over_match_on_combined() {
+        // Ordre veto-first : une réponse satisfaisant `--match` mais
+        // relevant d'un veto explicite reste vetée (pas d'absurde abstain).
+        let cfg_status = MatcherConfig {
+            string: Some("welcome".to_owned()),
+            veto_codes: vec![410],
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg_status.matches("welcome", 410),
+            Some(false),
+            "veto status : prioritaire sur --match"
+        );
+        let cfg_body = MatcherConfig {
+            not_string: Some("fatal".to_owned()),
+            string: Some("welcome".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(cfg_body.matches("welcome fatal", 200), Some(false));
+        assert!(cfg_body.matches("welcome ok", 200).is_none());
+    }
+
+    #[test]
+    fn is_active_with_expression_fields() {
+        assert!(regex_cfg(&["a"], &[], &[]).is_active());
+        assert!(regex_cfg(&[], &["b"], &[]).is_active());
+        assert!(regex_cfg(&[], &[], &[200]).is_active());
+        assert!(!regex_cfg(&[], &[], &[]).is_active());
+    }
+
+    #[test]
+    fn evidence_suffix_lists_c17_expressions() {
+        let cfg = regex_cfg(&["a.*b", "cde"], &["veto"], &[410]);
+        let suffix = cfg.evidence_suffix();
+        assert!(suffix.contains("re-match:a.*b|cde"), "{suffix}");
+        assert!(suffix.contains("re-veto:veto"), "{suffix}");
+        assert!(suffix.contains("status-veto:410"), "{suffix}");
     }
 }
