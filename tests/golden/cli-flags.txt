@@ -45,6 +45,7 @@ scan
 --discover-params
 --dry-run
 --dump
+--enum
 --enumerate
 --explain
 --export-encrypted
@@ -96,6 +97,7 @@ scan
 --request-budget
 --retries
 --safe-chars
+--scope
 --second-order
 --second-order-max-stores
 --second-order-revisit-url
