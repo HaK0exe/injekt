@@ -21,6 +21,56 @@ pub enum EnumGate {
     Strict(bool),
 }
 
+/// C17 — legacy enumeration flags present in `EnumOpts` (bools `true`,
+/// `--db/--table/--column` set) → single deprecation line with the
+/// "equivalent command" mapping (`--dbs → --enum dbs`, the triple →
+/// `--scope`). No values echoed (DB/table/column names carry no token but
+/// the line stays flag-only, stable hashing-free). Empty string if none.
+fn legacy_enum_flags(opts: &crate::cli::args::enumeration::EnumOpts) -> String {
+    use crate::cli::args::enumeration::legacy_item_flag;
+    let mut pairs: Vec<String> = Vec::new();
+    for (flag, present) in [
+        ("--dbs", opts.dbs),
+        ("--tables", opts.tables),
+        ("--columns", opts.columns),
+        ("--dump", opts.dump),
+        ("--banner", opts.banner),
+        ("--current-user", opts.current_user),
+        ("--current-db", opts.current_db),
+        ("--hostname", opts.hostname),
+    ] {
+        if present {
+            match flag.strip_prefix("--").and_then(legacy_item_flag) {
+                Some(item) => pairs.push(format!("{flag} -> --enum {item}")),
+                // unreachable with the inline table above (guard for future flags)
+                None => pairs.push(flag.to_string()),
+            }
+        }
+    }
+    if opts.db.is_some() || opts.table.is_some() || opts.column.is_some() {
+        pairs.push("--db/--table/--column -> --scope".to_string());
+    }
+    pairs.join(", ")
+}
+
+/// C17 — legacy matcher flags (`--string`/`--not-string`/`--code`)
+/// present in `DetectionOpts` → single deprecation line + equivalent
+/// pairs. Flag-only (no value echo: `--match`/`--veto` EXPR contents are
+/// operator-supplied words and must never surface in a warning line).
+fn legacy_matcher_flags(opts: &crate::cli::args::DetectionOpts) -> String {
+    let mut pairs: Vec<&'static str> = Vec::new();
+    if opts.string.is_some() {
+        pairs.push("--string -> --match body=<string>");
+    }
+    if opts.not_string.is_some() {
+        pairs.push("--not-string -> --veto body=<string>");
+    }
+    if opts.code.is_some() {
+        pairs.push("--code <N> -> --match status==<N>");
+    }
+    pairs.join(", ")
+}
+
 /// Build engine config from CLI detection/enumeration options.
 /// Resolution honours `--profile` / config file / `INJEKT_*` via `Cli::effective_*`:
 /// explicit flags always win, presets only fill gaps (non-breaking).
@@ -39,20 +89,49 @@ pub fn build_engine_config(cli: &Cli, enum_gate: EnumGate) -> EngineConfig {
         EnumGate::Passthrough => (true, false),
         EnumGate::Strict(e) => (e, true),
     };
+    // C17 — warning deprecated legacy flags BEFORE the mapping (only flags
+    // explicitly given should appear here: `--enum`/`--scope` items will be
+    // applied afterwards, an item never silences a legacy warning).
+    let legacy = legacy_enum_flags(&cli.enumeration);
+    if !legacy.is_empty() {
+        tracing::warn!("legacy enumeration flags deprecated (2 releases left): {legacy}");
+    }
+    let legacy_matcher = legacy_matcher_flags(&cli.detection);
+    if !legacy_matcher.is_empty() {
+        tracing::warn!("legacy matcher flags deprecated (2 releases left): {legacy_matcher}");
+    }
+    // C17 — `--export-encrypted` deprecated: the post-run inline export
+    // stays functional; passphrase rotation now has a dedicated offline
+    // entry point (one-line nudge, no value echo — OPSEC).
+    if cli.output_opts.export_encrypted.is_some() {
+        tracing::warn!(
+            "legacy `--export-encrypted` flag deprecated (2 releases left): \
+             the post-run export is unchanged; passphrase rotation via \
+             `injekt session export <PATH> --import <FILE>`"
+        );
+    }
+    // C17 — `--enum <items>` / `--scope <db[.table[.column]]>` applied to
+    // the historical fields (UNION, never a downgrade): the same internal
+    // `EnumConfig`, MCP shapes (direct write of bools) untouched.
+    let mut enum_local = cli.enumeration.clone();
+    crate::cli::args::enumeration::apply_enum_items(&mut enum_local, &cli.enumeration.enum_items);
+    crate::cli::args::enumeration::apply_scope(&mut enum_local, &cli.enumeration.scope);
     if strict
         && !enumerate
-        && (cli.enumeration.dbs
-            || cli.enumeration.tables
-            || cli.enumeration.columns
-            || cli.enumeration.dump
-            || cli.enumeration.banner
-            || cli.enumeration.current_user
-            || cli.enumeration.current_db
-            || cli.enumeration.hostname
-            || cli.enumeration.count)
+        && (enum_local.dbs
+            || enum_local.tables
+            || enum_local.columns
+            || enum_local.dump
+            || enum_local.banner
+            || enum_local.current_user
+            || enum_local.current_db
+            || enum_local.hostname
+            || enum_local.count
+            || !enum_local.enum_items.is_empty()
+            || enum_local.scope.is_some())
     {
         tracing::warn!(
-            "identity/enumeration flags (--banner/--current-user/--current-db/--hostname/--dbs/--tables/--columns/--dump/--count) require --auto-enumerate for recon scan; ignoring them"
+            "identity/enumeration flags (--banner/--current-user/--current-db/--hostname/--dbs/--tables/--columns/--dump/--count, now --enum/--scope) require --auto-enumerate for recon scan; ignoring them"
         );
     }
     // C13 : lecture au boot uniquement sur opt-in explicite. OFF (`None`) =
@@ -93,21 +172,21 @@ pub fn build_engine_config(cli: &Cli, enum_gate: EnumGate) -> EngineConfig {
             oob_wait_secs: cli.effective_oob_wait_secs_with(&snap),
         },
         enumeration: crate::engine::orchestrator::EnumConfig {
-            extract: cli.enumeration.extract,
-            dbs: enumerate && cli.enumeration.dbs,
-            tables: enumerate && cli.enumeration.tables,
-            columns: enumerate && cli.enumeration.columns,
-            dump: enumerate && cli.enumeration.dump,
-            banner: enumerate && cli.enumeration.banner,
-            current_user: enumerate && cli.enumeration.current_user,
-            current_db: enumerate && cli.enumeration.current_db,
-            hostname: enumerate && cli.enumeration.hostname,
-            db: cli.enumeration.db.clone(),
-            table: cli.enumeration.table.clone(),
-            column: cli.enumeration.column.clone(),
-            start: cli.enumeration.start,
-            stop: cli.enumeration.stop,
-            count: enumerate && cli.enumeration.count,
+            extract: enum_local.extract,
+            dbs: enumerate && enum_local.dbs,
+            tables: enumerate && enum_local.tables,
+            columns: enumerate && enum_local.columns,
+            dump: enumerate && enum_local.dump,
+            banner: enumerate && enum_local.banner,
+            current_user: enumerate && enum_local.current_user,
+            current_db: enumerate && enum_local.current_db,
+            hostname: enumerate && enum_local.hostname,
+            db: enum_local.db.clone(),
+            table: enum_local.table.clone(),
+            column: enum_local.column.clone(),
+            start: enum_local.start,
+            stop: enum_local.stop,
+            count: enumerate && enum_local.count,
         },
         techniques: if !cli.detection.techniques.is_empty() {
             cli.detection.techniques.clone()
@@ -169,5 +248,242 @@ pub fn build_engine_config(cli: &Cli, enum_gate: EnumGate) -> EngineConfig {
         // patch de suggestion `INCONCLUSIVE`. `Zeroizing` = zéro persistance
         // (remis à zéro au drop, Debug masqué).
         argv: zeroize::Zeroizing::new(cli.captured_argv.clone()),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{EnumGate, build_engine_config, legacy_enum_flags, legacy_matcher_flags};
+    use crate::cli::args::{Cli, EnumOpts};
+
+    /// Fixture minimale : les 3 paramètres couvrent les 3 familles legacy
+    /// (bool data, bool identité, triple scope).
+    fn opts(dbs: bool, current_user: bool, db: Option<&str>) -> EnumOpts {
+        EnumOpts {
+            extract: false,
+            enum_items: Vec::new(),
+            scope: None,
+            dbs,
+            tables: false,
+            columns: false,
+            dump: false,
+            banner: false,
+            current_user,
+            current_db: false,
+            hostname: false,
+            db: db.map(str::to_string),
+            table: None,
+            column: None,
+            start: None,
+            stop: None,
+            count: false,
+        }
+    }
+
+    #[test]
+    fn no_legacy_flag_gives_empty_mapping() {
+        assert_eq!(legacy_enum_flags(&opts(false, false, None)), "");
+    }
+
+    #[test]
+    fn legacy_pairs_follow_declared_order() {
+        assert_eq!(
+            legacy_enum_flags(&opts(true, true, Some("shop"))),
+            "--dbs -> --enum dbs, --current-user -> --enum user, \
+             --db/--table/--column -> --scope"
+        );
+    }
+
+    #[test]
+    fn new_shapes_alone_do_not_warn_legacy() {
+        let mut o = opts(false, false, None);
+        o.enum_items = vec!["dbs".to_string()];
+        o.scope = Some("shop.users".to_string());
+        assert_eq!(legacy_enum_flags(&o), "");
+    }
+
+    #[test]
+    fn enum_items_and_scope_map_onto_enum_config() {
+        use clap::Parser as _;
+        let cli = Cli::parse_from([
+            "injekt",
+            "http://t/?id=1",
+            "--enum",
+            "dbs,user",
+            "--scope",
+            "shop.users.password",
+        ]);
+        let cfg = build_engine_config(&cli, EnumGate::Passthrough);
+        assert!(cfg.enumeration.dbs, "item dbs -> field dbs");
+        assert!(
+            cfg.enumeration.current_user,
+            "item user -> field current_user"
+        );
+        assert!(!cfg.enumeration.tables, "item absent -> field untouched");
+        assert_eq!(cfg.enumeration.db.as_deref(), Some("shop"));
+        assert_eq!(cfg.enumeration.table.as_deref(), Some("users"));
+        assert_eq!(cfg.enumeration.column.as_deref(), Some("password"));
+    }
+
+    #[test]
+    fn legacy_flags_and_items_union_never_downgrade() {
+        use clap::Parser as _;
+        let cli = Cli::parse_from([
+            "injekt",
+            "http://t/?id=1",
+            "--tables",
+            "--enum",
+            "dbs",
+            "--scope",
+            "db1",
+        ]);
+        let cfg = build_engine_config(&cli, EnumGate::Passthrough);
+        assert!(cfg.enumeration.dbs, "item --enum dbs");
+        assert!(
+            cfg.enumeration.tables,
+            "legacy --tables: union, never downgrade"
+        );
+        assert_eq!(
+            cfg.enumeration.db.as_deref(),
+            Some("db1"),
+            "--scope db only"
+        );
+    }
+
+    #[test]
+    fn strict_gate_gates_bools_but_preserves_scope_values() {
+        use clap::Parser as _;
+        let cli = Cli::parse_from([
+            "injekt",
+            "http://t/?id=1",
+            "--enum",
+            "dbs",
+            "--scope",
+            "shop",
+        ]);
+        let cfg = build_engine_config(&cli, EnumGate::Strict(false));
+        assert!(
+            !cfg.enumeration.dbs,
+            "recon sans --auto-enumerate : bools gated"
+        );
+        // Parité historique : les valeurs de scope (comme --db avant) restent
+        // injectées pour l'usage ultérieur, seuls les bools sont gated.
+        assert_eq!(cfg.enumeration.db.as_deref(), Some("shop"));
+    }
+
+    #[test]
+    fn no_legacy_matcher_flag_gives_empty_mapping() {
+        assert_eq!(legacy_matcher_flags(&fixture_detection()), "");
+    }
+
+    #[test]
+    fn legacy_matcher_pairs_follow_declared_order() {
+        let mut d = fixture_detection();
+        d.string = Some("welcome".to_owned());
+        d.not_string = Some("fatal".to_owned());
+        d.code = Some(200);
+        assert_eq!(
+            legacy_matcher_flags(&d),
+            "--string -> --match body=<string>, \
+             --not-string -> --veto body=<string>, \
+             --code <N> -> --match status==<N>"
+        );
+    }
+
+    /// Fixture alignée sur `resolve::tests::blank_cli()` (champs détection).
+    fn fixture_detection() -> crate::cli::args::DetectionOpts {
+        crate::cli::args::DetectionOpts {
+            threads: None,
+            level: None,
+            techniques: Vec::new(),
+            tamper: Vec::new(),
+            params: Vec::new(),
+            data: None,
+            fetch_using: None,
+            dbms: None,
+            marker: None,
+            string: None,
+            not_string: None,
+            code: None,
+            match_expr: Vec::new(),
+            veto_expr: Vec::new(),
+            text_only: false,
+            max_duration: None,
+            request_budget: None,
+            confirm: false,
+            seed: None,
+            ignore_codes: Vec::new(),
+            oob_domain: None,
+            oob_poll_url: None,
+            oob_wait_secs: None,
+            ai_suggest: false,
+            ai_provider: None,
+            ai_endpoint: None,
+            ai_model: None,
+            ai_api_key: None,
+            ai_max_suggestions: 3,
+            ai_timeout: 30,
+            generative: None,
+            max_generated: 4,
+        }
+    }
+
+    #[test]
+    fn match_exprs_map_onto_matcher_config() {
+        use clap::Parser as _;
+        let cli = Cli::parse_from([
+            "injekt",
+            "http://t/?id=1",
+            "--match",
+            "status==404",
+            "--match",
+            "body=welcome",
+            "--veto",
+            "body=fatal",
+            "--veto",
+            "body~waf",
+            "--veto",
+            "status==503",
+            "--match",
+            "body~wel.*come",
+        ]);
+        let cfg = build_engine_config(&cli, EnumGate::Passthrough);
+        assert_eq!(cfg.matcher.code, Some(404), "--match status==");
+        assert_eq!(cfg.matcher.veto_codes, vec![503], "--veto status==");
+        assert_eq!(
+            cfg.matcher.string.as_deref(),
+            Some("welcome"),
+            "--match body="
+        );
+        assert_eq!(
+            cfg.matcher.not_string.as_deref(),
+            Some("fatal"),
+            "--veto body="
+        );
+        assert_eq!(cfg.matcher.match_regex_src, vec!["wel.*come".to_owned()]);
+        assert_eq!(cfg.matcher.veto_regex_src, vec!["waf".to_owned()]);
+        assert!(!cfg.matcher.veto_regex.is_empty());
+        // Un corps satisfaisant --match (body= OU body~) et le status
+        // 404 requis ne veto pas (abstention, moteur décide).
+        assert!(
+            cfg.matcher.matches("a welcome page", 404).is_none(),
+            "matcher satisfait ⇒ abstention"
+        );
+    }
+
+    #[test]
+    fn veto_status_ne_maps_to_code_semantics() {
+        use clap::Parser as _;
+        // `--veto status!=200` ≡ legacy `--code 200` (le status doit être égal).
+        let cli = Cli::parse_from(["injekt", "http://t/?id=1", "--veto", "status!=200"]);
+        let cfg = build_engine_config(&cli, EnumGate::Passthrough);
+        assert_eq!(cfg.matcher.code, Some(200));
+        assert_eq!(legacy_matcher_flags(&cli.detection), "");
+        let cli_code = Cli::parse_from(["injekt", "http://t/?id=1", "--code", "200"]);
+        assert_eq!(
+            legacy_matcher_flags(&cli_code.detection),
+            "--code <N> -> --match status==<N>"
+        );
     }
 }

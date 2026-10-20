@@ -101,6 +101,7 @@ La cible admet quatre sources (précidence) : `--raw-file` > positional `injekt 
 |------|-------------|---------|
 | `-u, --target <URL>` | Target URL (e.g. `https://example.com/?id=1`) | — |
 | `-m, --bulk-file <PATH>` | Bulk scan: one target per line (`#` comments skipped, max 1000) | — |
+| `--input <PATH\|-|DIR>` | C17 — unified ingestion (sniff: `-` stdin, dir → raw-dir, `.json/.yaml/.yml` `openapi` key → openapi, `.xml` `<urlset>` → sitemap, else TXT list). Additive, dedup; legacy modes still functional 2 releases | — |
 | `--method <METHOD>` | HTTP method | `GET` |
 | `--headers <H1,H2>` | Extra headers (comma-separated `Name: value`) | — |
 | `--cookies <STR>` | Cookie header (stored as `SecretString`, redacted in logs) | — |
@@ -117,9 +118,11 @@ La cible admet quatre sources (précidence) : `--raw-file` > positional `injekt 
 | `--safe-chars <STR>` | Extra chars exempted from percent-encoding (e.g. `"(),"`) | — |
 | `--skip-urlencode` | Send payloads without URL-encoding (use with care) | `false` |
 | `--fetch-using <MODE>` | Force fetch oracle: `direct`, `boolean` or `time` (narrows default technique set) | `direct` |
-| `--string <STR>` | Response body **must contain** this substring, otherwise veto finding | — |
-| `--not-string <STR>` | Response body **must NOT contain** this substring, otherwise veto finding | — |
-| `--code <N>` | Response status **must equal** this code, otherwise veto finding | — |
+| `--string <STR>` | *(deprecated, voir `--match body=…`)* Response body **must contain** this substring, otherwise veto finding | — |
+| `--not-string <STR>` | *(deprecated, voir `--veto body=…`)* Response body **must NOT contain** this substring, otherwise veto finding | — |
+| `--code <N>` | *(deprecated, voir `--match status==N`)* Response status **must equal** this code, otherwise veto finding | — |
+| `--match <EXPR>` | C17 — response matcher, repeatable (OR): `status==N`, `body=CONTENU` (contains literal), `body~RE` (regex). Invalid expr = usage exit 2. Disjunction: one hit registers the valid page | — |
+| `--veto <EXPR>` | C17 — repeatable veto: `status==N` (veto when equal), `status!=N` (must equal), `body=CONTENU`, `body~RE`. Veto-first priority over `--match` | — |
 | `--text-only` | Strip HTML tags/entities before matching and detection | `false` |
 | `--level <1-5>` | Aggressiveness: L1 = historical payload budget, L2 doubles it, L3+ tries every payload and widens ORDER BY enumeration | `1` |
 | `--max-duration <SECS>` | Global detection time budget (**OPT-IN**): detection stops cooperatively once the shared detection clock exceeds `SECS` (running technique finishes early, clean `Done`, no error, no new finding; the union starvation guard is skipped once spent). `None` = unlimited (default, historical behaviour) | — |
@@ -150,8 +153,8 @@ La cible admet quatre sources (précidence) : `--raw-file` > positional `injekt 
 | `--rate-limit <RPS>` | Token-bucket requests/second | `10` (always enforced; there is no "unlimited" mode via CLI) |
 | `--jitter <MEAN,STD>` | **Milliseconds**, e.g. `"750,250"` (750±250ms, floor 200ms) | `750,250` (human jitter is **on by default**, even without the flag) |
 | `--marker <STR>` | Injection marker: `*`, `§`, `{{}}` | auto-detect |
-| `--export-encrypted <PATH>` | Encrypted snapshot (XChaCha20-Poly1305 + Argon2id, **OPT-IN**) | — |
-| `--import <PATH>` | Legacy flag: rejected by `scan` (use `replay --file` to inspect an export, `recon import --file` for candidates) | — |
+| `--export-encrypted <PATH>` | Encrypted snapshot (XChaCha20-Poly1305 + Argon2id, **OPT-IN**) — **déprécié** (2 releases) : le flag reste fonctionnel post-run, la rotation de passphrase passe par `injekt session export` | — |
+| `--import <PATH>` | Legacy flag: rejected by `scan` (use `session replay <FILE>` to inspect an export, `recon import --file` for candidates — sert aussi de source au re-key `session export`) | — |
 | `--no-redact` | **Disable scrubbing (local debugging only!)** | `false` |
 | `--allow-private` | Allow loopback/private IPs (anti-SSRF bypass, lab only) | `false` |
 | `--max-redirects <N>` | Max redirects followed per request (`0` = do not follow; every hop re-validated, secrets stripped cross-origin) | `5` |
@@ -195,7 +198,7 @@ injekt --target "http://192.168.1.10/?id=1" --allow-private
 
 # Encrypted session export (OPT-IN) + inspection
 injekt --target "https://example.com/?id=1" --export-encrypted ./session.enc
-INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc  # decrypt + summary
+INJEKT_PASSPHRASE='...' injekt session replay ./session.enc  # decrypt + summary
 
 # Output JSON report
 injekt --target "https://example.com/?id=1" --output report.json
@@ -245,14 +248,16 @@ they stay available to single-payload techniques as explicit opt-in).
 **Enumeration/Extraction Flags** (require `--extract` or `--auto-enumerate` in recon):
 | Flag | Description |
 |------|-------------|
-| `--dbs` | Enumerate databases |
-| `--tables` | Enumerate tables (with `--db`) |
-| `--columns` | Enumerate columns (with `--db`, `--table`) |
-| `--dump` | Dump table data (with `--db`, `--table`, `--column`) |
-| `--banner` | Retrieve DBMS version |
-| `--current-user` | Retrieve current DB user |
-| `--current-db` | Retrieve current database name |
-| `--hostname` | Retrieve server hostname |
+| `--enum <ITEMS>` | C17 — compact enumeration, comma-separated: `dbs,tables,columns,dump,banner,user,db,hostname` (replaces the 8 legacy flag forms — deprecated but still functional 2 releases) |
+| `--scope <DB[.TABLE[.COLUMN]]>` | C17 — replaces the `--db/--table/--column` triple (same legacy window); a database name containing a literal `.` must use the legacy triple |
+| `--dbs` | *(deprecated, voir `--enum`)* Enumerate databases |
+| `--tables` | *(deprecated, voir `--scope`)* Enumerate tables (with `--db`) |
+| `--columns` | *(deprecated, voir `--scope`)* Enumerate columns (with `--db`, `--table`) |
+| `--dump` | *(deprecated, voir `--scope`)* Dump table data (with `--db`, `--table`, `--column`) |
+| `--banner` | *(deprecated, voir `--enum banner`)* Retrieve DBMS version |
+| `--current-user` | *(deprecated, voir `--enum user`)* Retrieve current DB user |
+| `--current-db` | *(deprecated, voir `--enum db`)* Retrieve current database name |
+| `--hostname` | *(deprecated, voir `--enum hostname`)* Retrieve server hostname |
 | `--db <NAME>` | Specific database |
 | `--table <NAME>` | Specific table |
 | `--column <NAME>` | Specific column |
@@ -266,8 +271,8 @@ they stay available to single-payload techniques as explicit opt-in).
 injekt recon crawl --target "example.com" --depth 2 --max-pages 100
 
 # Crawl + scan discovered parameters (`recon scan` = alias ; voie recommandée : `auto --with-recon`)
-injekt recon scan --target "example.com" --auto-enumerate --dbs
-injekt auto --target "example.com" --with-recon --auto-enumerate --dbs
+injekt recon scan --target "example.com" --auto-enumerate --enum dbs
+injekt auto --target "example.com" --with-recon --auto-enumerate --enum dbs
 
 # Import previously discovered candidates
 injekt recon import --file discovered.json --test
@@ -297,11 +302,18 @@ injekt recon import --file discovered.json --test --enumerate
 | `--test` | Actively scan imported candidates (requires network) |
 | `--enumerate` | Enable enumeration on confirmed findings |
 
-#### `replay` — Encrypted Session Inspection
+#### `session` — Export Namespace (C17)
 ```bash
-INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
+INJEKT_PASSPHRASE='...' injekt session replay ./session.enc
+# Rotation de passphrase (re-key : déchiffre puis rechiffre tel quel,
+# sel/nonce argon2id neufs, 0o600, --force pour remplacer) :
+injekt session export ./session-v2.enc --import ./session.enc
 ```
-Decrypts an `--export-encrypted` snapshot (`INJEKT_PASSPHRASE` or TTY prompt) and prints a scrubbed summary (findings, request count). Inspection only — re-run `injekt --target <url>` (ou `auto --target <url>`) to resume testing.
+`session replay <FILE>` decrypts an `--export-encrypted` snapshot (`INJEKT_PASSPHRASE` ou prompt TTY) and prints a scrubbed summary (findings, request count). Inspection only — re-run `injekt --target <url>` (ou `auto --target <url>`) to resume testing.
+
+`session export <PATH> --import <FILE>` re-keys an existing export into a fresh envelope (byte-for-byte passthrough du snapshot chiffré, salt/nonce OS-aléatoires neufs ; les blobs v1/v2 sont mis à niveau au passage). La passphrase source PUIS la destination proviennent de `INJEKT_PASSPHRASE` (identiques si env) ou du prompt TTY (deux lectures distinctes) ; l'écriture est auto-vérifiée par un déchiffrement immédiat (fichier supprimé si échec). Offline, 0 socket.
+
+L'alias top-level `injekt replay --file <FILE>` reste fonctionnel mais est **caché et déprécié** (2 releases) : un warning nomme l'équivalent à chaque invocation.
 
 #### `info` — Capability Information
 ```bash
@@ -326,7 +338,7 @@ Checks the local config, never the target, never the network (0 socket, 0 reques
 1. `config` — `--config` / `./injekt.toml` / `~/.config/injekt/config.toml`, parse TOML, résumé (preset effectif + threads) ; TOML cassé ⇒ `✗` avec la ligne/colonne du crate `toml` ;
 2. `proxy` — schéma seulement (`ProxyConfig::parse`) : `socks5://` ⇒ `✗` message DNS-leak exact (`socks5h://` requis),userinfo redirigé ; aucune connexion n'est tentée ;
 3. `cadence` — `1000/rate_limit ≥ jitter_mean − 2σ` : plus rapide que le jitter ⇒ `!` « pattern détectable » + correction chiffrée (`--rate-limit ≤ ...`) ; neutre si rien d'explicite ;
-4. `ingestion` — stat lexical des 5 sources (`--bulk-file/--raw-file/--raw-dir/--openapi-file/--sitemap-file`) : absent/illisible ⇒ `✗`.
+4. `ingestion` — stat lexical des 6 sources (`--bulk-file/--raw-file/--raw-dir/--openapi-file/--sitemap-file/--input`) : absent/illisible ⇒ `✗`.
 
 Sortie `✓ / ! / ✗` une ligne par check (scrubbée, `--no-redact` respecté) — exit `0` sans `✗`, `1` avec.
 
@@ -477,7 +489,7 @@ The `Scrubber` (`src/session/scrubber/`) processes all output:
 injekt --target "https://example.com/?id=1" --export-encrypted ./session.enc
 
 # Inspect (decrypt + scrubbed summary; not a full scan resume)
-INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
+INJEKT_PASSPHRASE='...' injekt session replay ./session.enc
 ```
 - Format: XChaCha20-Poly1305 + Argon2id (v2)
 - File permissions: 0o600 on Unix
@@ -492,7 +504,7 @@ INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
 ```
 src/
 ├── main.rs / lib.rs                 # Entry points, public API + InjektError
-├── cli/                             # args/ + commands/ (scan, recon, replay, info, auto) + output/
+├── cli/                             # args/ + commands/ (scan, recon, replay, session, info, auto) + output/
 │   ├── plan.rs + plan/              # Planner split: model/render/escalation
 │   ├── resolve.rs + resolve/        # CLI resolution split: snapshot/effective/…
 │   └── client_builder.rs file_config.rs profile.rs knowledge.rs styles.rs engine_cfg.rs
@@ -667,8 +679,8 @@ injekt -u "https://target.onion/?id=1" \
 injekt recon crawl --target "https://example.com" --depth 3 --max-pages 200 --output discovered.json
 
 # 2. Scan discovered parameters (`recon scan` = alias → préférer `auto --with-recon`)
-injekt recon scan --target "https://example.com" --auto-enumerate --dbs --output scan-report.json
-injekt auto --target "https://example.com" --with-recon --auto-enumerate --dbs --output scan-report.json
+injekt recon scan --target "https://example.com" --auto-enumerate --enum dbs --output scan-report.json
+injekt auto --target "https://example.com" --with-recon --auto-enumerate --enum dbs --output scan-report.json
 
 # 3. Import and test offline candidates
 injekt recon import --file discovered.json --test --enumerate --output final-report.json
@@ -718,7 +730,7 @@ injekt -u "https://example.com/?id=1" \
 injekt -u "https://example.com/?id=1" --export-encrypted session.enc
 
 # Inspect later (decrypt + scrubbed summary; not a full scan resume)
-INJEKT_PASSPHRASE='...' injekt replay --file session.enc
+INJEKT_PASSPHRASE='...' injekt session replay session.enc
 ```
 
 ### Terminal UI/UX
@@ -828,7 +840,7 @@ auto-discovered files only warn. `injekt info` lists `profiles`.
 2. Global `-u/--target <URL>`.
 3. `scan --target <URL>` (subcommand-level, alias historique déprécié — masqué de `-h`).
 
-Bulk auto-détecté : `--bulk-file` / `--stdin` / `--openapi-file` / `--sitemap-file` / `--raw-dir` (aucune sous-commande bulk dédiée).
+Bulk auto-détecté : `--bulk-file` / `--stdin` / `--openapi-file` / `--sitemap-file` / `--raw-dir` (aucune sous-commande bulk dédiée). C17 : forme unifiée `--input <PATH|-|DIR>` (sniff sur les mêmes loaders).
 
 `--bulk-file` conflicts with `--target` / `--raw-file` (one mode at a time) and with
 `--export-encrypted` (use `--output` for the aggregated report). Format: one target per

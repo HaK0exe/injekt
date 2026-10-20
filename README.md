@@ -118,8 +118,8 @@ injekt recon crawl --target "example.com" --depth 2 --max-pages 100
 
 # Crawl, test each discovered parameter, then enumerate confirmed findings
 # (`recon scan` = alias ; voie recommandée : `auto --with-recon`)
-injekt recon scan --target "example.com" --auto-enumerate --dbs
-injekt auto --target "example.com" --with-recon --auto-enumerate --dbs
+injekt recon scan --target "example.com" --auto-enumerate --enum dbs
+injekt auto --target "example.com" --with-recon --auto-enumerate --enum dbs
 
 # Import previously discovered candidates
 injekt recon import --file discovered.json --test
@@ -136,12 +136,14 @@ injekt --target "https://example.com/?id=1" --tamper versionedcomment,charencode
 
 # Request-level tampers: HPP (?id=1&id=PAYLOAD) and chunked (streamed body)
 injekt --target "https://example.com/?id=1" --hpp --techniques boolean
-injekt auto --target "example.com" --with-recon --hpp --chunked --auto-enumerate --dbs
+injekt auto --target "example.com" --with-recon --hpp --chunked --auto-enumerate --enum dbs
 # (ancien: `recon scan --target "example.com" --hpp --chunked --auto-enumerate --dbs` — alias conservé)
 
 # Bulk auto-détecté : --bulk-file / --stdin / --openapi-file / --sitemap-file / --raw-dir
 # (aucun sous-mode bulk à nommer — `auto` et la cible globale détectent l'ingestion massive seuls)
+# (C17 : forme unifiée --input <PATH|-|DIR> — sniff auto TXT/OpenAPI/sitemap/dir/stdin)
 injekt --bulk-file targets.txt --output bulk-report.json --threads 3
+injekt --input targets.txt --output bulk-report.json --threads 3
 
 # OPSEC: Tor + jitter + rate limit + no private IP bypass
 injekt --target "https://example.com/?id=1" \
@@ -154,7 +156,9 @@ injekt --target "http://192.168.1.10/?id=1" --allow-private
 # Encrypted session export (OPT-IN) — creates sensitive artefact
 injekt --target "https://example.com/?id=1" --export-encrypted ./session.enc
 # Inspect an export (decrypt + scrubbed summary, not a full scan resume):
-INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
+INJEKT_PASSPHRASE='...' injekt session replay ./session.enc
+# Passphrase rotation (re-key an existing export, same inspect loop):
+injekt session export ./session-v2.enc --import ./session.enc
 injekt info
 
 # MCP Server (for AI assistants)
@@ -221,13 +225,16 @@ injekt [OPTIONS] [COMMAND]
 Commands:
   scan    Run detection (default when --target is given)
   recon   Crawl targets, discover parameters, scan candidates, import candidate JSON
-  replay  Replay encrypted session
+  replay  Replay encrypted session (deprecated hidden alias — use `session replay`)
+  session export <PATH> --import <FILE>  Re-key an encrypted export (C17, passphrase rotation)
+  session replay <FILE>  Replay encrypted session (C17)
   info    Show version / techniques / DBMS
   mcp     MCP server over stdio (Claude Code, Codex, OpenCode, Cursor, VS Code)
 
 Options:
   -u, --target <URL>              Target URL (--raw-file takes priority if both given)
   -m, --bulk-file <PATH>          Bulk scan: one target/line, `#` comments skipped, max 1000
+      --input <PATH|-|DIR>        Unified ingestion (C17, sniff: stdin/dir/OpenAPI/sitemap/TXT); legacy modes still functional 2 releases
                                   (conflicts with --target/--raw-file/--export-encrypted)
       --profile <NAME>            Preset: quick|balanced|stealth|aggressive (explicit flags win)
       --config <PATH>             TOML config file (default: ./injekt.toml, ~/.config/injekt/config.toml)
@@ -253,7 +260,10 @@ Options:
       --safe-chars <STR>          Extra chars exempted from percent-encoding
       --skip-urlencode            Send payloads without URL-encoding (use with care)
       --string/--not-string <STR> Response must (not) contain substring, else veto finding
-      --code <N>                  Response status must equal N, else veto finding
+                                  (deprecated C17: ⚠ see --match/--veto)
+      --match <EXPR>              C17 matchers, repeatable (OR): status==N, body=CONTENU, body~RE
+      --veto <EXPR>               C17 vetoes, repeatable: status==N, status!=N, body=CONTENU, body~RE
+      --code <N>                  Response status must equal N, else veto finding (deprecated: --match status==N)
       --text-only                 Strip HTML tags/entities before matching
       --level <1-5>               Aggressiveness [default: 1]
       --seed <N>                  Deterministic RNG seed (recorded in report)
@@ -264,9 +274,10 @@ Options:
       --oob-wait-secs <N>         Wait before polling collaborator [default: 5]
       --dbms <KIND>               mysql|postgres|mssql|oracle (default: auto-fingerprint)
       --extract                   Enable data extraction (opt-in, SecretString)
-      --dbs/--tables/--columns/--dump  Enumeration (needs --extract or recon --auto-enumerate)
-  -b, --banner, --current-user, --current-db, --hostname  Identity enumeration
-      --db/--table/--column <NAME>  Enumeration scope; --start/--stop/--count for dumps
+      --enum <ITEMS>              Compact enumeration (C17, comma-separated): dbs,tables,columns,dump,banner,user,db,hostname
+      --scope <DB[.TABLE[.COL]]>  Enumeration scope (C17); --start/--stop/--count for dumps
+      --dbs/--tables/--columns/--dump, -b/--banner/--current-user/--current-db/--hostname, --db/--table/--column <NAME>
+                                  (legacy flags, deprecated 2 releases — equivalent mapping shown as warning)
       --marker <STR>              Injection marker (*, §, {{}})
       --output <PATH>             JSON report path (0o600 on Unix)
       --export-encrypted <PATH>   Encrypted snapshot (XChaCha20-Poly1305/Argon2id)
@@ -290,7 +301,7 @@ injekt recon import --file discovered.json [--test] [--enumerate]
 > Voies recommandées : cible unique → `injekt --target <URL>` (ou `injekt auto --target <URL>`) ;
 > `scan --target` n'est qu'un alias historique déprécié (masqué de `-h`, visible dans `--help`).
 > Bulk auto-détecté : `--bulk-file` / `--stdin` / `--openapi-file` / `--sitemap-file` / `--raw-dir`
-> (pas de sous-commande bulk dédiée).
+> (pas de sous-commande bulk dédiée). C17 : forme unifiée `--input <PATH|-|DIR>` (sniff).
 
 ### Presets & config (non-breaking)
 

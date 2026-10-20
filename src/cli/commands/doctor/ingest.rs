@@ -39,9 +39,13 @@ pub struct SourceItem {
 /// ingestion déclarées, dans l'ordre de `TargetOpts`.
 #[must_use]
 pub fn collect_ingestion_sources(cli: &Cli) -> Vec<SourceItem> {
-    let specs: [(&str, &Option<String>, bool); 5] = [
+    let specs: [(&str, &Option<String>, bool); 6] = [
         ("bulk-file", &cli.target_opts.bulk_file, false),
         ("raw-file", &cli.target_opts.raw_file, false),
+        // C17 — source unifiée : le sniff accepte fichier OU dossier ;
+        // `expects_dir` est recalé sur l'état réel (aucun Warn de type
+        // inversé possible pour `--input`).
+        ("input", &cli.target_opts.input, false),
         ("raw-dir", &cli.target_opts.raw_dir, true),
         ("openapi-file", &cli.target_opts.openapi_file, false),
         ("sitemap-file", &cli.target_opts.sitemap_file, false),
@@ -49,7 +53,7 @@ pub fn collect_ingestion_sources(cli: &Cli) -> Vec<SourceItem> {
     let mut out = Vec::new();
     for (flag, value, expects_dir) in specs {
         let Some(raw) = value else { continue };
-        let state = if flag == "bulk-file" && raw == "-" {
+        let state = if (flag == "bulk-file" || flag == "input") && raw == "-" {
             SourceState::Stdin
         } else {
             match std::fs::metadata(raw) {
@@ -58,6 +62,11 @@ pub fn collect_ingestion_sources(cli: &Cli) -> Vec<SourceItem> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => SourceState::Missing,
                 Err(e) => SourceState::Unreadable(e.to_string()),
             }
+        };
+        let expects_dir = if flag == "input" {
+            matches!(state, SourceState::Dir)
+        } else {
+            expects_dir
         };
         out.push(SourceItem {
             flag,
@@ -77,7 +86,7 @@ pub fn check_ingestion(items: &[SourceItem]) -> CheckResult {
     if items.is_empty() {
         return CheckResult::ok(
             "ingestion: aucune source (--bulk-file/--raw-file/--raw-dir/\
-             --openapi-file/--sitemap-file) — usage scan direct --target",
+             --openapi-file/--sitemap-file/--input) — usage scan direct --target",
         );
     }
     let mut hard = Vec::new();

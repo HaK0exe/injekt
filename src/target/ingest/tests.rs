@@ -71,3 +71,107 @@ fn limited_read_rejects_oversize_file() {
     assert!(err.to_string().contains("too large"), "{err}");
     std::fs::remove_file(&path).expect("cleanup temp file");
 }
+
+// ---------------------------------------------------------------------------
+// C17 migration 2 — `--input` auto-detection (frozen grammar)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn input_kind_stdin_marker() {
+    assert_eq!(sniff_input_kind("-", None), InputKind::Stdin);
+    // The `-` marker wins even with an explicit first-kib window.
+    assert_eq!(sniff_input_kind("-", Some("whatever")), InputKind::Stdin);
+}
+
+#[test]
+fn input_kind_directory_wins_over_extension() {
+    let dir = std::env::temp_dir().join(format!("injekt-input-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    // A directory named `*.xml` must still resolve as RawDir.
+    let xml_dir = std::env::temp_dir().join(format!("injekt-input-dir-{}.xml", std::process::id()));
+    std::fs::create_dir_all(&xml_dir).expect("create temp xml dir");
+    let a = sniff_input_kind(&dir.to_string_lossy(), None);
+    let b = sniff_input_kind(&xml_dir.to_string_lossy(), None);
+    std::fs::remove_dir(&dir).expect("cleanup");
+    std::fs::remove_dir(&xml_dir).expect("cleanup");
+    assert_eq!(a, InputKind::RawDir);
+    assert_eq!(b, InputKind::RawDir);
+}
+
+#[test]
+fn input_kind_openapi_by_marker_in_window() {
+    // json + clef `openapi` present in the first KiB.
+    assert_eq!(
+        sniff_input_kind(
+            "spec.json",
+            Some(r#"{"openapi":"3.0.1","info":{"title":"t"},"paths":{}}"#)
+        ),
+        InputKind::Openapi
+    );
+    // yaml/yml: prefix clef, openapi key within the window.
+    assert_eq!(
+        sniff_input_kind("spec.yaml", Some("openapi: 3.0.1\ninfo:\n  title: t\n")),
+        InputKind::Openapi
+    );
+    assert_eq!(
+        sniff_input_kind("spec.yml", Some("openapi: 3.0.1\n")),
+        InputKind::Openapi
+    );
+    // json without the marker → page TXT list.
+    assert_eq!(
+        sniff_input_kind("data.json", Some(r#"{"foo":"bar"}"#)),
+        InputKind::Text
+    );
+    // Marker too late (> first KiB) → TXT list (cas documenté du sniff).
+    let padding = " ".repeat(1030);
+    assert_eq!(
+        sniff_input_kind("late.json", Some(&format!("{padding}\"openapi\":"))),
+        InputKind::Text
+    );
+}
+
+#[test]
+fn input_kind_sitemap_by_urlset_root() {
+    // .xml + `<urlset` root → sitemap (tolerant to attributes,
+    // `<urlset xmlns="...">`).
+    assert_eq!(
+        sniff_input_kind(
+            "map.xml",
+            Some(
+                r#"<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://a.example/</loc></url></urlset>"#
+            )
+        ),
+        InputKind::Sitemap
+    );
+    // XML without `<urlset` → TXT list (e.g. an exported Burp xml).
+    assert_eq!(
+        sniff_input_kind("items.xml", Some("<items><e/></items>")),
+        InputKind::Text
+    );
+}
+
+#[test]
+fn input_kind_text_list_default() {
+    assert_eq!(
+        sniff_input_kind("targets.txt", Some("https://a.example/?id=1\n")),
+        InputKind::Text
+    );
+    assert_eq!(
+        sniff_input_kind("targets", Some("https://a.example/?id=1")),
+        InputKind::Text
+    );
+    // Unreadable contents (read error): TXT fallback without panic.
+    assert_eq!(sniff_input_kind("targets.txt", None), InputKind::Text);
+}
+
+#[test]
+fn ext_sniff_is_case_insensitive() {
+    assert_eq!(
+        sniff_input_kind("SPEC.JSON", Some(r#"{"openapi":"3.0.1"}"#)),
+        InputKind::Openapi
+    );
+    assert_eq!(
+        sniff_input_kind("MAP.Xml", Some("<urlset><url/></urlset>")),
+        InputKind::Sitemap
+    );
+}

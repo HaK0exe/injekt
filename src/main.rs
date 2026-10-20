@@ -15,7 +15,11 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run().await {
+    // C17 : `Cli` (et donc le futur `dispatch → run`) a grandi avec les
+    // fields `--enum`/`--scope`/`--input`/`--match`/`--veto` (> 16 KiB
+    // côté future) — `Box::pin` est le fix clippy `large_futures`
+    // canonique, sans faute de copie supplémentaire.
+    match Box::pin(run()).await {
         // Un chemin peut désormais porter un code d'exit dédié (C15 :
         // `doctor` → 0 sans `✗`, 1 avec `✗` ; C16 : erreur d'usage
         // `NoTarget`/`TargetConflict` → 2) ; les autres restent `()`.

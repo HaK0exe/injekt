@@ -195,23 +195,68 @@ roughly zéro changement de comportement de détection.
 Prompt/PR **dédiée**, un commit par migration, gate utilisateur entre chaque.
 Interne inchangé (`EnumConfig`, `MatcherConfig`), parité MCP vérifiée.
 
-- [ ] **`--enum <items>` + `--scope <db[.table[.col]]>`** fusionnent le cluster
+- [x] **`--enum <items>` + `--scope <db[.table[.col]]>`** fusionnent le cluster
   `EnumOpts` (15 bools : `--dbs --tables --columns --dump -b --current-user
   --current-db --hostname --db --table --column`). Items : `dbs,tables,columns,dump,
   user,db,hostname`. `--start/--stop/--count` inchangés. Anciens flags → warning +
   commande équivalente + mapping vers les mêmes champs `EnumConfig`. ⚠ `mcp/tools/params.rs`
   expose les mêmes — les deux shapes restent.
-- [ ] **`--input <PATH|-|DIR>`** (detection auto du format : dir → raw-dir ; `.xml`
+  *(fait 2026-10-20 : item `banner` ajouté au set (`banner` absent de cette
+  liste d'origine — union des deux nomenclatures, value_parser figé) ;
+  warning une ligne par run `legacy enumeration flags deprecated (2 releases
+  left)` + paires `flag -> --enum item` / triple -> `--scope` ; suite
+  `tests/integration_cli_c17.rs` 6 tests zéro requête ; golden regen (+2
+  flags) ; parité MCP = shapes bools directes inchangées.)*
+- [x] **`--input <PATH|-|DIR>`** (detection auto du format : dir → raw-dir ; `.xml`
   racine `<urlset>` → sitemap ; `.json/.yaml` clé `openapi` → OpenAPI ; `-` → stdin ;
   sinon liste TXT `#`-commenté) fusionne les 7 modes ingestion. Point de branch
   central : `target::ingest` (`collect_targets`). `is_bulk()` couvre le nouveau flag.
-- [ ] **`--match EXPR` / `--veto EXPR`** (rép.) remappent `--string/--not-string/--code`
+  *(fait 2026-10-20 : sniff figé `sniff_input_kind` sur fenêtre premier KiB
+  (`std` sniff — 7 unit), bloc `--input` dans `collect_targets` routant vers les
+  loaders legacy sans duplication (`parse_targets_text`/`parse_openapi_targets`/
+  `parse_sitemap_targets`/`load_raw_dir_targets`/`read_stdin_all`) ; `.yml`
+  accepté avec `.yaml` (superset documenté) ; `is_bulk()` + doctor (6e source,
+  alias stdin, dir/fichier valides) ; 6 tests binaire réel zéro requête
+  (TXT/OpenAPI/sitemap/stdin/dedup-positional/gate) ; golden regen (+ `--input`)
+  ; MCP shape inchangée.)*
+- [x] **`--match EXPR` / `--veto EXPR`** (rép.) remappent `--string/--not-string/--code`
   vers `detection::matcher::MatcherConfig`. Grammaire figée : `status==N`, `status!=N`,
   `body=CONTENU` (contient littéral), `body~RE` (regex) — littéral et regex
   **distingués explicitement**. `--text-only` reste un preprocessing (pas un veto).
-- [ ] **Session namespace** : `injekt session export <PATH>` / `session replay <FILE>`
+  *(fait 2026-10-20 : `MatchExprKind` + `parse_match_expr` validé au parse
+  (`value_parser = parse_match_expr`, champs `Vec<MatchExprKind>` typés — usage
+  exit 2 sur forme inconnue/status non-u16/`body=` vide/regex non compilable) ;
+  mapping `matcher_config` (legacy d'abord, dernier expr gagne sur les Options ;
+  regex compilées UNE fois dans le resolver, hot path jamais recompilé ;
+  `veto_codes` champ nouveau sans équivalent legacy) ; ordre `matches()` étendu
+  (code → veto_codes → not_string → veto_regex → valid-page OU) ; legacy
+  matcher warning flag-only ; `evidence_suffix()` étendu. Tests : 5 unit
+  grammaire + 6 unit matcher gates + 4 unit mapping/precedence/doc-warning +
+  5 intégration binaire (usage-errors exit 2, legacy pairs, dry-run clean).
+  `regex` dépendance déjà déclarée (Cargo.toml:80) — zéro nouvelle dep.
+  Note `main.rs`: `Box::pin(run())` (clippy `large_futures` > 16 KiB après
+  croissance d'`Cli`).*
+- [x] **Session namespace** : `injekt session export <PATH>` / `session replay <FILE>`
   ; `replay` devient alias caché déprécié ; `--export-encrypted` déprécié ; réutilise
   `session::export` tel quel (v2 argon2id 0o600).
+  *Fait 2026-10-20 : `Commands::Session` + `SessionCommands::{Export,Replay}` (root.rs),
+  `commands/session.rs` (`run_export` + helper passphrase mutualisé
+  `passphrase_for_session` — replay.rs délègue), dispatch m4 (warning alias legacy
+  unique), `EncryptedExport::rekey_from_file` (crypto.rs — core
+  `encrypt_json_to_file` factorisé, passthrough byte-for-byte du JSON déchiffré,
+  sel/nonce neufs, garde MIN_PASSPHRASE_LEN, refus écrasement sauf `--force`),
+  auto-vérification du re-key côté commande (déchiffrement immédiat, suppression
+  best-effort si échec), warning legacy `--export-encrypted` dans engine_cfg.
+  `session replay` réutilise `replay::run` tel quel (shape positionnelle
+  `SessionReplayArgs` → `ReplayArgs`). Tests : 3 unit re-key (roundtrip
+  passphrase+envelope, force/overwrite, passphrase fausse/courte sans write
+  partiel) + 5 intégration binaire (roundtrip re-key+replay env, overwrite/force,
+  `--import` manquant, alias legacy warn, `--export-encrypted` warn dry-run).
+  Golden regen (+`session`, `+session export`, `+session replay` ; `replay` reste
+  listé — collecte programmatique, hidden ≠ retiré). Docs : README/fr (exemples +
+  commandes), DOCUMENTATION (rows Output + section `session` + 3 exemples),
+  CHANGELOG (Added/Changed/Migration). Gates fmt/clippy/47 suites/944 lib
+  tests/doc verts. **C17 vague 2 : 4/4**.*
 
 **Acceptation par migration** : flag ancien fonctionnel avec warning + ligne
 équivalente ; suite `integration_enumeration.rs` / `tests/mcp_stdio.rs` maintenue
@@ -313,6 +358,117 @@ Exemple de diagnostic (JSON, champ optionnel — retro-compatible) :
   verts ; regen délibérée du golden `cli-flags.txt` (freeze surface :
   exactement 1 entrée subcommand `doctor`, aucun flag nouveau, revue du
   diff). Non fait : C16/C17/C18 (tâches suivantes, cochées vide).
+
+- > Progrès 2026-10-20 (C17 migration 1 done — branch `feat/cli-vague2`) : `--enum
+  <ITEMS>` (`long = "enum"` explicite — le derive clap produit
+  `--enum-items`, trap vu au test ; value_parser figé sur
+  `dbs|tables|columns|dump|banner|user|db|hostname`, `value_delimiter(',')`,
+  item inconnu = usage exit 2) + `--scope <DB[.TABLE[.COLUMN]]>`
+  (`splitn(3,'.')`, segments vides → `None`) dans
+  `src/cli/args/enumeration.rs` ; mapping `apply_enum_items`/`apply_scope`
+  appliqué à une copie d'`EnumOpts` dans `src/cli/engine_cfg.rs` (UNION —
+  un item/le scope ne désactivent jamais un flag explicite) ; warning
+  deprecated legacy UNE ligne par run + paires `--dbs -> --enum dbs` /
+  `--db/--table/--column -> --scope` sans valeurs, collecté AVANT le
+  mapping (un item ne masque jamais le warning) ; gate
+  `EnumGate::Strict` étendu aux deux nouvelles shapes ; parité MCP =
+  shapes bools directes inchangées (builder complété des 2 nvx champs,
+  defaults neutres). Tests : 13 unit (parse_scope, union,
+  mapping legacy, `Cli::parse_from` → `EnumConfig`, gate strict) +
+  `tests/integration_cli_c17.rs` 6 tests `CARGO_BIN_EXE` zéro requête
+  (dry-run : shape nouvelle sans warning, legacy warning + mapping,
+  item inconnu exit 2). Docs : README/README.fr (flags block + exemples
+  → `--enum`), DOCUMENTATION (table + exemples). Golden `cli-flags.txt`
+  regen délibérée (+ `--enum`, `--scope`, revue du diff). Gates
+  fmt/clippy/47 suites/doc verts sur build copie nvme ;
+  apprentissage : `const fn` ne peut pas matcher sur `str` sous 1.98
+  (E0658, PartialEq const-trail non stable) → `legacy_item_flag` en `fn`
+  classique.
+
+- > Progrès 2026-10-20 (C17 migration 2 done — même branch) : `--input
+  <PATH|-|DIR>` (`src/cli/args/target.rs`, single-occurrence comme les options
+  legacy — un doublon = ArgumentConflict, testé ; parity MCP : shape CLI only,
+  modes individuels MCP restent) ; sniff `sniff_input_kind`
+  (`src/target/ingest/mod.rs`, fenêtre 1 KiB, extension lower-case, grammaire
+  figée : `-` stdin, `is_dir()` raw-dir, `.json/.yaml/.yml` + `openapi` →
+  openapi, `.xml` + `<urlset` → sitemap, sinon TXT) appliqué dans
+  `collect_targets` (routing vers les loaders legacy exacts, additive, dedup
+  `seen` inchangé) ; `is_bulk()` (common.rs) couvre `--input` (fallback bare
+  → pipeline scan bulk) ; `doctor/ingest.rs` : 6e source, alias stdin `--input
+  -`, `expects_dir` recalé sur l'état réel (fichier OU dossier tous deux
+  `good` — jamais de Warn type inversé). Tests : 7 unit sniff (window/late
+  marker/case-insensitive/dir-over-extension/stdin) + 2 doctor +
+  `integration_cli_c17.rs` +6 (TXT/OpenAPI/sitemap/stdin pipe/dedup
+  positional/gate, fichiers temporaires `std::env::temp_dir` isolés pid) ;
+  piège clap vu : `Option<String>` doublé = ArgumentConflict (usage exit 2)
+  → parses séparés dans le test doctor. Docs : README/README.fr (flags +
+  exemples), DOCUMENTATION (row table Target, diag doctor 6 sources, note
+  bulk). Golden `cli-flags.txt` regen délibérée (+ `--input`). Gates
+  fmt/clippy/47 suites/doc verts sur build copie nvme. Reste C17 :
+  migration 3 (`--match/--veto`), migration 4 (session namespace).
+
+- > Progrès 2026-10-20 (C17 migration 3 done — même branche) :
+  `--match EXPR`/`--veto EXPR` répétables (OU interne des exprs, un hit
+  couvre la condition de page valide, premier veto gagne). Grammaire
+  figée `status==N|status!=N|body=CONTENU|body~RE` classifiée par
+  `MatchExprKind` (`src/cli/args/detection.rs`), `value_parser =
+  parse_match_expr` (champs retypés `Vec<MatchExprKind>` — zéro re-parse
+  dans le mapping ; erreurs d'usage exit 2 : forme inconnue, status
+  non-u16, `body=` vide, regex non compilable — `regex` déjà dépendance
+  déclarée : zéro nouvelle dep). Mapping `matcher_config`
+  (`src/cli/resolve/opts.rs`) : legacy d'abord puis exprs (dernier expr
+  gagne sur `code`/`string`/`not_string`), regex COMPILÉES UNE FOIS
+  (`Vec<Regex>` + `_src` pour evidence) — `matches()` (hot path
+  par-réponse) ne recompile pas. Extensions `MatcherConfig`:
+  `match_regex`/`match_regex_src`/`veto_regex`/`veto_regex_src`/
+  `veto_codes` (`#[non_exhaustive]`, littéraux tests via
+  `..Default::default()`), `is_active` et `evidence_suffix()` étendus
+  (re-match:/re-veto:/status-veto:). Ordre `matches()` : code →
+  veto_codes → not_string → veto_regex → valid-page (string OU
+  match_regex). Warning legacy matcher flag-only (jamais de valeur
+  utilisateur écho). `main.rs`: `Box::pin(run())` (clippy
+  `large_futures` — `Cli` a dépassé 16 KiB de future après les nvx
+  champs). Tests : 5 unit grammaire, 6 unit gates matcher, 4 unit
+  mapping/precedence/warning, +5 intégration binaire (usage-errors
+  exit 2, pairs legacy, dry-run clean). Golden regen (`--match`,
+  `--veto`). Docs : README/README.fr flags-block, DOCUMENTATION (row
+  Detection + notes deprecated). Gates fmt/clippy/47 suites/941 tests
+  lib/doc verts (build copie nvme). Reste C17 : migration 4 (session
+  namespace).
+
+- > Progrès 2026-10-20 (C17 migration 4 done — même branche, **vague 2 :
+  4/4**) : namespace `session` — `Commands::Session` +
+  `SessionCommands::{Export(ExportArgs), Replay(SessionReplayArgs)}` (root.rs ;
+  `Replay` conservé en variante cachée `#[command(hide = true)]`, warning
+  flag-only unique dans le dispatch). `commands/session.rs` : `run_export`
+  (exige le global `--import <FILE>`, NOTHING sans key material) +
+  `passphrase_for_session(role)` mutalisé — le prompt replay historique
+  délègue (repli gracieux raw-size préservé) ; export lit source PUIS
+  destination (env ⇒ même passphrase des deux côtés, TTY ⇒ deux lectures).
+  `EncryptedExport::rekey_from_file` (crypto.rs) : core d'écriture factorisé
+  en `encrypt_json_to_file` (ZÉRO changement crypto, même corps déplacé) ;
+  re-key = passthrough byte-for-byte du JSON déchiffré (pas de
+  re-sérialisation), sel/nonce OS-aléatoires neufs, garde
+  `MIN_PASSPHRASE_LEN`, refus d'écrasement sauf `--force` (rm préalable),
+  validation minimale `IgnoredAny` (fail-fast JSON corrompu) ; blob TOUJOURS
+  réécrit en version courante ⇒ upgrade v1/v2 → v3 comme effet de bord
+  documenté. L'output est auto-vérifié par un déchiffrement immédiat côté
+  commande (fichier supprimé best-effort si échec). `session replay <FILE>`
+  réutilise `replay::run` tel quel (littéral `ReplayArgs` intra-crate). 
+  Warning legacy `--export-encrypted` (engine_cfg, flag-only, jamais de
+  valeur écho). MCP : aucun nouveau champ de commandes (bools/modes
+  inchangés, littéraux Cli intacts). Tests : 3 unit re-key (roundtrip
+  passphrase+contenu, overwrite/force + fichier préexistant intact, source
+  fausse/courte ⇒ aucun write partiel) + 5 intégration binaire zéro-requête
+  (roundtrip re-key + replay via `INJEKT_PASSPHRASE`, overwrite refusé puis
+  `--force`, `--import` manquant ⇒ exit ≠ 0, alias legacy warn, dry-run +
+  `--export-encrypted` warn). Golden regen : `+session`, `+session export`,
+  `+session replay` (l'alias `replay` RESTE listé — la surface figée collecte
+  les sous-commandes programmatiquement, hide ≠ retrait). Docs : README/fr
+  (exemples + commandes), DOCUMENTATION (rows `--export-encrypted`/`--import`
+  + section `session` + 2 exemples inspection), CHANGELOG
+  (Added/Changed/Migration guide). Gates fmt/clippy/47 suites/944 lib
+  tests/doc verts (build copie nvme).
 
 - > Progrès 2026-10-19 (C14 done): moteur diagnostics `INCONCLUSIVE` câblé —
   `src/engine/diagnostics.rs` (types purs : `InconclusiveCause`/`Diagnostic`/`DiagSignals`,
