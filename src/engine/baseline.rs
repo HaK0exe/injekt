@@ -354,7 +354,8 @@ pub(crate) async fn collect_baseline_uncached(
     if baseline.is_waf_blocked() {
         warn!(
             target=%scrubber.scrub(target.as_str()),
-            "possible WAF detected (repeated 403/406)"
+            "possible WAF detected (repeated 403/406) — if blocking is confirmed, \
+             space2comment,randomcase are auto-enabled"
         );
     }
     // Blocking WAF = actionable warn; mere CDN presence (e.g. `cf-ray`
@@ -389,7 +390,8 @@ pub(crate) async fn collect_baseline_uncached(
         && config.evasion.tampers.is_empty()
     {
         info!(
-            "WAF suspected and no --tamper given — auto-enabling space2comment,randomcase for detection"
+            "WAF blocking suspected, no --tamper given — auto-enabling space2comment,randomcase \
+             (--tamper takes precedence when set)"
         );
         waf_auto_tampers()
     } else {

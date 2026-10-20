@@ -8,8 +8,29 @@ use crate::cli::profile::Profile;
 use crate::cli::styles::CLI_STYLES;
 use clap::{Parser, Subcommand};
 
+/// C18 (Phase 4 UI) — clig.dev « lead with examples » : `--help` s'ouvre sur
+/// des invocations typiques AVANT la liste des options, et documente les exit
+/// codes (contrat `main` : `0` run terminé, `1` runtime, `2` usage ;
+/// `doctor` : 0/1). `const` (pas de runtime) — la surface freeze
+/// `tests/golden/cli-flags.txt` ne capture que les flags/sous-commandes :
+/// un `after_help` n'y change rien et le golden reste valide sans regen.
+const AFTER_HELP: &str = concat!(
+    "Examples:\n",
+    "  injekt https://lab.example.com/?id=1        scan a parameterized URL\n",
+    "  injekt auto lab.example.org                 crawl, then scan discovered params\n",
+    "  injekt --raw-file burp.txt                  inject into a Burp/ZAP raw request\n",
+    "  injekt --target <URL> --profile stealth -q  quiet run, minimized footprint\n",
+    "  injekt doctor                               sanity-check local config (no network)\n",
+    "\n",
+    "Exit codes:\n",
+    "  0  run completed (findings or none — read stdout / the JSON report)\n",
+    "  1  runtime failure (network, I/O, …)\n",
+    "  2  usage error (no target, conflicting targets)\n",
+    "  doctor: 0 every check passed, 1 at least one failure",
+);
+
 #[derive(Parser, Clone)]
-#[command(name="injekt", version, about="Modern SQLi detection — zero persistence, anonymisation by design", long_about=None, styles = CLI_STYLES)]
+#[command(name="injekt", version, about="Modern SQLi detection — zero persistence, anonymisation by design", long_about=None, styles = CLI_STYLES, after_help = AFTER_HELP)]
 #[non_exhaustive]
 // Each bool is an independent CLI flag (clap derive); a state-machine/enum
 // refactor would break the flat --flag command-line surface.

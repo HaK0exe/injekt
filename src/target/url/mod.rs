@@ -26,7 +26,9 @@ impl core::fmt::Debug for TargetUrl {
 pub enum UrlError {
     #[error("invalid url: {0}")]
     Invalid(String),
-    #[error("private/loopback IP rejected (anti-SSRF), use --allow-private to override")]
+    #[error(
+        "private/loopback target rejected (anti-SSRF): pass --allow-private to scan a lab target you own"
+    )]
     PrivateIp,
     #[error("unsupported scheme: {0}")]
     Scheme(String),
