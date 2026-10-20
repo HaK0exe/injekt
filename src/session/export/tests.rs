@@ -311,3 +311,23 @@ fn rekey_rejects_wrong_source_passphrase_and_short_dest() {
     );
     fs::remove_file(&src).unwrap();
 }
+
+#[test]
+fn rekey_force_wrong_source_preserves_destination() {
+    let state = test_state();
+    let a = SecretString::from("passphrase123456");
+    let b = SecretString::from("new-passphrase-987");
+    let src = temp_path();
+    let dst = temp_path();
+    EncryptedExport::encrypt_to_file(&state, &a, &src).unwrap();
+    EncryptedExport::encrypt_to_file(&state, &a, &dst).unwrap();
+    // --force + wrong source passphrase: the source must fail BEFORE the
+    // destination is removed (no destructive rotation on a typo).
+    let wrong = SecretString::from("this-is-not-the-pass");
+    let _err = EncryptedExport::rekey_from_file(&wrong, &src, &b, &dst, true)
+        .expect_err("wrong source passphrase must fail");
+    EncryptedExport::decrypt_from_file(&a, &dst)
+        .expect("pre-existing destination preserved on source decrypt failure");
+    fs::remove_file(&src).unwrap();
+    fs::remove_file(&dst).unwrap();
+}
