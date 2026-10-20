@@ -48,6 +48,21 @@ Seuils calibrés (C7, gelés v1.0-rc — voir `src/reporting/verdict.rs` +
   non compilable) ; littéral et regex explicitement distincts (`=`
   contains, `~` regex — `regex` déjà dépendance déclarée : zéro nouvelle
   dep). `--text-only` reste un preprocessing (pas un veto).
+- **C17 — CLI vague 2, migration 4 (namespace `session`)** :
+  `injekt session export <PATH> --import <FILE>` (re-key d'un export
+  chiffré : déchiffrement puis rechiffrement **tel quel** du snapshot —
+  passthrough byte-for-byte du JSON déchiffré, sel/nonce argon2id
+  OS-aléatoires neufs, blob toujours réécrit en version courante = mise à
+  niveau v1/v2 → v3 au passage ; 0o600 `create_new`, refus d'écrasement
+  sauf `--force`, output auto-vérifié par un déchiffrement immédiat avec
+  suppression best-effort si échec) et `injekt session replay <FILE>`
+  (shape positionnelle du même moteur d'inspection `replay::run`).
+  Passphrases via `INJEKT_PASSPHRASE` (min 12, même valeur des deux côtés
+  si env) ou prompt TTY (lecture source puis destination distinctes) ;
+  le helper est mutualisé dans `commands::session::passphrase_for_session`
+  (le prompt replay historique délègue, où l'absence de TTY/env reste un
+  repli gracieux vers le rapport raw-size — pour `session export` c'est
+  une erreur bloquante, aucun write sans key material). Offline, 0 socket.
 
 ### Changed
 - Flags legacy d'`EnumOpts` (`--dbs/--tables/--columns/--dump`,
@@ -70,6 +85,12 @@ Seuils calibrés (C7, gelés v1.0-rc — voir `src/reporting/verdict.rs` +
   `veto_codes` → `not_string` → `veto_regex` → conditions valid-page
   (`string` OU `match_regex`). `evidence_suffix()` étendu
   (`re-match:`/`re-veto:`/`status-veto:`, sources truncées 24 chars).
+- Namespace `session` (C17 migration 4) : `injekt replay` devient un
+  **alias caché déprécié** (fonctionnel encore 2 releases, warning
+  flag-only unique à chaque run : `injekt session replay <FILE>`). Le
+  flag `--export-encrypted` devient **déprécié** (fonctionnel inchangé
+  post-run, warning unique) — la rotation de passphrase passe par
+  `injekt session export <PATH> --import <FILE>`.
 
 ### Migration guide
 - Énumération : `injekt <URL> --dbs --current-user` ⇒ `injekt <URL> --enum
@@ -92,6 +113,15 @@ Seuils calibrés (C7, gelés v1.0-rc — voir `src/reporting/verdict.rs` +
   interne ; premier veto gagne dans l'ordre `matches()`).
 - Le reporting, le rapport JSON et la sortie console restent byte-identiques :
   seul l'appel CLI change (l'engine struct reçoit les mêmes champs).
+- Namespace session : `injekt replay --file s.enc` ⇒ `injekt session
+  replay s.enc` (shape positionnelle, le flag `--file` reste accepté par
+  l'alias legacy jusqu'à sa suppression) ; rotation de passphrase :
+  `injekt session export s-v2.enc --import s.enc` (passphrase
+  destination distincte sous TTY ; sous env les deux côtés utilisent
+  `INJEKT_PASSPHRASE` — une rotation réelle sous env exige deux
+  processus avec des envs différents). `--export-encrypted` reste la
+  voie d'export inline post-run ; aucun changement de comportement du
+  blob (formats inchangés, versions reconnues élargies au re-key).
 
 ## [0.4.0] — 2026-10-19 — Hardening v1.0-rc (première release taguée post-v0.3.0)
 

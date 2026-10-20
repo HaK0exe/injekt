@@ -156,7 +156,9 @@ injekt --target "http://192.168.1.10/?id=1" --allow-private
 # Encrypted session export (OPT-IN) — creates sensitive artefact
 injekt --target "https://example.com/?id=1" --export-encrypted ./session.enc
 # Inspect an export (decrypt + scrubbed summary, not a full scan resume):
-INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
+INJEKT_PASSPHRASE='...' injekt session replay ./session.enc
+# Passphrase rotation (re-key an existing export, same inspect loop):
+injekt session export ./session-v2.enc --import ./session.enc
 injekt info
 
 # MCP Server (for AI assistants)
@@ -223,7 +225,9 @@ injekt [OPTIONS] [COMMAND]
 Commands:
   scan    Run detection (default when --target is given)
   recon   Crawl targets, discover parameters, scan candidates, import candidate JSON
-  replay  Replay encrypted session
+  replay  Replay encrypted session (deprecated hidden alias — use `session replay`)
+  session export <PATH> --import <FILE>  Re-key an encrypted export (C17, passphrase rotation)
+  session replay <FILE>  Replay encrypted session (C17)
   info    Show version / techniques / DBMS
   mcp     MCP server over stdio (Claude Code, Codex, OpenCode, Cursor, VS Code)
 

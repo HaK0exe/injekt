@@ -16,5 +16,6 @@ pub use output::{OutputOpts, ReportFormat};
 pub use root::{
     AutoArgs, Cli, Commands, CompletionsArgs, DoctorArgs, InfoArgs, InitArgs, ManArgs, McpArgs,
     ReconArgs, ReconCommands, ReconCrawlArgs, ReconImportArgs, ReconScanArgs, ReplayArgs, ScanArgs,
+    SessionArgs, SessionCommands, SessionExportArgs, SessionReplayArgs,
 };
 pub use target::TargetOpts;

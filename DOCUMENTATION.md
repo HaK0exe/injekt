@@ -153,8 +153,8 @@ La cible admet quatre sources (précidence) : `--raw-file` > positional `injekt 
 | `--rate-limit <RPS>` | Token-bucket requests/second | `10` (always enforced; there is no "unlimited" mode via CLI) |
 | `--jitter <MEAN,STD>` | **Milliseconds**, e.g. `"750,250"` (750±250ms, floor 200ms) | `750,250` (human jitter is **on by default**, even without the flag) |
 | `--marker <STR>` | Injection marker: `*`, `§`, `{{}}` | auto-detect |
-| `--export-encrypted <PATH>` | Encrypted snapshot (XChaCha20-Poly1305 + Argon2id, **OPT-IN**) | — |
-| `--import <PATH>` | Legacy flag: rejected by `scan` (use `replay --file` to inspect an export, `recon import --file` for candidates) | — |
+| `--export-encrypted <PATH>` | Encrypted snapshot (XChaCha20-Poly1305 + Argon2id, **OPT-IN**) — **déprécié** (2 releases) : le flag reste fonctionnel post-run, la rotation de passphrase passe par `injekt session export` | — |
+| `--import <PATH>` | Legacy flag: rejected by `scan` (use `session replay <FILE>` to inspect an export, `recon import --file` for candidates — sert aussi de source au re-key `session export`) | — |
 | `--no-redact` | **Disable scrubbing (local debugging only!)** | `false` |
 | `--allow-private` | Allow loopback/private IPs (anti-SSRF bypass, lab only) | `false` |
 | `--max-redirects <N>` | Max redirects followed per request (`0` = do not follow; every hop re-validated, secrets stripped cross-origin) | `5` |
@@ -198,7 +198,7 @@ injekt --target "http://192.168.1.10/?id=1" --allow-private
 
 # Encrypted session export (OPT-IN) + inspection
 injekt --target "https://example.com/?id=1" --export-encrypted ./session.enc
-INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc  # decrypt + summary
+INJEKT_PASSPHRASE='...' injekt session replay ./session.enc  # decrypt + summary
 
 # Output JSON report
 injekt --target "https://example.com/?id=1" --output report.json
@@ -302,11 +302,18 @@ injekt recon import --file discovered.json --test --enumerate
 | `--test` | Actively scan imported candidates (requires network) |
 | `--enumerate` | Enable enumeration on confirmed findings |
 
-#### `replay` — Encrypted Session Inspection
+#### `session` — Export Namespace (C17)
 ```bash
-INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
+INJEKT_PASSPHRASE='...' injekt session replay ./session.enc
+# Rotation de passphrase (re-key : déchiffre puis rechiffre tel quel,
+# sel/nonce argon2id neufs, 0o600, --force pour remplacer) :
+injekt session export ./session-v2.enc --import ./session.enc
 ```
-Decrypts an `--export-encrypted` snapshot (`INJEKT_PASSPHRASE` or TTY prompt) and prints a scrubbed summary (findings, request count). Inspection only — re-run `injekt --target <url>` (ou `auto --target <url>`) to resume testing.
+`session replay <FILE>` decrypts an `--export-encrypted` snapshot (`INJEKT_PASSPHRASE` ou prompt TTY) and prints a scrubbed summary (findings, request count). Inspection only — re-run `injekt --target <url>` (ou `auto --target <url>`) to resume testing.
+
+`session export <PATH> --import <FILE>` re-keys an existing export into a fresh envelope (byte-for-byte passthrough du snapshot chiffré, salt/nonce OS-aléatoires neufs ; les blobs v1/v2 sont mis à niveau au passage). La passphrase source PUIS la destination proviennent de `INJEKT_PASSPHRASE` (identiques si env) ou du prompt TTY (deux lectures distinctes) ; l'écriture est auto-vérifiée par un déchiffrement immédiat (fichier supprimé si échec). Offline, 0 socket.
+
+L'alias top-level `injekt replay --file <FILE>` reste fonctionnel mais est **caché et déprécié** (2 releases) : un warning nomme l'équivalent à chaque invocation.
 
 #### `info` — Capability Information
 ```bash
@@ -482,7 +489,7 @@ The `Scrubber` (`src/session/scrubber/`) processes all output:
 injekt --target "https://example.com/?id=1" --export-encrypted ./session.enc
 
 # Inspect (decrypt + scrubbed summary; not a full scan resume)
-INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
+INJEKT_PASSPHRASE='...' injekt session replay ./session.enc
 ```
 - Format: XChaCha20-Poly1305 + Argon2id (v2)
 - File permissions: 0o600 on Unix
@@ -497,7 +504,7 @@ INJEKT_PASSPHRASE='...' injekt replay --file ./session.enc
 ```
 src/
 ├── main.rs / lib.rs                 # Entry points, public API + InjektError
-├── cli/                             # args/ + commands/ (scan, recon, replay, info, auto) + output/
+├── cli/                             # args/ + commands/ (scan, recon, replay, session, info, auto) + output/
 │   ├── plan.rs + plan/              # Planner split: model/render/escalation
 │   ├── resolve.rs + resolve/        # CLI resolution split: snapshot/effective/…
 │   └── client_builder.rs file_config.rs profile.rs knowledge.rs styles.rs engine_cfg.rs
@@ -723,7 +730,7 @@ injekt -u "https://example.com/?id=1" \
 injekt -u "https://example.com/?id=1" --export-encrypted session.enc
 
 # Inspect later (decrypt + scrubbed summary; not a full scan resume)
-INJEKT_PASSPHRASE='...' injekt replay --file session.enc
+INJEKT_PASSPHRASE='...' injekt session replay session.enc
 ```
 
 ### Terminal UI/UX

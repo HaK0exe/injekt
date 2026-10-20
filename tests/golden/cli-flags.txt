@@ -12,6 +12,9 @@ recon import
 recon scan
 replay
 scan
+session
+session export
+session replay
 # flags (sorted --long, all levels)
 --ai-api-key
 --ai-endpoint

@@ -8,6 +8,7 @@ pub mod recon;
 pub mod replay;
 pub mod scaffold;
 pub mod scan;
+pub mod session;
 
 use crate::cli::args::{Cli, Commands};
 use std::process::ExitCode;
@@ -36,7 +37,24 @@ pub async fn dispatch(cli: Cli, cancel: CancellationToken) -> anyhow::Result<()>
             Ok(())
         }
         Some(Commands::Recon(args)) => recon::run(&cli, args, cancel).await,
-        Some(Commands::Replay(args)) => replay::run(args, &cli.output_opts),
+        Some(Commands::Replay(args)) => {
+            session::warn_legacy_replay_alias();
+            replay::run(args, &cli.output_opts)
+        }
+        Some(Commands::Session(args)) => match &args.command {
+            crate::cli::args::SessionCommands::Export(export) => {
+                session::run_export(export, &cli.output_opts)
+            }
+            crate::cli::args::SessionCommands::Replay(replay_args) => {
+                // Même moteur, shape positionnelle (`session replay <FILE>`).
+                replay::run(
+                    &crate::cli::args::ReplayArgs {
+                        file: replay_args.file.clone(),
+                    },
+                    &cli.output_opts,
+                )
+            }
+        },
         Some(Commands::Info(_)) => {
             info::run();
             Ok(())
