@@ -306,3 +306,133 @@ async fn input_flag_is_bulk_like_pipeline_gate() {
     // exclusion confirmed by the absence of a dry-run pipeline error).
     assert!(stdout.contains("dry-run: scan plan"), "{stdout}");
 }
+
+// ---------------------------------------------------------------------------
+// C17 migration 3 — `--match EXPR` / `--veto EXPR` (frozen grammar)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn match_exprs_reach_the_scan_plan_with_no_legacy_warning() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let target = format!("{}/?id=1", server.uri());
+    let (code, stdout, stderr) = run_binary(&[
+        &target,
+        "--dry-run",
+        "--allow-private",
+        "--no-banner",
+        "--match",
+        "status==200",
+        "--match",
+        "body=servicing",
+        "--veto",
+        "body~waf|rate.bound",
+        "--veto",
+        "status==503",
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
+    assert!(stdout.contains("dry-run: scan plan"));
+    assert!(!stderr.contains("legacy matcher flags deprecated"));
+}
+
+#[tokio::test]
+async fn unknown_match_expr_is_usage_exit_2() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let target = format!("{}/?id=1", server.uri());
+    let (code, _stdout, stderr) = run_binary(&[
+        &target,
+        "--allow-private",
+        "--no-banner",
+        "--match",
+        "status=200",
+    ]);
+    assert_eq!(
+        code, 2,
+        "grammaire figée : une seule '=' est un usage error"
+    );
+    assert!(
+        stderr.contains("unknown frozen grammar"),
+        "le rejet nomme la grammaire: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn non_compiling_regex_is_usage_exit_2() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let target = format!("{}/?id=1", server.uri());
+    let (code, _stdout, stderr) = run_binary(&[
+        &target,
+        "--allow-private",
+        "--no-banner",
+        "--veto",
+        "body~[",
+    ]);
+    assert_eq!(code, 2, "regex non compilable = usage error: {stderr}");
+    assert!(stderr.contains("does not compile"), "{stderr}");
+}
+
+#[tokio::test]
+async fn legacy_code_flag_warns_with_expr_mapping() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let target = format!("{}/?id=1", server.uri());
+    let (code, stdout, stderr) = run_binary(&[
+        &target,
+        "--dry-run",
+        "--allow-private",
+        "--no-banner",
+        "--code",
+        "200",
+    ]);
+    assert_eq!(code, 0, "legacy --code reste fonctionnel: {stderr}");
+    assert!(stdout.contains("dry-run: scan plan"));
+    assert!(
+        stderr.contains("legacy matcher flags deprecated"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("--code <N> -> --match status==<N>"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_string_flag_warns_with_match_body_mapping() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let target = format!("{}/?id=1", server.uri());
+    let (code, _stdout, stderr) = run_binary(&[
+        &target,
+        "--dry-run",
+        "--allow-private",
+        "--no-banner",
+        "--string",
+        "welcome",
+        "--not-string",
+        "fatal",
+    ]);
+    assert_eq!(code, 0);
+    assert!(
+        stderr.contains("--string -> --match body=<string>")
+            && stderr.contains("--not-string -> --veto body=<string>"),
+        "{}",
+        stderr
+    );
+}

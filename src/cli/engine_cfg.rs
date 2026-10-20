@@ -53,6 +53,24 @@ fn legacy_enum_flags(opts: &crate::cli::args::enumeration::EnumOpts) -> String {
     pairs.join(", ")
 }
 
+/// C17 — legacy matcher flags (`--string`/`--not-string`/`--code`)
+/// present in `DetectionOpts` → single deprecation line + equivalent
+/// pairs. Flag-only (no value echo: `--match`/`--veto` EXPR contents are
+/// operator-supplied words and must never surface in a warning line).
+fn legacy_matcher_flags(opts: &crate::cli::args::DetectionOpts) -> String {
+    let mut pairs: Vec<&'static str> = Vec::new();
+    if opts.string.is_some() {
+        pairs.push("--string -> --match body=<string>");
+    }
+    if opts.not_string.is_some() {
+        pairs.push("--not-string -> --veto body=<string>");
+    }
+    if opts.code.is_some() {
+        pairs.push("--code <N> -> --match status==<N>");
+    }
+    pairs.join(", ")
+}
+
 /// Build engine config from CLI detection/enumeration options.
 /// Resolution honours `--profile` / config file / `INJEKT_*` via `Cli::effective_*`:
 /// explicit flags always win, presets only fill gaps (non-breaking).
@@ -77,6 +95,10 @@ pub fn build_engine_config(cli: &Cli, enum_gate: EnumGate) -> EngineConfig {
     let legacy = legacy_enum_flags(&cli.enumeration);
     if !legacy.is_empty() {
         tracing::warn!("legacy enumeration flags deprecated (2 releases left): {legacy}");
+    }
+    let legacy_matcher = legacy_matcher_flags(&cli.detection);
+    if !legacy_matcher.is_empty() {
+        tracing::warn!("legacy matcher flags deprecated (2 releases left): {legacy_matcher}");
     }
     // C17 — `--enum <items>` / `--scope <db[.table[.column]]>` applied to
     // the historical fields (UNION, never a downgrade): the same internal
@@ -222,7 +244,7 @@ pub fn build_engine_config(cli: &Cli, enum_gate: EnumGate) -> EngineConfig {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{EnumGate, build_engine_config, legacy_enum_flags};
+    use super::{EnumGate, build_engine_config, legacy_enum_flags, legacy_matcher_flags};
     use crate::cli::args::{Cli, EnumOpts};
 
     /// Fixture minimale : les 3 paramètres couvrent les 3 familles legacy
@@ -338,5 +360,120 @@ mod tests {
         // Parité historique : les valeurs de scope (comme --db avant) restent
         // injectées pour l'usage ultérieur, seuls les bools sont gated.
         assert_eq!(cfg.enumeration.db.as_deref(), Some("shop"));
+    }
+
+    #[test]
+    fn no_legacy_matcher_flag_gives_empty_mapping() {
+        assert_eq!(legacy_matcher_flags(&fixture_detection()), "");
+    }
+
+    #[test]
+    fn legacy_matcher_pairs_follow_declared_order() {
+        let mut d = fixture_detection();
+        d.string = Some("welcome".to_owned());
+        d.not_string = Some("fatal".to_owned());
+        d.code = Some(200);
+        assert_eq!(
+            legacy_matcher_flags(&d),
+            "--string -> --match body=<string>, \
+             --not-string -> --veto body=<string>, \
+             --code <N> -> --match status==<N>"
+        );
+    }
+
+    /// Fixture alignée sur `resolve::tests::blank_cli()` (champs détection).
+    fn fixture_detection() -> crate::cli::args::DetectionOpts {
+        crate::cli::args::DetectionOpts {
+            threads: None,
+            level: None,
+            techniques: Vec::new(),
+            tamper: Vec::new(),
+            params: Vec::new(),
+            data: None,
+            fetch_using: None,
+            dbms: None,
+            marker: None,
+            string: None,
+            not_string: None,
+            code: None,
+            match_expr: Vec::new(),
+            veto_expr: Vec::new(),
+            text_only: false,
+            max_duration: None,
+            request_budget: None,
+            confirm: false,
+            seed: None,
+            ignore_codes: Vec::new(),
+            oob_domain: None,
+            oob_poll_url: None,
+            oob_wait_secs: None,
+            ai_suggest: false,
+            ai_provider: None,
+            ai_endpoint: None,
+            ai_model: None,
+            ai_api_key: None,
+            ai_max_suggestions: 3,
+            ai_timeout: 30,
+            generative: None,
+            max_generated: 4,
+        }
+    }
+
+    #[test]
+    fn match_exprs_map_onto_matcher_config() {
+        use clap::Parser as _;
+        let cli = Cli::parse_from([
+            "injekt",
+            "http://t/?id=1",
+            "--match",
+            "status==404",
+            "--match",
+            "body=welcome",
+            "--veto",
+            "body=fatal",
+            "--veto",
+            "body~waf",
+            "--veto",
+            "status==503",
+            "--match",
+            "body~wel.*come",
+        ]);
+        let cfg = build_engine_config(&cli, EnumGate::Passthrough);
+        assert_eq!(cfg.matcher.code, Some(404), "--match status==");
+        assert_eq!(cfg.matcher.veto_codes, vec![503], "--veto status==");
+        assert_eq!(
+            cfg.matcher.string.as_deref(),
+            Some("welcome"),
+            "--match body="
+        );
+        assert_eq!(
+            cfg.matcher.not_string.as_deref(),
+            Some("fatal"),
+            "--veto body="
+        );
+        assert_eq!(cfg.matcher.match_regex_src, vec!["wel.*come".to_owned()]);
+        assert_eq!(cfg.matcher.veto_regex_src, vec!["waf".to_owned()]);
+        assert!(!cfg.matcher.veto_regex.is_empty());
+        // Un corps satisfaisant --match (body= OU body~) et le status
+        // 404 requis ne veto pas (abstention, moteur décide).
+        assert!(
+            cfg.matcher.matches("a welcome page", 404).is_none(),
+            "matcher satisfait ⇒ abstention"
+        );
+    }
+
+    #[test]
+    fn veto_status_ne_maps_to_code_semantics() {
+        use clap::Parser as _;
+        // `--veto status!=200` ≡ legacy `--code 200` (le status doit être égal).
+        let cli = Cli::parse_from(["injekt", "http://t/?id=1", "--veto", "status!=200"]);
+        let cfg = build_engine_config(&cli, EnumGate::Passthrough);
+        assert_eq!(cfg.matcher.code, Some(200));
+        assert_eq!(legacy_matcher_flags(&cli.detection), "");
+        let cli_code = Cli::parse_from(["injekt", "http://t/?id=1", "--code", "200"]);
+        assert_eq!(
+            legacy_matcher_flags(&cli_code.detection),
+            "--code <N> -> --match status==<N>"
+        );
     }
 }

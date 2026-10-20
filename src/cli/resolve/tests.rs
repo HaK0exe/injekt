@@ -61,6 +61,8 @@ fn blank_cli() -> Cli {
             string: None,
             not_string: None,
             code: None,
+            match_expr: Vec::new(),
+            veto_expr: Vec::new(),
             text_only: false,
             max_duration: None,
             request_budget: None,

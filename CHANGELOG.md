@@ -35,9 +35,22 @@ Seuils calibrés (C7, gelés v1.0-rc — voir `src/reporting/verdict.rs` +
   inchangé) ; `is_bulk()` couvre `--input` (pipeline bulk déclenché) ;
   `injekt doctor` liste désormais la 6e source (`--input` : fichier ou
   dossier tous deux valides, alias stdin accepté).
+- **C17 — CLI vague 2, migration 3 (`--match`/`--veto`)** : expressions
+  de matcher répétables (OU interne des exprs) remappées exactement vers
+  `detection::matcher::MatcherConfig` : `--match status==N` /
+  `--veto status!=N` ⇔ `code` (doit être égal) ; `--match body=…` ⇔
+  `string` ; `--veto body=…` ⇔ `not_string` ; `--veto status==N` ⇒ champ
+  nouveau `veto_codes` (pas d'équivalent legacy) ; `body~RE` ⇒ deux
+  listes de regex **compilées dans le resolver** (`match_regex` /
+  `veto_regex` — compilation au build de config, jamais par réponse :
+  hot path inchangé en CPU). Grammaire figée validée au parse (usage
+  exit 2 : forme inconnue, status non-u16, `body=` vide, regex
+  non compilable) ; littéral et regex explicitement distincts (`=`
+  contains, `~` regex — `regex` déjà dépendance déclarée : zéro nouvelle
+  dep). `--text-only` reste un preprocessing (pas un veto).
 
 ### Changed
-- Flags legacy hôtes du cluster (`--dbs/--tables/--columns/--dump`,
+- Flags legacy d'`EnumOpts` (`--dbs/--tables/--columns/--dump`,
   `-b/--banner`, `--current-user`, `--current-db`, `--hostname`,
   `--db/--table/--column`) : **deprecated, fonctionnels encore 2 releases**.
   Un warning unique par run liste le mapping équivalent (`--dbs -> --enum
@@ -48,6 +61,15 @@ Seuils calibrés (C7, gelés v1.0-rc — voir `src/reporting/verdict.rs` +
   `--sitemap-file`, `--raw-dir` — pas concernés : `--raw-file` reste la
   voie single-scan exclusive) : inchangés et alternatifs à `--input` ;
   aucune dépréciation forcée à ce stade (coexistence additive).
+- Matchers legacy (`--string`, `--not-string`, `--code`) : **deprecated,
+  fonctionnels encore 2 releases** ; warning unique par run + paires
+  flag-only (`--string -> --match body=<string>`,
+  `--not-string -> --veto body=<string>`, `--code <N> -> --match
+  status==<N>` — les valeurs ne sont jamais échos dans une ligne de
+  warning). Ordre `matches()` étendu (premier veto gagne) : `code` →
+  `veto_codes` → `not_string` → `veto_regex` → conditions valid-page
+  (`string` OU `match_regex`). `evidence_suffix()` étendu
+  (`re-match:`/`re-veto:`/`status-veto:`, sources truncées 24 chars).
 
 ### Migration guide
 - Énumération : `injekt <URL> --dbs --current-user` ⇒ `injekt <URL> --enum
@@ -62,6 +84,12 @@ Seuils calibrés (C7, gelés v1.0-rc — voir `src/reporting/verdict.rs` +
   `--raw-dir dumps/` ⇔ `--input dumps/` (dossier). Une source ambiguë
   (JSON sans clé `openapi`, XML sans `<urlset>`) retombe en liste TXT —
   utiliser le mode legacy équivalent si l'intention diffère.
+- Matchers : `--string welcome` ⇔ `--match body=welcome` ;
+  `--not-string fatal` ⇔ `--veto body=fatal` ; `--code 200` ⇔
+  `--match status==200` ; nouveau sans équivalent legacy :
+  `--veto status==503`, `--veto body~waf|rate.bound`,
+  `--match body~servicing` (regex, validé au parse ; répétable, OU
+  interne ; premier veto gagne dans l'ordre `matches()`).
 - Le reporting, le rapport JSON et la sortie console restent byte-identiques :
   seul l'appel CLI change (l'engine struct reçoit les mêmes champs).
 
