@@ -37,7 +37,9 @@ impl Cli {
             "postgres" | "postgresql" | "pg" | "pgsql" => "postgres",
             "mssql" | "sqlserver" | "sql-server" | "tsql" => "mssql",
             "oracle" | "ora" => "oracle",
-            "sqlite" => "sqlite",
+            // P5: `sqlite3` is the canonical CLI name of the engine — accept
+            // it for parity with the binary's own library name.
+            "sqlite" | "sqlite3" => "sqlite",
             _ => {
                 tracing::warn!(dbms=%raw, "unknown --dbms, ignoring (auto-fingerprint)");
                 return None;

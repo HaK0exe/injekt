@@ -55,7 +55,7 @@ pub struct ScanParams {
     pub headers: Option<Vec<String>>,
     /// Cookie header value
     pub cookies: Option<String>,
-    /// Force specific DBMS: mysql, postgres, mssql, oracle, sqlite
+    /// Force specific DBMS: mysql, postgres, mssql, oracle, sqlite (alias: sqlite3)
     pub dbms: Option<String>,
     /// Enable data extraction (opt-in)
     pub extract: Option<bool>,
@@ -226,7 +226,7 @@ pub struct ReconScanParams {
     pub headers: Option<Vec<String>>,
     /// Cookie header value
     pub cookies: Option<String>,
-    /// Force specific DBMS: mysql, postgres, mssql, oracle, sqlite
+    /// Force specific DBMS: mysql, postgres, mssql, oracle, sqlite (alias: sqlite3)
     pub dbms: Option<String>,
     /// Enable data extraction (opt-in)
     pub extract: Option<bool>,
@@ -300,7 +300,7 @@ pub struct PlanParams {
     pub params: Option<Vec<String>>,
     /// POST body to test (e.g. "id=1&user=admin")
     pub data: Option<String>,
-    /// Force specific DBMS: mysql, postgres, mssql, oracle, sqlite
+    /// Force specific DBMS: mysql, postgres, mssql, oracle, sqlite (alias: sqlite3)
     pub dbms: Option<String>,
     /// Deterministic run seed (same seed => same plan order)
     pub seed: Option<u64>,

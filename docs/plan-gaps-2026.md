@@ -5,6 +5,24 @@
 > `docs/adr/0010-second-order.md` est à rédiger à l'amorçage du chantier P1
 > (unique décision touchant la « ligne rouge » écriture cible).
 >
+> Progrès 2026-10-20 (P5 done — branch `feat/p5-sqlite`) : audit révélant le
+> plombage déjà en place (`Some("sqlite")` dans error/time/union/boolean
+> payloads, `DbmsBelief::from_hint`, `dbms_hint_kind`, enumerate/extraction
+> hint-first, fingerprint hint-short-circuit) — le G5 « payloads absents »
+> de la ligne de statut était déjà clos par la base. Reste livré : alias
+> `sqlite3` (3 routeurs + docstring MCP), suite d'acceptance dédiée
+> `tests/integration_dbms_sqlite.rs` (wiremock : confirmation boolean + dump
+> `sqlite_master`/`sqlite_version` via l'oracle du détecteur
+> `LENGTH((...))>=N` / `UNICODE(SUBSTR(...))>=m`, pureté dialecte par sink
+> de requêtes — 0 payload mysql/pg/mssql/oracle envoyé sous hint sqlite,
+> alias `sqlite3`), docs playbook 05/README, CHANGELOG `[Unreleased]`.
+> Critère time du plan supplanté par l'existant : `RANDOMBLOB` (proxy CPU
+> dense) au lieu de l'exclusion, déjà testé upstream. Défaut auto
+> byte-identique (OFF) tenu : aucun flag CLI nouveau, golden inchangé
+> (freeze vert). Gates fmt/clippy -D warnings/47 suites/905 lib tests/doc
+> verts (build copie nvme). Reste série : P2, P1 (après ADR 0010),
+> P3/P4/P6.
+>
 > **Doctrine respectée** (non négociable, cf. `docs/ROADMAP-v1.0.md` §6.1) :
 > - v1.0-rc en cours = *geler, durcir, prouver* — **rien de nouveau avant le tag v1.0** ;
 > - pas de ML/LLM-détecteur black-box, pas d'agent LLM autonome ;
@@ -43,7 +61,7 @@ Ce qui **manque** (les 6 gaps de ce plan) :
 | G2 Recherche adaptative de bypass (payload-level) | ⚠ partiel (boost technique-level C13 existe, mais pas de politique tamper×fence×separator en run) | Contourne les WAF à signatures mortes sur les chaînes canoniques |
 | G3 Oracle temporel statistique fin | ⚠ basique (seuil baseline+2σ) | Extrait malgré rate-limit/bruit sur les cibles « lentes autorisées » |
 | G4 Registre de profils WAF | ⚠ presets + auto 2 tampers seulement | Réduit le coût de placement en évasion (fingerprints → tamper set recommandé) |
-| G5 Dialecte SQLite | ❌ (fingerprint présent, payloads absents) | Cheap win : stack lab/API courantes ; vocabulaire knowledge l'anticipe déjà (`sqlite` dans `DbmsKind`) |
+| G5 Dialecte SQLite | ✅ (P5 — `--dbms sqlite|sqlite3` routé payloads/enums/doc ; défaut auto inchangé) | Cheap win : stack lab/API courantes ; vocabulaire knowledge l'anticipe déjà (`sqlite` dans `DbmsKind`) |
 | G6 Tags recon GraphQL/LLM-endpoints | ❌ | Cartographie passive des surfaces IA sans attaque (préalable éthique) |
 
 Framing versions : tout ceci est **série v1.1** (post-tag v1.0). Un seul overlap
