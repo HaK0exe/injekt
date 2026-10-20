@@ -55,7 +55,7 @@ async fn enum_items_reach_the_scan_plan_without_legacy_warning() {
         !stderr.contains("legacy enumeration flags deprecated"),
         "nouvelle shape : aucun warning legacy attendu: {stderr}"
     );
-    assert!(!stdout.is_empty());
+    assert_ne!(stdout, "", "dry-run plan doit être rendu");
 }
 
 #[tokio::test]
