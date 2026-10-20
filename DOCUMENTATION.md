@@ -101,6 +101,7 @@ La cible admet quatre sources (précidence) : `--raw-file` > positional `injekt 
 |------|-------------|---------|
 | `-u, --target <URL>` | Target URL (e.g. `https://example.com/?id=1`) | — |
 | `-m, --bulk-file <PATH>` | Bulk scan: one target per line (`#` comments skipped, max 1000) | — |
+| `--input <PATH\|-|DIR>` | C17 — unified ingestion (sniff: `-` stdin, dir → raw-dir, `.json/.yaml/.yml` `openapi` key → openapi, `.xml` `<urlset>` → sitemap, else TXT list). Additive, dedup; legacy modes still functional 2 releases | — |
 | `--method <METHOD>` | HTTP method | `GET` |
 | `--headers <H1,H2>` | Extra headers (comma-separated `Name: value`) | — |
 | `--cookies <STR>` | Cookie header (stored as `SecretString`, redacted in logs) | — |
@@ -328,7 +329,7 @@ Checks the local config, never the target, never the network (0 socket, 0 reques
 1. `config` — `--config` / `./injekt.toml` / `~/.config/injekt/config.toml`, parse TOML, résumé (preset effectif + threads) ; TOML cassé ⇒ `✗` avec la ligne/colonne du crate `toml` ;
 2. `proxy` — schéma seulement (`ProxyConfig::parse`) : `socks5://` ⇒ `✗` message DNS-leak exact (`socks5h://` requis),userinfo redirigé ; aucune connexion n'est tentée ;
 3. `cadence` — `1000/rate_limit ≥ jitter_mean − 2σ` : plus rapide que le jitter ⇒ `!` « pattern détectable » + correction chiffrée (`--rate-limit ≤ ...`) ; neutre si rien d'explicite ;
-4. `ingestion` — stat lexical des 5 sources (`--bulk-file/--raw-file/--raw-dir/--openapi-file/--sitemap-file`) : absent/illisible ⇒ `✗`.
+4. `ingestion` — stat lexical des 6 sources (`--bulk-file/--raw-file/--raw-dir/--openapi-file/--sitemap-file/--input`) : absent/illisible ⇒ `✗`.
 
 Sortie `✓ / ! / ✗` une ligne par check (scrubbée, `--no-redact` respecté) — exit `0` sans `✗`, `1` avec.
 
@@ -830,7 +831,7 @@ auto-discovered files only warn. `injekt info` lists `profiles`.
 2. Global `-u/--target <URL>`.
 3. `scan --target <URL>` (subcommand-level, alias historique déprécié — masqué de `-h`).
 
-Bulk auto-détecté : `--bulk-file` / `--stdin` / `--openapi-file` / `--sitemap-file` / `--raw-dir` (aucune sous-commande bulk dédiée).
+Bulk auto-détecté : `--bulk-file` / `--stdin` / `--openapi-file` / `--sitemap-file` / `--raw-dir` (aucune sous-commande bulk dédiée). C17 : forme unifiée `--input <PATH|-|DIR>` (sniff sur les mêmes loaders).
 
 `--bulk-file` conflicts with `--target` / `--raw-file` (one mode at a time) and with
 `--export-encrypted` (use `--output` for the aggregated report). Format: one target per

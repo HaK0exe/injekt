@@ -22,6 +22,7 @@ fn blank_cli() -> Cli {
             target: None,
             bulk_file: None,
             raw_file: None,
+            input: None,
             raw_dir: None,
             stdin: false,
             openapi_file: None,

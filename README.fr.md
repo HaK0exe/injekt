@@ -204,6 +204,7 @@ Commandes:
 Options:
   -u, --target <URL>              URL cible (--raw-file prioritaire si les deux sont donnés)
   -m, --bulk-file <CHEMIN>        Scan bulk : une cible/ligne, commentaires `#` ignorés, max 1000
+      --input <CHEMIN|-|Dossier>  Ingestion unifiée (C17, sniff : stdin/dossier/OpenAPI/sitemap/TXT) ; modes legacy encore 2 releases
                                   (conflit avec --target/--raw-file/--export-encrypted)
       --profile <NOM>             Preset : quick|balanced|stealth|aggressive (les flags explicites gagnent)
       --config <CHEMIN>           Fichier TOML (défaut : ./injekt.toml, ~/.config/injekt/config.toml)

@@ -207,10 +207,18 @@ Interne inchangé (`EnumConfig`, `MatcherConfig`), parité MCP vérifiée.
   left)` + paires `flag -> --enum item` / triple -> `--scope` ; suite
   `tests/integration_cli_c17.rs` 6 tests zéro requête ; golden regen (+2
   flags) ; parité MCP = shapes bools directes inchangées.)*
-- [ ] **`--input <PATH|-|DIR>`** (detection auto du format : dir → raw-dir ; `.xml`
+- [x] **`--input <PATH|-|DIR>`** (detection auto du format : dir → raw-dir ; `.xml`
   racine `<urlset>` → sitemap ; `.json/.yaml` clé `openapi` → OpenAPI ; `-` → stdin ;
   sinon liste TXT `#`-commenté) fusionne les 7 modes ingestion. Point de branch
   central : `target::ingest` (`collect_targets`). `is_bulk()` couvre le nouveau flag.
+  *(fait 2026-10-20 : sniff figé `sniff_input_kind` sur fenêtre premier KiB
+  (`std` sniff — 7 unit), bloc `--input` dans `collect_targets` routant vers les
+  loaders legacy sans duplication (`parse_targets_text`/`parse_openapi_targets`/
+  `parse_sitemap_targets`/`load_raw_dir_targets`/`read_stdin_all`) ; `.yml`
+  accepté avec `.yaml` (superset documenté) ; `is_bulk()` + doctor (6e source,
+  alias stdin, dir/fichier valides) ; 6 tests binaire réel zéro requête
+  (TXT/OpenAPI/sitemap/stdin/dedup-positional/gate) ; golden regen (+ `--input`)
+  ; MCP shape inchangée.)*
 - [ ] **`--match EXPR` / `--veto EXPR`** (rép.) remappent `--string/--not-string/--code`
   vers `detection::matcher::MatcherConfig`. Grammaire figée : `status==N`, `status!=N`,
   `body=CONTENU` (contient littéral), `body~RE` (regex) — littéral et regex
@@ -345,6 +353,28 @@ Exemple de diagnostic (JSON, champ optionnel — retro-compatible) :
   apprentissage : `const fn` ne peut pas matcher sur `str` sous 1.98
   (E0658, PartialEq const-trail non stable) → `legacy_item_flag` en `fn`
   classique.
+
+- > Progrès 2026-10-20 (C17 migration 2 done — même branch) : `--input
+  <PATH|-|DIR>` (`src/cli/args/target.rs`, single-occurrence comme les options
+  legacy — un doublon = ArgumentConflict, testé ; parity MCP : shape CLI only,
+  modes individuels MCP restent) ; sniff `sniff_input_kind`
+  (`src/target/ingest/mod.rs`, fenêtre 1 KiB, extension lower-case, grammaire
+  figée : `-` stdin, `is_dir()` raw-dir, `.json/.yaml/.yml` + `openapi` →
+  openapi, `.xml` + `<urlset` → sitemap, sinon TXT) appliqué dans
+  `collect_targets` (routing vers les loaders legacy exacts, additive, dedup
+  `seen` inchangé) ; `is_bulk()` (common.rs) couvre `--input` (fallback bare
+  → pipeline scan bulk) ; `doctor/ingest.rs` : 6e source, alias stdin `--input
+  -`, `expects_dir` recalé sur l'état réel (fichier OU dossier tous deux
+  `good` — jamais de Warn type inversé). Tests : 7 unit sniff (window/late
+  marker/case-insensitive/dir-over-extension/stdin) + 2 doctor +
+  `integration_cli_c17.rs` +6 (TXT/OpenAPI/sitemap/stdin pipe/dedup
+  positional/gate, fichiers temporaires `std::env::temp_dir` isolés pid) ;
+  piège clap vu : `Option<String>` doublé = ArgumentConflict (usage exit 2)
+  → parses séparés dans le test doctor. Docs : README/README.fr (flags +
+  exemples), DOCUMENTATION (row table Target, diag doctor 6 sources, note
+  bulk). Golden `cli-flags.txt` regen délibérée (+ `--input`). Gates
+  fmt/clippy/47 suites/doc verts sur build copie nvme. Reste C17 :
+  migration 3 (`--match/--veto`), migration 4 (session namespace).
 
 - > Progrès 2026-10-19 (C14 done): moteur diagnostics `INCONCLUSIVE` câblé —
   `src/engine/diagnostics.rs` (types purs : `InconclusiveCause`/`Diagnostic`/`DiagSignals`,

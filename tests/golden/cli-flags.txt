@@ -62,6 +62,7 @@ scan
 --ignore-robots
 --import
 --include-subdomains
+--input
 --jitter
 --knowledge-path
 --level

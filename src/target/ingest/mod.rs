@@ -1,7 +1,8 @@
 #![deny(unsafe_code)]
 
 //! Multi-source target ingestion (`--bulk-file`, `--stdin`, `--openapi-file`,
-//! `--sitemap-file`, `--raw-dir`).
+//! `--sitemap-file`, `--raw-dir`; plus the unified `--input <PATH|-|DIR>`
+//! C17 resolver on top of those same loaders).
 //!
 //! All entry points are pure over strings except the `*_file` / `*_dir`
 //! loaders, which are thin I/O wrappers. Every collected URL is validated
@@ -42,16 +43,62 @@ pub(crate) fn read_limited_file(path: &str, max_bytes: u64) -> anyhow::Result<St
     Ok(buf)
 }
 
+/// C17 — famille de format détectée pour `--input` (migration 2, grammaire
+/// figée du plan). La détection est un sniff léger sur une fenêtre de début
+/// de fichier : fiable pour un document de plus d'un Mo — un OpenAPI/sitemap
+/// déclaratif porte sa clé/racine tout au début; un TXT de cibles risque au
+/// pire une sur-détection si "openapi" apparaît dans le premier KiB (mettre
+/// la liste ailleurs, ou utiliser le mode legacy équivalent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputKind {
+    Stdin,
+    RawDir,
+    Openapi,
+    Sitemap,
+    Text,
+}
+
+/// Detection rules: `-` → stdin; existing directory → raw-dir; extension
+/// `.json/.yaml/.yml` with an `openapi` marker → openapi; `.xml` carrying
+/// a `<urlset` document → sitemap; everything else (including `.xml`
+/// without `<urlset`, `.json/.yaml` without `openapi`) → TXT target list.
+#[must_use]
+fn sniff_input_kind(path: &str, content_first: Option<&str>) -> InputKind {
+    if path == "-" {
+        return InputKind::Stdin;
+    }
+    if std::path::Path::new(path).is_dir() {
+        return InputKind::RawDir;
+    }
+    let Some(content) = content_first else {
+        return InputKind::Text;
+    };
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    // Sniff window: first KiB (documents declare themselves early).
+    let window = &content[..content.len().min(1024)];
+    match ext.as_str() {
+        "json" | "yaml" | "yml" if window.contains("openapi") => InputKind::Openapi,
+        "xml" if window.contains("<urlset") => InputKind::Sitemap,
+        _ => InputKind::Text,
+    }
+}
+
 /// Merge every ingestion source from [`crate::cli::args::Cli`] into one
 /// deduplicated target list.
 ///
 /// Precedence is intentionally flat — every source is additive:
-/// `--target` / `scan --target` / `auto --target`, `--bulk-file` (or `-`
+/// `--target` / `scan --target` / `auto --target`, `--input <PATH|-|DIR>`
+/// (C17, auto-detected on top of the same loaders), `--bulk-file` (or `-`
 /// for stdin), `--stdin`, `--openapi-file`, `--sitemap-file`, `--raw-dir`.
 ///
 /// # Errors
 /// Returns an error when files cannot be read/parsed, or when no valid
 /// target remains after filtering.
+#[allow(clippy::too_many_lines)]
 pub fn collect_targets(
     cli: &crate::cli::args::Cli,
     extra_target: Option<&str>,
@@ -110,6 +157,35 @@ pub fn collect_targets(
         && push(t.to_owned(), allow_private)
     {
         anyhow::bail!("ingestion exceeds {MAX_BULK_TARGETS} targets");
+    }
+
+    // C17 — `--input <PATH|-|DIR>` : ingestion unifiée (migration 2). Le
+    // sniff figé (`sniff_input_kind`) route vers les loaders legacy
+    // exactement — mêmes parsers, mêmes caps, mêmes warnings — et la
+    // source reste additive (les doublons tombent sur le dedup `seen`).
+    if let Some(input) = cli.target_opts.input.as_deref() {
+        let file_content = if input == "-" || std::path::Path::new(input).is_dir() {
+            None
+        } else {
+            Some(read_limited_file(input, MAX_INGEST_FILE_BYTES)?)
+        };
+        let kind = sniff_input_kind(input, file_content.as_deref());
+        let targets: Vec<String> = match (kind, file_content.as_deref()) {
+            (InputKind::Stdin, _) => parse_targets_text(&read_stdin_all()?),
+            (InputKind::RawDir, _) => load_raw_dir_targets(input)?,
+            (InputKind::Openapi, Some(content)) => parse_openapi_targets(content),
+            (InputKind::Sitemap, Some(content)) => parse_sitemap_targets(content),
+            (InputKind::Text, Some(content)) => parse_targets_text(content),
+            // Inatteignable : `Stdin`/`RawDir` couvrent tous les cas
+            // `content = None` (sniff ne classe Openapi/Sitemap/Text
+            // que lorsqu'un contenu fichier a été lu).
+            (InputKind::Openapi | InputKind::Sitemap | InputKind::Text, None) => Vec::new(),
+        };
+        for t in targets {
+            if push(t, allow_private) {
+                anyhow::bail!("ingestion exceeds {MAX_BULK_TARGETS} targets");
+            }
+        }
     }
 
     if let Some(path) = cli.target_opts.bulk_file.as_deref() {

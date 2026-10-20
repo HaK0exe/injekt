@@ -141,7 +141,9 @@ injekt auto --target "example.com" --with-recon --hpp --chunked --auto-enumerate
 
 # Bulk auto-détecté : --bulk-file / --stdin / --openapi-file / --sitemap-file / --raw-dir
 # (aucun sous-mode bulk à nommer — `auto` et la cible globale détectent l'ingestion massive seuls)
+# (C17 : forme unifiée --input <PATH|-|DIR> — sniff auto TXT/OpenAPI/sitemap/dir/stdin)
 injekt --bulk-file targets.txt --output bulk-report.json --threads 3
+injekt --input targets.txt --output bulk-report.json --threads 3
 
 # OPSEC: Tor + jitter + rate limit + no private IP bypass
 injekt --target "https://example.com/?id=1" \
@@ -228,6 +230,7 @@ Commands:
 Options:
   -u, --target <URL>              Target URL (--raw-file takes priority if both given)
   -m, --bulk-file <PATH>          Bulk scan: one target/line, `#` comments skipped, max 1000
+      --input <PATH|-|DIR>        Unified ingestion (C17, sniff: stdin/dir/OpenAPI/sitemap/TXT); legacy modes still functional 2 releases
                                   (conflicts with --target/--raw-file/--export-encrypted)
       --profile <NAME>            Preset: quick|balanced|stealth|aggressive (explicit flags win)
       --config <PATH>             TOML config file (default: ./injekt.toml, ~/.config/injekt/config.toml)
@@ -291,7 +294,7 @@ injekt recon import --file discovered.json [--test] [--enumerate]
 > Voies recommandées : cible unique → `injekt --target <URL>` (ou `injekt auto --target <URL>`) ;
 > `scan --target` n'est qu'un alias historique déprécié (masqué de `-h`, visible dans `--help`).
 > Bulk auto-détecté : `--bulk-file` / `--stdin` / `--openapi-file` / `--sitemap-file` / `--raw-dir`
-> (pas de sous-commande bulk dédiée).
+> (pas de sous-commande bulk dédiée). C17 : forme unifiée `--input <PATH|-|DIR>` (sniff).
 
 ### Presets & config (non-breaking)
 

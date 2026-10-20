@@ -170,3 +170,139 @@ async fn legacy_scope_triple_warns_mapping_to_scope() {
         "{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// C17 migration 2 — `--input <PATH|-|DIR>` (ingestion unifiée)
+// ---------------------------------------------------------------------------
+
+/// Temp fixture writer (unique per test, process-id isolated) returning the
+/// path string; tracks files for explicit cleanup at test end.
+fn temp_input(suffix: &str, content: &[u8]) -> String {
+    let path =
+        std::env::temp_dir().join(format!("injekt-c17-input-{}-{suffix}", std::process::id()));
+    std::fs::write(&path, content).expect("write temp input fixture");
+    path.to_string_lossy().into_owned()
+}
+
+fn cleanup_temp_input(path: &str) {
+    let _ = std::fs::remove_file(path);
+}
+
+fn run_binary_stdin(args: &[&str], stdin_data: &[u8]) -> (i32, String, String) {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_injekt"))
+        .args(args)
+        .env_remove("INJEKT_TARGET")
+        .env_remove("INJEKT_FORMAT")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn injekt binary");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin piped")
+        .write_all(stdin_data)
+        .expect("write stdin fixture");
+    let out = child.wait_with_output().expect("wait injekt binary");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[tokio::test]
+async fn input_txt_list_ingests_targets_zero_requests() {
+    let file = temp_input(
+        "targets.txt",
+        b"# list\nhttps://example.com/?id=1\nhttps://shop.example/?q=x\n",
+    );
+    let (code, stdout, stderr) = run_binary(&["--input", &file, "--dry-run", "--no-banner"]);
+    cleanup_temp_input(&file);
+    assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
+    assert!(stdout.contains("dry-run: scan plan"));
+    assert!(
+        stdout.contains("targets: 2"),
+        "TXT list must ingest both URLs: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn input_openapijson_routes_to_openapi_parser() {
+    let file = temp_input(
+        "spec.json",
+        br#"{"openapi":"3.0.1","servers":[{"url":"https://api.example.com/v1"}],"paths":{"/users/{id}":{"get":{"parameters":[{"name":"id","in":"query"}]}}}}"#,
+    );
+    let (code, stdout, stderr) = run_binary(&["--input", &file, "--dry-run", "--no-banner"]);
+    cleanup_temp_input(&file);
+    assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
+    assert!(
+        stdout.contains("targets: 1"),
+        "OpenAPI routing must harvest the templated path: {stdout}"
+    );
+    assert!(
+        stdout.contains("/users/1"),
+        "harvested URL must carry the expanded template: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn input_sitemapxml_routes_to_sitemap_parser() {
+    let file = temp_input(
+        "map.xml",
+        br#"<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://maps.example.com/a</loc></url></urlset>"#,
+    );
+    let (code, stdout, stderr) = run_binary(&["--input", &file, "--dry-run", "--no-banner"]);
+    cleanup_temp_input(&file);
+    assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
+    assert!(
+        stdout.contains("targets: 1") && stdout.contains("maps.example.com"),
+        "sitemap routing must harvest <loc> entries: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn input_stdin_marker_reads_piped_list() {
+    let (code, stdout, stderr) = run_binary_stdin(
+        &["--input", "-", "--dry-run", "--no-banner"],
+        b"https://example.com/?id=1\nhttps://other.example/?p=1\n",
+    );
+    assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
+    assert!(
+        stdout.contains("targets: 2"),
+        "stdin marker must ingest the piped list: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn input_dedups_overlapping_positional_target() {
+    let file = temp_input("dup.txt", b"https://example.com/?id=1\n");
+    let (code, stdout, stderr) = run_binary(&[
+        "https://example.com/?id=1",
+        "--input",
+        &file,
+        "--dry-run",
+        "--no-banner",
+    ]);
+    cleanup_temp_input(&file);
+    assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
+    assert!(
+        stdout.contains("targets: 1"),
+        "additive ingestion must dedup the overlapping positional: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn input_flag_is_bulk_like_pipeline_gate() {
+    // `--input` counts as bulk for the scan pipeline gate (is_bulk): a TXT
+    // list runs the bulk flow, not the single-target exclusive chain.
+    let file = temp_input("gate.txt", b"https://example.com/?id=1\n");
+    let (code, stdout, stderr) = run_binary(&["--input", &file, "--dry-run", "--no-banner"]);
+    cleanup_temp_input(&file);
+    assert_eq!(code, 0, "stdout: {stdout} stderr: {stderr}");
+    // Bulk dry-run branches through the same plan render (single-target
+    // exclusion confirmed by the absence of a dry-run pipeline error).
+    assert!(stdout.contains("dry-run: scan plan"), "{stdout}");
+}

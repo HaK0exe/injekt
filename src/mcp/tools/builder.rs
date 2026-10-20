@@ -121,6 +121,9 @@ impl InjektServer {
                 target: None,
                 bulk_file: None,
                 raw_file: None,
+                // C17 : `--input` est une shape CLI seulement — le MCP
+                // continue d'exposer les modes individuels.
+                input: None,
                 raw_dir: None,
                 stdin: false,
                 openapi_file: None,

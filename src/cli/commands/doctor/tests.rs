@@ -376,6 +376,55 @@ fn collect_ingestion_stdin_alias() {
     assert_eq!(items[0].state, SourceState::Stdin);
 }
 
+#[test]
+fn collect_ingestion_input_maps_file_dir_and_stdin() {
+    // Alias stdin de la source unifiée.
+    let cli = Cli::try_parse_from(["injekt", "--input", "-"]).expect("cli parses");
+    let items = collect_ingestion_sources(&cli);
+    assert_eq!(items[0].flag, "input");
+    assert_eq!(items[0].state, SourceState::Stdin);
+
+    // Fichier ET dossier : tous deux valides, `expects_dir` recalé sur
+    // l'état réel (aucun Warn de type inversé possible pour `--input`).
+    let stamp = format!("injekt-doctor-input-{}", std::process::id());
+    let file = std::env::temp_dir().join(format!("{stamp}-file.txt"));
+    let dir = std::env::temp_dir().join(format!("{stamp}-dir"));
+    std::fs::write(&file, "https://lab.example.test/?id=1\n").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_str = file.to_string_lossy().into_owned();
+    let dir_str = dir.to_string_lossy().into_owned();
+    // `--input` est single-occurrence (parité options legacy) : deux parses
+    // séparés pour le cas fichier et le cas dossier.
+    let cli_file =
+        Cli::try_parse_from(["injekt", "--input", file_str.as_str()]).expect("cli parses");
+    let cli_dir = Cli::try_parse_from(["injekt", "--input", dir_str.as_str()]).expect("cli parses");
+    let items = collect_ingestion_sources(&cli_file);
+    let items_dir = collect_ingestion_sources(&cli_dir);
+    std::fs::remove_file(&file).unwrap();
+    std::fs::remove_dir(&dir).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].state, SourceState::File);
+    assert!(!items[0].expects_dir);
+    assert_eq!(items_dir.len(), 1);
+    assert_eq!(items_dir[0].state, SourceState::Dir);
+    assert!(items_dir[0].expects_dir);
+}
+
+#[test]
+fn ingestion_input_accepts_file_and_dir_alike() {
+    // `--input` : fichier et dossier rendus `good` tous deux (sniff).
+    let r = check_ingestion(&[
+        item("input", "/tmp/somewhere.txt", false, SourceState::File),
+        item("input", "/tmp/somedir", true, SourceState::Dir),
+    ]);
+    assert_eq!(r.level, CheckLevel::Ok);
+    assert!(
+        r.line.contains("--input=/tmp/somewhere.txt") && r.line.contains("--input=/tmp/somedir"),
+        "{}",
+        r.line
+    );
+}
+
 // ---- rendu -------------------------------------------------------------
 
 #[test]
